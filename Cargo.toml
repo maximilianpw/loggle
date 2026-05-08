@@ -1,0 +1,11 @@
+[package]
+name = "loggle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.38", features = ["derive"] }
+crossterm = { version = "0.28.1", features = ["use-dev-tty"] }
+libc = "0.2.172"
+ratatui = "0.29.0"
+tokio = { version = "1.45.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
