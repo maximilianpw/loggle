@@ -9,14 +9,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, Paragraph},
+    widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 
 use crate::app::{App, Mode, PromptKind};
 
 use theme::THEME;
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool) {
+pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool, closing: Option<&str>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -44,6 +44,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool) {
             &items,
             app.palette_selected(),
         );
+    } else if app.mode() == &Mode::PropertyFilters {
+        draw_property_filters_dialog(frame, app);
+    }
+
+    if let Some(message) = closing {
+        draw_closing_overlay(frame, frame.area(), message);
     }
 }
 
@@ -189,8 +195,78 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.mode() {
         Mode::Prompt(_) => draw_prompt(frame, area, app),
-        Mode::Normal | Mode::Palette => status::draw_status(frame, area, app),
+        Mode::Normal | Mode::Palette | Mode::PropertyFilters => {
+            status::draw_status(frame, area, app)
+        }
     }
+}
+
+fn draw_property_filters_dialog(frame: &mut Frame<'_>, app: &App) {
+    let rows = app.property_filter_rows();
+    let items;
+    let empty_items;
+    let rendered = if rows.is_empty() {
+        empty_items = [dialog::SelectableListItem {
+            shortcut: None,
+            label: "No property filters",
+            description: "Add filters with f, +, or -",
+        }];
+        &empty_items[..]
+    } else {
+        items = rows
+            .iter()
+            .map(|row| dialog::SelectableListItem {
+                shortcut: Some(row.kind),
+                label: &row.summary,
+                description: "Enter edit  Backspace/Delete remove",
+            })
+            .collect::<Vec<_>>();
+        &items[..]
+    };
+
+    dialog::draw_searchable_dialog(
+        frame,
+        frame.area(),
+        "Property filters",
+        app.property_filter_query(),
+        rendered,
+        app.selected_property_filter_index(),
+    );
+}
+
+fn draw_closing_overlay(frame: &mut Frame<'_>, area: Rect, message: &str) {
+    let width = area.width.clamp(32, 54).min(area.width);
+    let height = 5.min(area.height);
+    let overlay = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(THEME.panel_alt)),
+        overlay,
+    );
+
+    let content = Rect {
+        x: overlay.x.saturating_add(2),
+        y: overlay.y.saturating_add(2),
+        width: overlay.width.saturating_sub(4),
+        height: 1,
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            "* ",
+            Style::default()
+                .fg(THEME.accent)
+                .bg(THEME.panel_alt)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(message.to_string(), Style::default().fg(THEME.text).bg(THEME.panel_alt)),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(Style::default().bg(THEME.panel_alt)), content);
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -198,9 +274,10 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Prompt(PromptKind::Text) => "/",
         Mode::Prompt(PromptKind::Source) => "source: ",
         Mode::Prompt(PromptKind::Level) => "level: ",
-        Mode::Prompt(PromptKind::IncludeProperty) => "include prop: ",
-        Mode::Prompt(PromptKind::ExcludeProperty) => "exclude prop: ",
-        Mode::Normal | Mode::Palette => "",
+        Mode::Prompt(PromptKind::IncludeProperty) => "show prop: ",
+        Mode::Prompt(PromptKind::ExcludeProperty) => "hide prop: ",
+        Mode::Prompt(PromptKind::EditPropertyFilter) => "edit prop: ",
+        Mode::Normal | Mode::Palette | Mode::PropertyFilters => "",
     };
     let base = Style::default().fg(THEME.text).bg(THEME.panel_alt);
     let prompt = Line::from(vec![

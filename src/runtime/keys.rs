@@ -13,6 +13,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyO
     match app.mode() {
         Mode::Prompt(_) => handle_prompt_key(app, key),
         Mode::Palette => handle_palette_key(app, key, half_page),
+        Mode::PropertyFilters => handle_property_filters_key(app, key, half_page),
         Mode::Normal => handle_normal_key(app, key, half_page),
     }
 }
@@ -49,6 +50,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('+'), _) => return execute_command(app, CommandAction::IncludeProperty),
         (KeyCode::Char('-'), _) => return execute_command(app, CommandAction::ExcludeProperty),
         (KeyCode::Char('f'), _) => return execute_command(app, CommandAction::FollowProperty),
+        (KeyCode::Char('P'), _) => return execute_command(app, CommandAction::PropertyFilters),
         (KeyCode::Char(']'), _) => return execute_command(app, CommandAction::NextProperty),
         (KeyCode::Char('['), _) => return execute_command(app, CommandAction::PreviousProperty),
         (KeyCode::Char('c'), _) => return execute_command(app, CommandAction::ClearFilters),
@@ -60,6 +62,30 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('?'), _) => app.toggle_palette(),
         (KeyCode::Esc, _) => app.clear_transient(),
         _ => app.clear_transient(),
+    }
+
+    KeyOutcome::Continue
+}
+
+fn handle_property_filters_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => app.close_property_filters(),
+        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_property_filter_down(1),
+        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_property_filter_up(1),
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.move_property_filter_down(half_page),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.move_property_filter_up(half_page),
+        (KeyCode::Backspace, _) if app.property_filter_query().is_empty() => {
+            app.delete_selected_property_filter()
+        }
+        (KeyCode::Backspace, _) => app.pop_property_filter_query_char(),
+        (KeyCode::Delete, _) => app.delete_selected_property_filter(),
+        (KeyCode::Enter, _) => app.start_property_filter_edit(),
+        (KeyCode::Char(value), modifiers)
+            if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+        {
+            app.push_property_filter_query_char(value);
+        }
+        _ => {}
     }
 
     KeyOutcome::Continue
@@ -95,6 +121,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::PreviousProperty => app.previous_property(),
         CommandAction::NextProperty => app.next_property(),
         CommandAction::FollowProperty => app.follow_selected_property(),
+        CommandAction::PropertyFilters => app.open_property_filters(),
         CommandAction::IncludeProperty => app.start_prompt(PromptKind::IncludeProperty),
         CommandAction::ExcludeProperty => app.start_prompt(PromptKind::ExcludeProperty),
         CommandAction::ClearFilters => app.clear_filters(),
@@ -186,6 +213,70 @@ mod tests {
     }
 
     #[test]
+    fn capital_p_opens_property_filter_dialog() {
+        let mut app = App::new(10);
+
+        handle_key(&mut app, key(KeyCode::Char('P')), 5);
+
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+    }
+
+    #[test]
+    fn property_filter_dialog_searches_and_deletes() {
+        let mut app = App::new(10);
+        add_include_filter(&mut app, "tenantId=tenant-1");
+
+        app.open_property_filters();
+        handle_key(&mut app, key(KeyCode::Char('t')), 5);
+        handle_key(&mut app, key(KeyCode::Char('e')), 5);
+        assert_eq!(app.property_filter_query(), "te");
+
+        handle_key(&mut app, key(KeyCode::Backspace), 5);
+        assert_eq!(app.property_filter_query(), "t");
+
+        handle_key(&mut app, key(KeyCode::Delete), 5);
+        assert!(app.filters().property_includes.is_empty());
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+    }
+
+    #[test]
+    fn property_filter_dialog_backspace_deletes_when_search_is_empty() {
+        let mut app = App::new(10);
+        add_include_filter(&mut app, "tenantId=tenant-1");
+
+        app.open_property_filters();
+        handle_key(&mut app, key(KeyCode::Backspace), 5);
+
+        assert!(app.filters().property_includes.is_empty());
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+    }
+
+    #[test]
+    fn property_filter_dialog_enter_starts_edit_prompt() {
+        let mut app = App::new(10);
+        add_exclude_filter(&mut app, "debug");
+
+        app.open_property_filters();
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+
+        assert_eq!(app.mode(), &Mode::Prompt(PromptKind::EditPropertyFilter));
+        assert_eq!(app.prompt(), "!debug");
+    }
+
+    #[test]
+    fn property_filter_edit_escape_returns_to_dialog() {
+        let mut app = App::new(10);
+        add_include_filter(&mut app, "tenantId=tenant-1");
+
+        app.open_property_filters();
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+        handle_key(&mut app, key(KeyCode::Esc), 5);
+
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+        assert_eq!(app.filters().property_includes.len(), 1);
+    }
+
+    #[test]
     fn palette_escape_and_question_mark_close_palette() {
         let mut app = App::new(10);
         app.open_palette();
@@ -245,5 +336,21 @@ mod tests {
             .unwrap();
         app.move_palette_up(usize::MAX);
         app.move_palette_down(index);
+    }
+
+    fn add_include_filter(app: &mut App, value: &str) {
+        app.start_prompt(PromptKind::IncludeProperty);
+        for ch in value.chars() {
+            handle_key(app, key(KeyCode::Char(ch)), 5);
+        }
+        handle_key(app, key(KeyCode::Enter), 5);
+    }
+
+    fn add_exclude_filter(app: &mut App, value: &str) {
+        app.start_prompt(PromptKind::ExcludeProperty);
+        for ch in value.chars() {
+            handle_key(app, key(KeyCode::Char(ch)), 5);
+        }
+        handle_key(app, key(KeyCode::Enter), 5);
     }
 }

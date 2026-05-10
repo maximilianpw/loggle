@@ -21,6 +21,12 @@ pub struct PropertyFilterUpdate {
     pub predicate: PropertyPredicate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropertyFilterId {
+    pub exclude: bool,
+    pub index: usize,
+}
+
 impl LogFilter {
     pub fn matches(&self, event: &LogEvent) -> bool {
         self.matches_text(event)
@@ -47,6 +53,37 @@ impl LogFilter {
         if !filters.contains(&update.predicate) {
             filters.push(update.predicate);
         }
+    }
+
+    pub fn property_filter(&self, id: PropertyFilterId) -> Option<&PropertyPredicate> {
+        if id.exclude {
+            self.property_excludes.get(id.index)
+        } else {
+            self.property_includes.get(id.index)
+        }
+    }
+
+    pub fn remove_property_filter(&mut self, id: PropertyFilterId) -> Option<PropertyPredicate> {
+        let filters = if id.exclude {
+            &mut self.property_excludes
+        } else {
+            &mut self.property_includes
+        };
+
+        (id.index < filters.len()).then(|| filters.remove(id.index))
+    }
+
+    pub fn replace_property_filter(
+        &mut self,
+        id: PropertyFilterId,
+        update: PropertyFilterUpdate,
+    ) -> bool {
+        if self.remove_property_filter(id).is_none() {
+            return false;
+        }
+
+        self.add_property_filter(update);
+        true
     }
 
     fn matches_text(&self, event: &LogEvent) -> bool {
@@ -306,5 +343,44 @@ mod tests {
                 predicate: PropertyPredicate::exists("debug")
             }
         );
+    }
+
+    #[test]
+    fn removes_and_replaces_property_filters_by_id() {
+        let mut filters = LogFilter {
+            property_includes: vec![
+                PropertyPredicate::exact("tenantId", "tenant-1"),
+                PropertyPredicate::exists("requestId"),
+            ],
+            property_excludes: vec![PropertyPredicate::exact("statusCode", "500")],
+            ..LogFilter::default()
+        };
+
+        assert_eq!(
+            filters.remove_property_filter(PropertyFilterId {
+                exclude: false,
+                index: 1
+            }),
+            Some(PropertyPredicate::exists("requestId"))
+        );
+        assert!(filters.replace_property_filter(
+            PropertyFilterId {
+                exclude: true,
+                index: 0
+            },
+            PropertyFilterUpdate {
+                exclude: false,
+                predicate: PropertyPredicate::exact("statusCode", "200")
+            }
+        ));
+
+        assert_eq!(
+            filters.property_includes,
+            vec![
+                PropertyPredicate::exact("tenantId", "tenant-1"),
+                PropertyPredicate::exact("statusCode", "200"),
+            ]
+        );
+        assert!(filters.property_excludes.is_empty());
     }
 }

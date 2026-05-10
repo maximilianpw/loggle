@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use crate::commands::Command;
@@ -60,6 +60,70 @@ pub(super) fn draw_dialog(
     .collect::<Vec<_>>();
 
     frame.render_widget(List::new(rows).style(base), content);
+}
+
+pub(super) fn draw_searchable_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    query: &str,
+    items: &[SelectableListItem<'_>],
+    selected: usize,
+) {
+    let dialog = centered_dialog(area);
+    frame.render_widget(Clear, dialog);
+
+    let base = Style::default().fg(THEME.text).bg(THEME.panel_alt);
+    let muted = Style::default().fg(THEME.muted).bg(THEME.panel_alt);
+    let title_style = Style::default()
+        .fg(THEME.accent)
+        .bg(THEME.panel_alt)
+        .add_modifier(Modifier::BOLD);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(Span::styled(format!(" {title} "), title_style)))
+        .style(base);
+    frame.render_widget(block, dialog);
+
+    let content = Rect {
+        x: dialog.x.saturating_add(1),
+        y: dialog.y.saturating_add(1),
+        width: dialog.width.saturating_sub(2),
+        height: dialog.height.saturating_sub(2),
+    };
+
+    if content.height == 0 || content.width == 0 {
+        return;
+    }
+
+    let query_width = content.width.saturating_sub(9) as usize;
+    let query_line = Line::from(vec![
+        Span::styled(" search ", muted),
+        Span::styled(truncate_tail(query, query_width), base),
+    ]);
+    frame.render_widget(Paragraph::new(query_line).style(base), content);
+
+    let list_area = Rect {
+        x: content.x,
+        y: content.y.saturating_add(1),
+        width: content.width,
+        height: content.height.saturating_sub(1),
+    };
+    if list_area.height == 0 {
+        return;
+    }
+
+    let visible = visible_window(items.len(), selected, list_area.height as usize);
+    let rows = render_selectable_rows(
+        &items[visible.clone()],
+        selected.saturating_sub(visible.start),
+        list_area.width as usize,
+    )
+    .into_iter()
+    .map(ListItem::new)
+    .collect::<Vec<_>>();
+
+    frame.render_widget(List::new(rows).style(base), list_area);
 }
 
 pub(super) fn command_items(commands: &[Command]) -> Vec<SelectableListItem<'_>> {

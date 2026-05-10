@@ -47,14 +47,9 @@ impl From<io::Error> for RuntimeError {
 
 pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
     let (tx, rx) = mpsc::channel(input::LINE_CHANNEL_CAPACITY);
-    let mut child = start_input(&config.command, tx)?;
+    let child = start_input(&config.command, tx)?;
 
-    let result = terminal::run(rx, config.buffer_lines, config.color_enabled);
-    if let Some(child) = child.as_mut() {
-        input::terminate_child(child);
-    }
-
-    result.map_err(RuntimeError::from)
+    terminal::run(rx, config.buffer_lines, config.color_enabled, child).map_err(RuntimeError::from)
 }
 
 fn start_input(

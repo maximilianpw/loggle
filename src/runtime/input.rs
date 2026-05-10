@@ -1,9 +1,11 @@
 use std::{
     fs::File,
     io::{self, BufRead, IsTerminal, Read},
+    os::unix::process::CommandExt,
     os::fd::FromRawFd,
     process::{Child, Command, Stdio},
     thread,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc;
@@ -21,12 +23,23 @@ pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<String>) -> io::Result<()> {
 }
 
 pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io::Result<Child> {
-    let mut child = Command::new(&command[0])
+    let mut command_builder = Command::new(&command[0]);
+    command_builder
         .args(&command[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    unsafe {
+        command_builder.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command_builder.spawn()?;
 
     if let Some(stdout) = child.stdout.take() {
         spawn_line_reader(stdout, tx.clone());
@@ -71,17 +84,125 @@ where
     }
 }
 
-pub(super) fn terminate_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Err(_) => {
-            let _ = child.kill();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+    Kill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShutdownStatus {
+    Waiting(ShutdownSignal),
+    Exited,
+}
+
+#[derive(Debug)]
+pub(super) struct ChildShutdown {
+    process_group: libc::pid_t,
+    signal: ShutdownSignal,
+    next_escalation: Instant,
+    finished: bool,
+    send_signals: bool,
+}
+
+impl ChildShutdown {
+    pub(super) fn start(child: &Child, now: Instant) -> Self {
+        let shutdown = Self {
+            process_group: child.id() as libc::pid_t,
+            signal: ShutdownSignal::Interrupt,
+            next_escalation: now + interrupt_timeout(),
+            finished: false,
+            send_signals: true,
+        };
+        shutdown.send_current_signal();
+        shutdown
+    }
+
+    pub(super) fn status(&self) -> ShutdownStatus {
+        if self.finished {
+            ShutdownStatus::Exited
+        } else {
+            ShutdownStatus::Waiting(self.signal)
         }
     }
+
+    pub(super) fn tick(&mut self, child: &mut Child, now: Instant) -> io::Result<ShutdownStatus> {
+        if child.try_wait()?.is_some() {
+            self.finished = true;
+            return Ok(ShutdownStatus::Exited);
+        }
+
+        if now >= self.next_escalation {
+            self.escalate(now);
+        }
+
+        Ok(self.status())
+    }
+
+    pub(super) fn escalate_now(&mut self, now: Instant) {
+        self.escalate(now);
+    }
+
+    fn escalate(&mut self, now: Instant) {
+        match self.signal {
+            ShutdownSignal::Interrupt => {
+                self.signal = ShutdownSignal::Terminate;
+                self.next_escalation = now + terminate_timeout();
+                self.send_current_signal();
+            }
+            ShutdownSignal::Terminate => {
+                self.signal = ShutdownSignal::Kill;
+                self.next_escalation = now + kill_retry_timeout();
+                self.send_current_signal();
+            }
+            ShutdownSignal::Kill => {
+                self.next_escalation = now + kill_retry_timeout();
+                self.send_current_signal();
+            }
+        }
+    }
+
+    fn send_current_signal(&self) {
+        if !self.send_signals {
+            return;
+        }
+
+        let signal = match self.signal {
+            ShutdownSignal::Interrupt => libc::SIGINT,
+            ShutdownSignal::Terminate => libc::SIGTERM,
+            ShutdownSignal::Kill => libc::SIGKILL,
+        };
+        unsafe {
+            libc::kill(-self.process_group, signal);
+        }
+    }
+}
+
+pub(super) fn reap_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.wait();
+    }
+}
+
+pub(super) fn force_kill_child_group(child: &mut Child) {
+    let process_group = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+fn interrupt_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn terminate_timeout() -> Duration {
+    Duration::from_secs(2)
+}
+
+fn kill_retry_timeout() -> Duration {
+    Duration::from_millis(500)
 }
 
 #[cfg(test)]
@@ -97,5 +218,65 @@ mod tests {
         assert_eq!(rx.blocking_recv(), Some("one".to_string()));
         assert_eq!(rx.blocking_recv(), Some("two".to_string()));
         assert_eq!(rx.blocking_recv(), None);
+    }
+
+    #[test]
+    fn shutdown_escalates_by_timeout() {
+        let now = Instant::now();
+        let mut shutdown = ChildShutdown {
+            process_group: 1,
+            signal: ShutdownSignal::Interrupt,
+            next_escalation: now + interrupt_timeout(),
+            finished: false,
+            send_signals: false,
+        };
+
+        shutdown.escalate(now + interrupt_timeout());
+        assert_eq!(shutdown.status(), ShutdownStatus::Waiting(ShutdownSignal::Terminate));
+
+        shutdown.escalate(now + interrupt_timeout() + terminate_timeout());
+        assert_eq!(shutdown.status(), ShutdownStatus::Waiting(ShutdownSignal::Kill));
+    }
+
+    #[test]
+    fn shutdown_second_quit_escalates_immediately() {
+        let now = Instant::now();
+        let mut shutdown = ChildShutdown {
+            process_group: 1,
+            signal: ShutdownSignal::Interrupt,
+            next_escalation: now + interrupt_timeout(),
+            finished: false,
+            send_signals: false,
+        };
+
+        shutdown.escalate_now(now);
+
+        assert_eq!(shutdown.status(), ShutdownStatus::Waiting(ShutdownSignal::Terminate));
+    }
+
+    #[test]
+    fn shutdown_interrupt_stops_spawned_process_group() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut child = spawn_command(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap 'exit 42' INT; while true; do sleep 1; done".to_string(),
+            ],
+            tx,
+        )
+        .unwrap();
+        let mut shutdown = ChildShutdown::start(&child, Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while Instant::now() < deadline {
+            if shutdown.tick(&mut child, Instant::now()).unwrap() == ShutdownStatus::Exited {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        force_kill_child_group(&mut child);
+        panic!("spawned process group did not exit after SIGINT");
     }
 }

@@ -71,16 +71,23 @@ loggle --no-color -- docker compose logs -f
 - `l`: set level filter
 - `Enter`: toggle selected log details
 - `[` / `]`: move through properties in the details pane
-- `f`: follow the selected property value
-- `+`: add an include property filter
-- `-`: add an exclude property filter
+- `f`: show only rows with the selected property value
+- `P`: open searchable property filter manager
+- `+`: add a show property filter
+- `-`: add a hide property filter
 - `c`: clear filters
 - `n` / `N`: next/previous search match
 - `Space` or `p`: pause/resume following
 - `?`: open/close the command palette
+- Property filter manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` edits; `Backspace` or `Delete` removes when search is empty; `Esc` closes
 - Command palette: `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` runs; `Esc` closes
 - `Esc`: close prompt or clear transient mode
 - `q`: quit
+
+When Loggle started a child command, quitting sends the child process group a
+terminal-style interrupt first, shows a closing overlay, and escalates only if
+the command does not exit. Press `q` again while closing to escalate
+immediately.
 
 ## Log Parsing
 
@@ -132,7 +139,7 @@ previous event instead of shown as separate rows:
 ```
 
 Property filters support exact values and key existence. Use `key=value` or
-`key` for includes, and `key!=value` or `!key` for excludes. The details pane
+`key` to show matching rows, and `key!=value` or `!key` to hide matching rows. The details pane
 can prefill these filters from the selected event property.
 
 ## Development

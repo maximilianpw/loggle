@@ -81,7 +81,7 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
 
 fn value_limits(width: u16, help: HelpVariant) -> (usize, usize, usize, usize) {
     let help_len = match help {
-        HelpVariant::Full => 71,
+        HelpVariant::Full => 80,
         HelpVariant::Compact => 38,
         HelpVariant::None => 0,
     };
@@ -127,6 +127,8 @@ fn append_help(segments: &mut Vec<StatusSegment>, help: HelpVariant) {
                 base(" level  "),
                 key("Enter"),
                 base(" details  "),
+                key("P"),
+                base(" props  "),
                 key("c"),
                 base(" clear  "),
                 key("?"),

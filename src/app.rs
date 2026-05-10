@@ -1,6 +1,6 @@
 use crate::buffer::LogBuffer;
 use crate::commands::{Command, COMMANDS};
-use crate::filter::{LogFilter, PropertyFilterUpdate, PropertyPredicate};
+use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate};
 use crate::model::{Level, LogEvent, LogProperty};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +10,7 @@ pub enum PromptKind {
     Level,
     IncludeProperty,
     ExcludeProperty,
+    EditPropertyFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,14 @@ pub enum Mode {
     Normal,
     Prompt(PromptKind),
     Palette,
+    PropertyFilters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyFilterRow {
+    pub id: PropertyFilterId,
+    pub kind: &'static str,
+    pub summary: String,
 }
 
 #[derive(Debug)]
@@ -31,6 +40,9 @@ pub struct App {
     pending_g: bool,
     details_open: bool,
     selected_property: usize,
+    property_filter_query: String,
+    selected_property_filter: usize,
+    editing_property_filter: Option<PropertyFilterId>,
 }
 
 impl App {
@@ -46,6 +58,9 @@ impl App {
             pending_g: false,
             details_open: false,
             selected_property: 0,
+            property_filter_query: String::new(),
+            selected_property_filter: 0,
+            editing_property_filter: None,
         }
     }
 
@@ -84,6 +99,28 @@ impl App {
 
     pub fn selected_palette_command(&self) -> Option<&'static Command> {
         self.palette_commands().get(self.palette_selected)
+    }
+
+    pub fn property_filter_query(&self) -> &str {
+        &self.property_filter_query
+    }
+
+    pub fn selected_property_filter_index(&self) -> usize {
+        self.selected_property_filter
+    }
+
+    pub fn property_filter_rows(&self) -> Vec<PropertyFilterRow> {
+        let query = self.property_filter_query.trim();
+        self.all_property_filter_rows()
+            .into_iter()
+            .filter(|row| property_filter_row_matches(row, query))
+            .collect()
+    }
+
+    pub fn selected_property_filter_row(&self) -> Option<PropertyFilterRow> {
+        self.property_filter_rows()
+            .get(self.selected_property_filter)
+            .cloned()
     }
 
     pub fn filters(&self) -> &LogFilter {
@@ -184,8 +221,29 @@ impl App {
                 .selected_property()
                 .map(property_prompt_value)
                 .unwrap_or_default(),
+            PromptKind::EditPropertyFilter => String::new(),
         };
+        self.editing_property_filter = None;
         self.mode = Mode::Prompt(kind);
+    }
+
+    pub fn start_property_filter_edit(&mut self) {
+        let Some(row) = self.selected_property_filter_row() else {
+            return;
+        };
+        let Some(predicate) = self.filters.property_filter(row.id) else {
+            self.sync_property_filter_selection();
+            return;
+        };
+
+        self.prompt = if row.id.exclude {
+            exclude_property_prompt_value(predicate)
+        } else {
+            predicate.summary()
+        };
+        self.editing_property_filter = Some(row.id);
+        self.mode = Mode::Prompt(PromptKind::EditPropertyFilter);
+        self.pending_g = false;
     }
 
     pub fn open_palette(&mut self) {
@@ -219,6 +277,50 @@ impl App {
         self.palette_selected = self.palette_selected.saturating_sub(amount);
     }
 
+    pub fn open_property_filters(&mut self) {
+        self.mode = Mode::PropertyFilters;
+        self.prompt.clear();
+        self.pending_g = false;
+        self.editing_property_filter = None;
+        self.sync_property_filter_selection();
+    }
+
+    pub fn close_property_filters(&mut self) {
+        self.mode = Mode::Normal;
+        self.pending_g = false;
+    }
+
+    pub fn move_property_filter_down(&mut self, amount: usize) {
+        self.selected_property_filter = self
+            .selected_property_filter
+            .saturating_add(amount)
+            .min(self.property_filter_max_index());
+    }
+
+    pub fn move_property_filter_up(&mut self, amount: usize) {
+        self.selected_property_filter = self.selected_property_filter.saturating_sub(amount);
+    }
+
+    pub fn push_property_filter_query_char(&mut self, value: char) {
+        self.property_filter_query.push(value);
+        self.sync_property_filter_selection();
+    }
+
+    pub fn pop_property_filter_query_char(&mut self) {
+        self.property_filter_query.pop();
+        self.sync_property_filter_selection();
+    }
+
+    pub fn delete_selected_property_filter(&mut self) {
+        let Some(row) = self.selected_property_filter_row() else {
+            return;
+        };
+
+        self.filters.remove_property_filter(row.id);
+        self.sync_property_filter_selection();
+        self.sync_selection();
+    }
+
     pub fn push_prompt_char(&mut self, value: char) {
         self.prompt.push(value);
     }
@@ -228,9 +330,14 @@ impl App {
     }
 
     pub fn cancel_prompt(&mut self) {
-        self.mode = Mode::Normal;
+        self.mode = if self.editing_property_filter.is_some() {
+            Mode::PropertyFilters
+        } else {
+            Mode::Normal
+        };
         self.prompt.clear();
         self.pending_g = false;
+        self.editing_property_filter = None;
     }
 
     pub fn clear_transient(&mut self) {
@@ -263,10 +370,23 @@ impl App {
                     self.filters.add_property_filter(update);
                 }
             }
+            PromptKind::EditPropertyFilter => {
+                if let Some(update) = PropertyFilterUpdate::parse(&value, false) {
+                    if let Some(id) = self.editing_property_filter {
+                        self.filters.replace_property_filter(id, update);
+                    }
+                }
+            }
         }
 
-        self.mode = Mode::Normal;
+        self.mode = if matches!(kind, PromptKind::EditPropertyFilter) {
+            Mode::PropertyFilters
+        } else {
+            Mode::Normal
+        };
         self.prompt.clear();
+        self.editing_property_filter = None;
+        self.sync_property_filter_selection();
         self.sync_selection();
     }
 
@@ -387,10 +507,63 @@ impl App {
     fn palette_max_index(&self) -> usize {
         self.palette_commands().len().saturating_sub(1)
     }
+
+    fn sync_property_filter_selection(&mut self) {
+        self.selected_property_filter = self
+            .selected_property_filter
+            .min(self.property_filter_max_index());
+    }
+
+    fn property_filter_max_index(&self) -> usize {
+        self.property_filter_rows().len().saturating_sub(1)
+    }
+
+    fn all_property_filter_rows(&self) -> Vec<PropertyFilterRow> {
+        self.filters
+            .property_includes
+            .iter()
+            .enumerate()
+            .map(|(index, predicate)| PropertyFilterRow {
+                id: PropertyFilterId {
+                    exclude: false,
+                    index,
+                },
+                kind: "show",
+                summary: predicate.summary(),
+            })
+            .chain(
+                self.filters
+                    .property_excludes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, predicate)| PropertyFilterRow {
+                        id: PropertyFilterId {
+                            exclude: true,
+                            index,
+                        },
+                        kind: "ignore",
+                        summary: predicate.summary(),
+                    }),
+            )
+            .collect()
+    }
 }
 
 fn property_prompt_value(property: &LogProperty) -> String {
     format!("{}={}", property.key, property.value)
+}
+
+fn exclude_property_prompt_value(predicate: &PropertyPredicate) -> String {
+    match predicate.value.as_ref() {
+        Some(value) => format!("{}!={}", predicate.key, value),
+        None => format!("!{}", predicate.key),
+    }
+}
+
+fn property_filter_row_matches(row: &PropertyFilterRow, query: &str) -> bool {
+    query.is_empty()
+        || crate::filter::contains_ignore_ascii_case(row.kind, query)
+        || crate::filter::contains_ignore_ascii_case(&row.summary, query)
 }
 
 fn event_matches_search(event: &LogEvent, query: &str) -> bool {
@@ -519,5 +692,81 @@ mod tests {
 
         app.move_palette_up(usize::MAX);
         assert_eq!(app.palette_selected(), 0);
+    }
+
+    #[test]
+    fn property_filter_dialog_searches_active_filters() {
+        let mut app = App::new(10);
+        app.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: false,
+            predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
+        });
+        app.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: true,
+            predicate: PropertyPredicate::exists("debug"),
+        });
+
+        app.open_property_filters();
+        app.push_property_filter_query_char('i');
+        app.push_property_filter_query_char('g');
+
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+        let rows = app.property_filter_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "ignore");
+        assert_eq!(rows[0].summary, "debug");
+    }
+
+    #[test]
+    fn deleting_selected_property_filter_removes_it() {
+        let mut app = App::new(10);
+        app.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: false,
+            predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
+        });
+        app.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: true,
+            predicate: PropertyPredicate::exists("debug"),
+        });
+
+        app.open_property_filters();
+        app.move_property_filter_down(1);
+        app.delete_selected_property_filter();
+
+        assert_eq!(
+            app.filters.property_includes,
+            vec![PropertyPredicate::exact("tenantId", "tenant-1")]
+        );
+        assert!(app.filters.property_excludes.is_empty());
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+        assert_eq!(app.selected_property_filter_index(), 0);
+    }
+
+    #[test]
+    fn editing_property_filter_replaces_existing_filter() {
+        let mut app = App::new(10);
+        app.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: false,
+            predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
+        });
+
+        app.open_property_filters();
+        app.start_property_filter_edit();
+        assert_eq!(app.mode(), &Mode::Prompt(PromptKind::EditPropertyFilter));
+        assert_eq!(app.prompt(), "tenantId=tenant-1");
+        for _ in 0.."tenantId=tenant-1".len() {
+            app.pop_prompt_char();
+        }
+        for value in "tenantId!=tenant-2".chars() {
+            app.push_prompt_char(value);
+        }
+        app.apply_prompt();
+
+        assert_eq!(app.mode(), &Mode::PropertyFilters);
+        assert!(app.filters.property_includes.is_empty());
+        assert_eq!(
+            app.filters.property_excludes,
+            vec![PropertyPredicate::exact("tenantId", "tenant-2")]
+        );
     }
 }
