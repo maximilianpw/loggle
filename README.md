@@ -19,6 +19,8 @@ Live Docker logs -> source/level parsing -> searchable TUI -> inspect/filter pro
 
 Loggle turns noisy multi-process output into a scannable live log view:
 
+![Loggle running against Docker Compose logs](public/docker.jpg)
+
 ```text
  loggle follow  retained 1248  visible 42
 >    147 api             info    http.request GET /api/v1/inventory 200 96ms requestId=716d1e62 durationMs=96
@@ -118,6 +120,10 @@ loggle --no-color -- docker compose logs -f
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 
 ## Controls
+
+Press `?` to open the in-app command palette:
+
+![Loggle command palette and help screen](public/help.jpg)
 
 ### Navigation
 
