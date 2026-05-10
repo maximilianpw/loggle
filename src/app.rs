@@ -1,18 +1,22 @@
 use crate::buffer::LogBuffer;
-use crate::filter::LogFilter;
-use crate::model::{Level, LogEvent};
+use crate::commands::{Command, COMMANDS};
+use crate::filter::{LogFilter, PropertyFilterUpdate, PropertyPredicate};
+use crate::model::{Level, LogEvent, LogProperty};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Text,
     Source,
     Level,
+    IncludeProperty,
+    ExcludeProperty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Prompt(PromptKind),
+    Palette,
 }
 
 #[derive(Debug)]
@@ -23,7 +27,10 @@ pub struct App {
     follow: bool,
     mode: Mode,
     prompt: String,
+    palette_selected: usize,
     pending_g: bool,
+    details_open: bool,
+    selected_property: usize,
 }
 
 impl App {
@@ -35,7 +42,10 @@ impl App {
             follow: true,
             mode: Mode::Normal,
             prompt: String::new(),
+            palette_selected: 0,
             pending_g: false,
+            details_open: false,
+            selected_property: 0,
         }
     }
 
@@ -64,8 +74,28 @@ impl App {
         &self.prompt
     }
 
+    pub fn palette_selected(&self) -> usize {
+        self.palette_selected
+    }
+
+    pub fn palette_commands(&self) -> &'static [Command] {
+        COMMANDS
+    }
+
+    pub fn selected_palette_command(&self) -> Option<&'static Command> {
+        self.palette_commands().get(self.palette_selected)
+    }
+
     pub fn filters(&self) -> &LogFilter {
         &self.filters
+    }
+
+    pub fn details_open(&self) -> bool {
+        self.details_open
+    }
+
+    pub fn selected_property_index(&self) -> usize {
+        self.selected_property
     }
 
     pub fn visible_indices(&self) -> Vec<usize> {
@@ -84,6 +114,15 @@ impl App {
             .collect()
     }
 
+    pub fn selected_event(&self) -> Option<&LogEvent> {
+        self.visible_events().get(self.selected).copied()
+    }
+
+    pub fn selected_property(&self) -> Option<&LogProperty> {
+        self.selected_event()
+            .and_then(|event| event.properties.get(self.selected_property))
+    }
+
     #[cfg(test)]
     pub fn event_at_visible(&self, visible_index: usize) -> Option<&LogEvent> {
         let buffer_index = self.visible_indices().get(visible_index).copied()?;
@@ -99,18 +138,21 @@ impl App {
         } else {
             self.selected = (self.selected + amount).min(visible_len - 1);
         }
+        self.sync_selected_property();
     }
 
     pub fn move_up(&mut self, amount: usize) {
         self.follow = false;
         self.pending_g = false;
         self.selected = self.selected.saturating_sub(amount);
+        self.sync_selected_property();
     }
 
     pub fn jump_top(&mut self) {
         self.follow = false;
         self.pending_g = false;
         self.selected = 0;
+        self.sync_selected_property();
     }
 
     pub fn jump_bottom(&mut self) {
@@ -138,8 +180,43 @@ impl App {
                 .level
                 .map(|level| level.to_string())
                 .unwrap_or_default(),
+            PromptKind::IncludeProperty | PromptKind::ExcludeProperty => self
+                .selected_property()
+                .map(property_prompt_value)
+                .unwrap_or_default(),
         };
         self.mode = Mode::Prompt(kind);
+    }
+
+    pub fn open_palette(&mut self) {
+        self.mode = Mode::Palette;
+        self.prompt.clear();
+        self.pending_g = false;
+        self.sync_palette_selection();
+    }
+
+    pub fn close_palette(&mut self) {
+        self.mode = Mode::Normal;
+        self.pending_g = false;
+    }
+
+    pub fn toggle_palette(&mut self) {
+        if self.mode == Mode::Palette {
+            self.close_palette();
+        } else {
+            self.open_palette();
+        }
+    }
+
+    pub fn move_palette_down(&mut self, amount: usize) {
+        self.palette_selected = self
+            .palette_selected
+            .saturating_add(amount)
+            .min(self.palette_max_index());
+    }
+
+    pub fn move_palette_up(&mut self, amount: usize) {
+        self.palette_selected = self.palette_selected.saturating_sub(amount);
     }
 
     pub fn push_prompt_char(&mut self, value: char) {
@@ -176,6 +253,16 @@ impl App {
                     Level::parse(&value)
                 };
             }
+            PromptKind::IncludeProperty => {
+                if let Some(update) = PropertyFilterUpdate::parse(&value, false) {
+                    self.filters.add_property_filter(update);
+                }
+            }
+            PromptKind::ExcludeProperty => {
+                if let Some(update) = PropertyFilterUpdate::parse(&value, true) {
+                    self.filters.add_property_filter(update);
+                }
+            }
         }
 
         self.mode = Mode::Normal;
@@ -186,6 +273,42 @@ impl App {
     pub fn clear_filters(&mut self) {
         self.filters.clear();
         self.pending_g = false;
+        self.sync_selection();
+    }
+
+    pub fn toggle_details(&mut self) {
+        self.pending_g = false;
+        self.details_open = !self.details_open && self.selected_event().is_some();
+        self.sync_selected_property();
+    }
+
+    pub fn next_property(&mut self) {
+        self.pending_g = false;
+        let Some(event) = self.selected_event() else {
+            self.selected_property = 0;
+            return;
+        };
+
+        if !event.properties.is_empty() {
+            self.selected_property = (self.selected_property + 1).min(event.properties.len() - 1);
+        }
+    }
+
+    pub fn previous_property(&mut self) {
+        self.pending_g = false;
+        self.selected_property = self.selected_property.saturating_sub(1);
+    }
+
+    pub fn follow_selected_property(&mut self) {
+        self.pending_g = false;
+        let Some(property) = self.selected_property() else {
+            return;
+        };
+        let predicate = PropertyPredicate::exact(&property.key, property.value.to_string());
+        self.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: false,
+            predicate,
+        });
         self.sync_selection();
     }
 
@@ -224,8 +347,9 @@ impl App {
                 (self.selected + visible.len() - (step % visible.len())) % visible.len()
             };
 
-            if crate::filter::contains_ignore_ascii_case(&visible[index].raw, query) {
+            if event_matches_search(visible[index], query) {
                 self.selected = index;
+                self.sync_selected_property();
                 return;
             }
         }
@@ -240,7 +364,43 @@ impl App {
         } else {
             self.selected = self.selected.min(visible_len - 1);
         }
+        self.sync_selected_property();
     }
+
+    fn sync_selected_property(&mut self) {
+        let property_len = self
+            .selected_event()
+            .map(|event| event.properties.len())
+            .unwrap_or_default();
+
+        if property_len == 0 {
+            self.selected_property = 0;
+        } else {
+            self.selected_property = self.selected_property.min(property_len - 1);
+        }
+    }
+
+    fn sync_palette_selection(&mut self) {
+        self.palette_selected = self.palette_selected.min(self.palette_max_index());
+    }
+
+    fn palette_max_index(&self) -> usize {
+        self.palette_commands().len().saturating_sub(1)
+    }
+}
+
+fn property_prompt_value(property: &LogProperty) -> String {
+    format!("{}={}", property.key, property.value)
+}
+
+fn event_matches_search(event: &LogEvent, query: &str) -> bool {
+    crate::filter::contains_ignore_ascii_case(&event.raw, query)
+        || crate::filter::contains_ignore_ascii_case(&event.message, query)
+        || crate::filter::contains_ignore_ascii_case(&event.source, query)
+        || event.properties.iter().any(|property| {
+            crate::filter::contains_ignore_ascii_case(&property.key, query)
+                || crate::filter::contains_ignore_ascii_case(&property.value.to_string(), query)
+        })
 }
 
 #[cfg(test)]
@@ -299,5 +459,65 @@ mod tests {
 
         app.previous_search_match();
         assert_eq!(app.event_at_visible(app.selected()).unwrap().raw, "api | ERROR one");
+    }
+
+    #[test]
+    fn details_mode_tracks_selected_property() {
+        let mut app = App::new(10);
+        app.push_line("14:06:58.892 INFO request completed".to_string());
+        app.push_line("[14:06:58.892] INFO (#1):".to_string());
+        app.push_line("{".to_string());
+        app.push_line("requestId: \"abc\",".to_string());
+        app.push_line("tenantId: \"tenant-1\",".to_string());
+        app.push_line("}".to_string());
+
+        app.toggle_details();
+        app.next_property();
+
+        assert!(app.details_open());
+        assert_eq!(app.selected_property().unwrap().key, "tenantId");
+    }
+
+    #[test]
+    fn follow_selected_property_adds_include_filter() {
+        let mut app = App::new(10);
+        app.push_line("14:06:58.892 INFO request completed".to_string());
+        app.push_line("[14:06:58.892] INFO (#1):".to_string());
+        app.push_line("{".to_string());
+        app.push_line("tenantId: \"tenant-1\",".to_string());
+        app.push_line("}".to_string());
+
+        app.follow_selected_property();
+
+        assert_eq!(
+            app.filters.property_includes,
+            vec![PropertyPredicate::exact("tenantId", "tenant-1")]
+        );
+    }
+
+    #[test]
+    fn palette_opens_and_closes_from_normal_mode() {
+        let mut app = App::new(10);
+
+        app.toggle_palette();
+        assert_eq!(app.mode(), &Mode::Palette);
+
+        app.toggle_palette();
+        assert_eq!(app.mode(), &Mode::Normal);
+    }
+
+    #[test]
+    fn palette_selection_moves_and_clamps() {
+        let mut app = App::new(10);
+        app.open_palette();
+
+        app.move_palette_down(2);
+        assert_eq!(app.palette_selected(), 2);
+
+        app.move_palette_down(usize::MAX);
+        assert_eq!(app.palette_selected(), app.palette_commands().len() - 1);
+
+        app.move_palette_up(usize::MAX);
+        assert_eq!(app.palette_selected(), 0);
     }
 }

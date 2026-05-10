@@ -69,9 +69,16 @@ loggle --no-color -- docker compose logs -f
 - `/`: set text filter/search
 - `s`: set source/service filter
 - `l`: set level filter
+- `Enter`: toggle selected log details
+- `[` / `]`: move through properties in the details pane
+- `f`: follow the selected property value
+- `+`: add an include property filter
+- `-`: add an exclude property filter
 - `c`: clear filters
 - `n` / `N`: next/previous search match
 - `Space` or `p`: pause/resume following
+- `?`: open/close the command palette
+- Command palette: `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` runs; `Esc` closes
 - `Esc`: close prompt or clear transient mode
 - `q`: quit
 
@@ -98,9 +105,35 @@ cleaned for terminal use:
 - remaining control characters are removed
 - repeated whitespace is compacted for display
 
-Level inference is keyword-based and case-insensitive. It recognizes common
-tokens such as `fatal`, `error`, `warn`, `info`, `log`, `debug`, `trace`, and
-`verbose`.
+Loggle also recognizes structured summary lines where the first fields are a
+timestamp and level, or just a level:
+
+```text
+14:06:58.892 INFO http.request GET /api/v1/inventory 200 96ms
+INFO http.request GET /api/v1/inventory 200 96ms
+```
+
+For these rows, the timestamp and level are parsed into structured fields and
+the remaining text is shown as the message. Level inference for other logs is
+keyword-based and case-insensitive. It recognizes common tokens such as
+`fatal`, `error`, `warn`, `info`, `log`, `debug`, `trace`, and `verbose`.
+
+Structured property blocks printed after a matching summary are merged into the
+previous event instead of shown as separate rows:
+
+```text
+[14:06:58.892] INFO (#147):
+  {
+    messageKey: "http.request",
+    requestId: "716d1e62-46a1-46c0-9099-e939a2e4fbb0",
+    statusCode: 200,
+    durationMs: 96,
+  }
+```
+
+Property filters support exact values and key existence. Use `key=value` or
+`key` for includes, and `key!=value` or `!key` for excludes. The details pane
+can prefill these filters from the selected event property.
 
 ## Development
 

@@ -5,17 +5,48 @@ pub struct LogFilter {
     pub text: Option<String>,
     pub source: Option<String>,
     pub level: Option<Level>,
+    pub property_includes: Vec<PropertyPredicate>,
+    pub property_excludes: Vec<PropertyPredicate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyPredicate {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyFilterUpdate {
+    pub exclude: bool,
+    pub predicate: PropertyPredicate,
 }
 
 impl LogFilter {
     pub fn matches(&self, event: &LogEvent) -> bool {
-        self.matches_text(event) && self.matches_source(event) && self.matches_level(event)
+        self.matches_text(event)
+            && self.matches_source(event)
+            && self.matches_level(event)
+            && self.matches_property_filters(event)
     }
 
     pub fn clear(&mut self) {
         self.text = None;
         self.source = None;
         self.level = None;
+        self.property_includes.clear();
+        self.property_excludes.clear();
+    }
+
+    pub fn add_property_filter(&mut self, update: PropertyFilterUpdate) {
+        let filters = if update.exclude {
+            &mut self.property_excludes
+        } else {
+            &mut self.property_includes
+        };
+
+        if !filters.contains(&update.predicate) {
+            filters.push(update.predicate);
+        }
     }
 
     fn matches_text(&self, event: &LogEvent) -> bool {
@@ -26,6 +57,10 @@ impl LogFilter {
         contains_ignore_ascii_case(&event.raw, query)
             || contains_ignore_ascii_case(&event.message, query)
             || contains_ignore_ascii_case(&event.source, query)
+            || event.properties.iter().any(|property| {
+                contains_ignore_ascii_case(&property.key, query)
+                    || contains_ignore_ascii_case(&property.value.to_string(), query)
+            })
     }
 
     fn matches_source(&self, event: &LogEvent) -> bool {
@@ -39,6 +74,100 @@ impl LogFilter {
     fn matches_level(&self, event: &LogEvent) -> bool {
         self.level.is_none_or(|level| event.level == level)
     }
+
+    fn matches_property_filters(&self, event: &LogEvent) -> bool {
+        self.property_includes
+            .iter()
+            .all(|predicate| predicate.matches(event))
+            && !self
+                .property_excludes
+                .iter()
+                .any(|predicate| predicate.matches(event))
+    }
+}
+
+impl PropertyPredicate {
+    pub fn exact(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: Some(value.into()),
+        }
+    }
+
+    pub fn exists(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: None,
+        }
+    }
+
+    pub fn matches(&self, event: &LogEvent) -> bool {
+        event.property(&self.key).is_some_and(|property| {
+            self.value
+                .as_ref()
+                .is_none_or(|value| property.value.to_string() == *value)
+        })
+    }
+
+    pub fn summary(&self) -> String {
+        match self.value.as_ref() {
+            Some(value) => format!("{}={}", self.key, value),
+            None => self.key.clone(),
+        }
+    }
+}
+
+impl PropertyFilterUpdate {
+    pub fn parse(input: &str, default_exclude: bool) -> Option<Self> {
+        let input = input.trim();
+        if input.is_empty() {
+            return None;
+        }
+
+        if let Some((key, value)) = input.split_once("!=") {
+            return property_exact(key, value, true);
+        }
+
+        if let Some((key, value)) = input.split_once('=') {
+            return property_exact(key, value, default_exclude);
+        }
+
+        if let Some(key) = input.strip_prefix('!') {
+            let key = key.trim();
+            return (!key.is_empty()).then(|| Self {
+                exclude: true,
+                predicate: PropertyPredicate::exists(key),
+            });
+        }
+
+        Some(Self {
+            exclude: default_exclude,
+            predicate: PropertyPredicate::exists(input),
+        })
+    }
+}
+
+fn property_exact(key: &str, value: &str, exclude: bool) -> Option<PropertyFilterUpdate> {
+    let key = key.trim();
+    let value = normalize_filter_value(value.trim());
+
+    (!key.is_empty()).then(|| PropertyFilterUpdate {
+        exclude,
+        predicate: PropertyPredicate::exact(key, value),
+    })
+}
+
+fn normalize_filter_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0] as char;
+        let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+
+    trimmed.to_string()
 }
 
 pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
@@ -59,6 +188,7 @@ mod tests {
             text: Some("database".to_string()),
             source: Some("api".to_string()),
             level: Some(Level::Error),
+            ..LogFilter::default()
         };
 
         assert!(filter.matches(&event));
@@ -71,6 +201,7 @@ mod tests {
             text: Some("ready".to_string()),
             source: Some("api".to_string()),
             level: Some(Level::Info),
+            ..LogFilter::default()
         };
 
         assert!(!filter.matches(&event));
@@ -83,6 +214,7 @@ mod tests {
             text: Some("error".to_string()),
             source: None,
             level: None,
+            ..LogFilter::default()
         };
 
         assert!(filter.matches(&event));
@@ -95,8 +227,84 @@ mod tests {
             text: None,
             source: Some("backend".to_string()),
             level: None,
+            ..LogFilter::default()
         };
 
         assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn matches_included_property_exact_value() {
+        let mut event = LogEvent::from_line(0, "INFO request completed".to_string());
+        event.set_properties(vec![crate::model::LogProperty {
+            key: "tenantId".to_string(),
+            value: crate::model::PropertyValue::String("tenant-1".to_string()),
+        }]);
+        let filter = LogFilter {
+            property_includes: vec![PropertyPredicate::exact("tenantId", "tenant-1")],
+            ..LogFilter::default()
+        };
+
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn rejects_excluded_property_exact_value() {
+        let mut event = LogEvent::from_line(0, "INFO request completed".to_string());
+        event.set_properties(vec![crate::model::LogProperty {
+            key: "statusCode".to_string(),
+            value: crate::model::PropertyValue::Number("500".to_string()),
+        }]);
+        let filter = LogFilter {
+            property_excludes: vec![PropertyPredicate::exact("statusCode", "500")],
+            ..LogFilter::default()
+        };
+
+        assert!(!filter.matches(&event));
+    }
+
+    #[test]
+    fn matches_property_existence_filters() {
+        let mut event = LogEvent::from_line(0, "INFO request completed".to_string());
+        event.set_properties(vec![crate::model::LogProperty {
+            key: "requestId".to_string(),
+            value: crate::model::PropertyValue::String("abc".to_string()),
+        }]);
+        let include = LogFilter {
+            property_includes: vec![PropertyPredicate::exists("requestId")],
+            ..LogFilter::default()
+        };
+        let exclude = LogFilter {
+            property_excludes: vec![PropertyPredicate::exists("requestId")],
+            ..LogFilter::default()
+        };
+
+        assert!(include.matches(&event));
+        assert!(!exclude.matches(&event));
+    }
+
+    #[test]
+    fn parses_property_filter_inputs() {
+        assert_eq!(
+            PropertyFilterUpdate::parse("tenantId=tenant-1", false).unwrap(),
+            PropertyFilterUpdate {
+                exclude: false,
+                predicate: PropertyPredicate::exact("tenantId", "tenant-1")
+            }
+        );
+        assert_eq!(
+            PropertyFilterUpdate::parse("statusCode!=500", false).unwrap(),
+            PropertyFilterUpdate {
+                exclude: true,
+                predicate: PropertyPredicate::exact("statusCode", "500")
+            }
+        );
+        assert_eq!(
+            PropertyFilterUpdate::parse("!debug", false).unwrap(),
+            PropertyFilterUpdate {
+                exclude: true,
+                predicate: PropertyPredicate::exists("debug")
+            }
+        );
     }
 }

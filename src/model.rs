@@ -42,32 +42,92 @@ impl fmt::Display for Level {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyValue {
+    String(String),
+    Number(String),
+    Bool(bool),
+    Null,
+    Text(String),
+}
+
+impl fmt::Display for PropertyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(value) | Self::Number(value) | Self::Text(value) => f.write_str(value),
+            Self::Bool(value) => write!(f, "{value}"),
+            Self::Null => f.write_str("null"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogProperty {
+    pub key: String,
+    pub value: PropertyValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLine {
     pub source: String,
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredMessage {
+    pub timestamp: Option<String>,
+    pub level: Level,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyBlockHeader {
+    pub timestamp: String,
+    pub level: Level,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEvent {
     pub sequence: u64,
     pub source: String,
+    pub timestamp: Option<String>,
     pub level: Level,
     pub raw: String,
     pub message: String,
+    pub properties: Vec<LogProperty>,
 }
 
 impl LogEvent {
     pub fn from_line(sequence: u64, raw: String) -> Self {
         let parsed = parse_compose_line(&raw);
-        let level = infer_level(&parsed.message);
+        let structured = parse_structured_message(&parsed.message);
+        let timestamp = structured
+            .as_ref()
+            .and_then(|message| message.timestamp.clone());
+        let level = structured
+            .as_ref()
+            .map(|message| message.level)
+            .unwrap_or_else(|| infer_level(&parsed.message));
+        let message = structured
+            .map(|message| message.message)
+            .unwrap_or(parsed.message);
 
         Self {
             sequence,
             source: parsed.source,
+            timestamp,
             level,
             raw,
-            message: parsed.message,
+            message,
+            properties: Vec::new(),
         }
+    }
+
+    pub fn set_properties(&mut self, properties: Vec<LogProperty>) {
+        self.properties = properties;
+    }
+
+    pub fn property(&self, key: &str) -> Option<&LogProperty> {
+        self.properties.iter().find(|property| property.key == key)
     }
 }
 
@@ -101,6 +161,231 @@ fn parse_bracket_prefixed_line(line: &str) -> Option<ParsedLine> {
         source,
         message: clean_display_text(message.trim_start()),
     })
+}
+
+pub fn parse_structured_message(message: &str) -> Option<StructuredMessage> {
+    let message = clean_display_text(message);
+    let trimmed = message.trim();
+    let (first, rest) = split_first_token(trimmed)?;
+
+    if looks_like_timestamp(first) {
+        let (level_token, remainder) = split_first_token(rest.trim_start())?;
+        let level = Level::parse(level_token)?;
+        return Some(StructuredMessage {
+            timestamp: Some(first.to_string()),
+            level,
+            message: remainder.trim_start().to_string(),
+        });
+    }
+
+    Level::parse(first).map(|level| StructuredMessage {
+        timestamp: None,
+        level,
+        message: rest.trim_start().to_string(),
+    })
+}
+
+pub fn parse_property_block_header(line: &str) -> Option<PropertyBlockHeader> {
+    let message = message_without_compose_prefix(line);
+    let message = clean_display_text(message);
+    let rest = message.trim().strip_prefix('[')?;
+    let (timestamp, after_timestamp) = rest.split_once(']')?;
+    if !looks_like_timestamp(timestamp) {
+        return None;
+    }
+
+    let (level_token, after_level) = split_first_token(after_timestamp.trim_start())?;
+    let level = Level::parse(level_token)?;
+    let after_level = after_level.trim_start();
+    let after_marker = if let Some(marker) = after_level.strip_prefix("(#") {
+        let (_, after_marker) = marker.split_once(')')?;
+        after_marker.trim_start()
+    } else {
+        after_level
+    };
+
+    after_marker.strip_prefix(':')?;
+    Some(PropertyBlockHeader {
+        timestamp: timestamp.to_string(),
+        level,
+    })
+}
+
+fn message_without_compose_prefix(line: &str) -> &str {
+    if let Some((source, message)) = line.split_once('|') {
+        if !source.trim().is_empty() {
+            return message.trim_start();
+        }
+    }
+
+    line
+}
+
+fn split_first_token(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+
+    let end = value
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .unwrap_or(value.len());
+    Some((&value[..end], &value[end..]))
+}
+
+fn looks_like_timestamp(value: &str) -> bool {
+    let mut has_colon = false;
+    let mut has_digit = false;
+
+    for ch in value.chars() {
+        match ch {
+            ':' => has_colon = true,
+            '0'..='9' => has_digit = true,
+            '.' => {}
+            _ => return false,
+        }
+    }
+
+    has_colon && has_digit && value.len() >= 5
+}
+
+pub fn parse_property_object(input: &str) -> Option<Vec<LogProperty>> {
+    let mut saw_open = false;
+    let mut properties = Vec::new();
+
+    for line in input.lines() {
+        let mut entry = line.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        if !saw_open {
+            let Some(after_open) = entry.strip_prefix('{') else {
+                continue;
+            };
+            saw_open = true;
+            entry = after_open.trim();
+            if entry.is_empty() {
+                continue;
+            }
+        }
+
+        if entry.starts_with('}') {
+            break;
+        }
+
+        let entry = trim_trailing_comma(entry);
+        if entry.is_empty() || entry == "}" {
+            continue;
+        }
+
+        if let Some(property) = parse_property_entry(entry) {
+            properties.push(property);
+        }
+    }
+
+    saw_open.then_some(properties)
+}
+
+fn parse_property_entry(entry: &str) -> Option<LogProperty> {
+    let (key, value) = entry.split_once(':')?;
+    let key = parse_property_key(key.trim())?;
+    let value = parse_property_value(value.trim());
+
+    Some(LogProperty { key, value })
+}
+
+fn parse_property_key(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = parse_quoted_string(key) {
+        return Some(value);
+    }
+
+    Some(key.to_string())
+}
+
+fn parse_property_value(value: &str) -> PropertyValue {
+    let value = trim_trailing_comma(value.trim());
+
+    if let Some(value) = parse_quoted_string(value) {
+        return PropertyValue::String(value);
+    }
+
+    match value {
+        "true" => PropertyValue::Bool(true),
+        "false" => PropertyValue::Bool(false),
+        "null" => PropertyValue::Null,
+        value if is_number_literal(value) => PropertyValue::Number(value.to_string()),
+        value => PropertyValue::Text(value.to_string()),
+    }
+}
+
+fn trim_trailing_comma(value: &str) -> &str {
+    value.trim_end()
+        .strip_suffix(',')
+        .map(str::trim_end)
+        .unwrap_or(value.trim_end())
+}
+
+fn parse_quoted_string(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let mut output = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            match ch {
+                'n' => output.push('\n'),
+                'r' => output.push('\r'),
+                't' => output.push('\t'),
+                '\\' => output.push('\\'),
+                '"' => output.push('"'),
+                '\'' => output.push('\''),
+                value => output.push(value),
+            }
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == quote {
+            return Some(output);
+        }
+
+        output.push(ch);
+    }
+
+    None
+}
+
+fn is_number_literal(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = if let Some((whole, fraction)) = unsigned.split_once('.') {
+        (whole, fraction)
+    } else {
+        (unsigned, "")
+    };
+
+    !whole.is_empty()
+        && whole.chars().all(|ch| ch.is_ascii_digit())
+        && fraction.chars().all(|ch| ch.is_ascii_digit())
 }
 
 pub fn clean_display_text(input: &str) -> String {
@@ -219,8 +504,46 @@ mod tests {
         );
 
         assert_eq!(event.source, "backend");
-        assert_eq!(event.message, "INFO http.request GET /api/v1/auth/me 200");
+        assert_eq!(event.message, "http.request GET /api/v1/auth/me 200");
         assert_eq!(event.level, Level::Info);
+    }
+
+    #[test]
+    fn parses_structured_summary_with_timestamp_level_and_message() {
+        let event = LogEvent::from_line(
+            0,
+            "14:06:58.892 INFO http.request GET /api/v1/inventory 200 96ms".to_string(),
+        );
+
+        assert_eq!(event.source, "unknown");
+        assert_eq!(event.timestamp.as_deref(), Some("14:06:58.892"));
+        assert_eq!(event.level, Level::Info);
+        assert_eq!(
+            event.message,
+            "http.request GET /api/v1/inventory 200 96ms"
+        );
+    }
+
+    #[test]
+    fn parses_compose_prefixed_structured_summary() {
+        let event = LogEvent::from_line(
+            0,
+            "api | 14:06:58.892 WARNING http.request failed".to_string(),
+        );
+
+        assert_eq!(event.source, "api");
+        assert_eq!(event.timestamp.as_deref(), Some("14:06:58.892"));
+        assert_eq!(event.level, Level::Warn);
+        assert_eq!(event.message, "http.request failed");
+    }
+
+    #[test]
+    fn parses_level_first_structured_summary() {
+        let event = LogEvent::from_line(0, "ERROR sync.failed retry exhausted".to_string());
+
+        assert_eq!(event.timestamp, None);
+        assert_eq!(event.level, Level::Error);
+        assert_eq!(event.message, "sync.failed retry exhausted");
     }
 
     #[test]
@@ -282,6 +605,44 @@ mod tests {
         let parsed = parse_compose_line("api | progress 10%\rprogress 20%\u{8}\tready");
 
         assert_eq!(parsed.message, "progress 10%progress 20% ready");
+    }
+
+    #[test]
+    fn parses_property_block_header() {
+        let header = parse_property_block_header("[14:06:58.892] INFO (#147):").unwrap();
+
+        assert_eq!(header.timestamp, "14:06:58.892");
+        assert_eq!(header.level, Level::Info);
+        assert!(parse_property_block_header("[frontend] VITE ready").is_none());
+    }
+
+    #[test]
+    fn parses_js_like_property_object() {
+        let properties = parse_property_object(
+            r#"  {
+    messageKey: "http.request",
+    statusCode: 200,
+    durationMs: 96,
+    cached: false,
+    metadata: null,
+    userAgent: "Mozilla/5.0 (KHTML, like Gecko)",
+  }"#,
+        )
+        .unwrap();
+
+        assert_eq!(properties[0].key, "messageKey");
+        assert_eq!(
+            properties[0].value,
+            PropertyValue::String("http.request".to_string())
+        );
+        assert_eq!(properties[1].value, PropertyValue::Number("200".to_string()));
+        assert_eq!(properties[2].value, PropertyValue::Number("96".to_string()));
+        assert_eq!(properties[3].value, PropertyValue::Bool(false));
+        assert_eq!(properties[4].value, PropertyValue::Null);
+        assert_eq!(
+            properties[5].value,
+            PropertyValue::String("Mozilla/5.0 (KHTML, like Gecko)".to_string())
+        );
     }
 
     #[test]

@@ -6,7 +6,10 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::{app::App, filter::LogFilter};
+use crate::{
+    app::App,
+    filter::{LogFilter, PropertyPredicate},
+};
 
 use super::{text::truncate_tail, theme::THEME};
 
@@ -56,8 +59,9 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
         .level
         .map(|level| level.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let properties = property_filters_summary(filters);
     let help = help_variant(width);
-    let (source_limit, level_limit, text_limit) = value_limits(width, help);
+    let (source_limit, level_limit, text_limit, property_limit) = value_limits(width, help);
 
     let mut segments = vec![
         base(" filters "),
@@ -67,32 +71,34 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
         value(truncate_tail(&level, level_limit)),
         base("  search="),
         value(truncate_tail(text, text_limit)),
+        base("  props="),
+        value(truncate_tail(&properties, property_limit)),
     ];
 
     append_help(&mut segments, help);
     segments
 }
 
-fn value_limits(width: u16, help: HelpVariant) -> (usize, usize, usize) {
+fn value_limits(width: u16, help: HelpVariant) -> (usize, usize, usize, usize) {
     let help_len = match help {
-        HelpVariant::Full => 44,
-        HelpVariant::Compact => 25,
+        HelpVariant::Full => 71,
+        HelpVariant::Compact => 38,
         HelpVariant::None => 0,
     };
     let separator_len = usize::from(help != HelpVariant::None) * 3;
-    let fixed_len = 9 + 7 + 8 + 9 + separator_len + help_len;
+    let fixed_len = 9 + 7 + 8 + 9 + 8 + separator_len + help_len;
     let available = (width as usize).saturating_sub(fixed_len);
 
     if available >= 55 {
-        (20, 7, 32)
+        (16, 7, 24, 32)
     } else if available >= 35 {
-        (12, 7, 16)
+        (10, 7, 12, 10)
     } else if available >= 21 {
-        (8, 5, 8)
+        (7, 5, 7, 6)
     } else if available >= 12 {
-        (4, 3, 5)
+        (4, 3, 4, 3)
     } else {
-        (1, 1, 1)
+        (1, 1, 1, 1)
     }
 }
 
@@ -119,8 +125,12 @@ fn append_help(segments: &mut Vec<StatusSegment>, help: HelpVariant) {
                 base(" source  "),
                 key("l"),
                 base(" level  "),
+                key("Enter"),
+                base(" details  "),
                 key("c"),
-                base(" clear"),
+                base(" clear  "),
+                key("?"),
+                base(" commands"),
             ]);
         }
         HelpVariant::Compact => {
@@ -131,7 +141,9 @@ fn append_help(segments: &mut Vec<StatusSegment>, help: HelpVariant) {
                 key("/"),
                 base(" search  "),
                 key("c"),
-                base(" clear"),
+                base(" clear  "),
+                key("?"),
+                base(" commands"),
             ]);
         }
         HelpVariant::None => {}
@@ -159,6 +171,29 @@ fn key(text: impl Into<String>) -> StatusSegment {
     }
 }
 
+fn property_filters_summary(filters: &LogFilter) -> String {
+    if filters.property_includes.is_empty() && filters.property_excludes.is_empty() {
+        return "-".to_string();
+    }
+
+    filters
+        .property_includes
+        .iter()
+        .map(|predicate| prefixed_property("+", predicate))
+        .chain(
+            filters
+                .property_excludes
+                .iter()
+                .map(|predicate| prefixed_property("-", predicate)),
+        )
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn prefixed_property(prefix: &str, predicate: &PropertyPredicate) -> String {
+    format!("{prefix}{}", predicate.summary())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,12 +212,14 @@ mod tests {
             text: Some("database connection failure in shard six".to_string()),
             source: Some("very-long-service-name".to_string()),
             level: Some(Level::Error),
+            property_includes: vec![PropertyPredicate::exact("tenantId", "tenant-1")],
+            property_excludes: Vec::new(),
         };
 
-        let status = plain_status(&filters, 90);
+        let status = plain_status(&filters, 110);
 
-        assert!(status.contains("very-lo~"));
-        assert!(status.contains("databas~"));
+        assert!(status.contains("very-l~"));
+        assert!(status.contains("databa~"));
         assert!(!status.contains("very-long-service-name"));
         assert!(!status.contains("database connection failure"));
         assert!(status.contains("q quit"));
@@ -204,5 +241,17 @@ mod tests {
 
         assert!(!status.contains("q quit"));
         assert!(status.contains("filters source=-"));
+    }
+
+    #[test]
+    fn status_summarizes_property_filters() {
+        let filters = LogFilter {
+            property_includes: vec![PropertyPredicate::exact("tenantId", "tenant-1")],
+            property_excludes: vec![PropertyPredicate::exists("debug")],
+            ..LogFilter::default()
+        };
+        let status = plain_status(&filters, 220);
+
+        assert!(status.contains("props=+tenantId=tenant-1,-debug"));
     }
 }
