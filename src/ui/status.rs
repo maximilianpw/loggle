@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::App,
-    filter::{LogFilter, PropertyPredicate},
+    filter::LogFilter,
 };
 
 use super::{text::truncate_tail, theme::THEME};
@@ -181,25 +181,21 @@ fn property_filters_summary(filters: &LogFilter) -> String {
     filters
         .property_includes
         .iter()
-        .map(|predicate| prefixed_property("+", predicate))
+        .map(|predicate| predicate.summary_for(false))
         .chain(
             filters
                 .property_excludes
                 .iter()
-                .map(|predicate| prefixed_property("-", predicate)),
+                .map(|predicate| predicate.summary_for(true)),
         )
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn prefixed_property(prefix: &str, predicate: &PropertyPredicate) -> String {
-    format!("{prefix}{}", predicate.summary())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Level;
+    use crate::{filter::PropertyPredicate, model::Level};
 
     fn plain_status(filters: &LogFilter, width: u16) -> String {
         status_segments(filters, width)
@@ -249,11 +245,18 @@ mod tests {
     fn status_summarizes_property_filters() {
         let filters = LogFilter {
             property_includes: vec![PropertyPredicate::exact("tenantId", "tenant-1")],
-            property_excludes: vec![PropertyPredicate::exists("debug")],
+            property_excludes: vec![
+                PropertyPredicate::exists("debug"),
+                PropertyPredicate::exact("statusCode", "500"),
+            ],
             ..LogFilter::default()
         };
         let status = plain_status(&filters, 220);
 
-        assert!(status.contains("props=+tenantId=tenant-1,-debug"));
+        assert_eq!(
+            property_filters_summary(&filters),
+            "tenantId=tenant-1,!debug,statusCode!=500"
+        );
+        assert!(status.contains("props=tenantId=tenant-1,!debug"));
     }
 }

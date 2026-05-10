@@ -1,7 +1,13 @@
+mod list_state;
+
 use crate::buffer::LogBuffer;
 use crate::commands::{Command, COMMANDS};
-use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate};
+use crate::filter::{
+    event_contains, LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate,
+};
 use crate::model::{Level, LogEvent, LogProperty};
+
+use list_state::SearchableListState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -37,16 +43,14 @@ pub struct App {
     follow: bool,
     mode: Mode,
     prompt: String,
-    palette_selected: usize,
+    palette: SearchableListState,
     pending_g: bool,
     details_open: bool,
     selected_property: usize,
-    property_filter_query: String,
-    selected_property_filter: usize,
+    property_filters: SearchableListState,
     editing_property_filter: Option<PropertyFilterId>,
     message_field_keys: Vec<String>,
-    message_field_query: String,
-    selected_message_field: usize,
+    message_fields: SearchableListState,
 }
 
 impl App {
@@ -58,16 +62,14 @@ impl App {
             follow: true,
             mode: Mode::Normal,
             prompt: String::new(),
-            palette_selected: 0,
+            palette: SearchableListState::default(),
             pending_g: false,
             details_open: false,
             selected_property: 0,
-            property_filter_query: String::new(),
-            selected_property_filter: 0,
+            property_filters: SearchableListState::default(),
             editing_property_filter: None,
             message_field_keys: Vec::new(),
-            message_field_query: String::new(),
-            selected_message_field: 0,
+            message_fields: SearchableListState::default(),
         }
     }
 
@@ -97,7 +99,7 @@ impl App {
     }
 
     pub fn palette_selected(&self) -> usize {
-        self.palette_selected
+        self.palette.selected()
     }
 
     pub fn palette_commands(&self) -> &'static [Command] {
@@ -105,19 +107,19 @@ impl App {
     }
 
     pub fn selected_palette_command(&self) -> Option<&'static Command> {
-        self.palette_commands().get(self.palette_selected)
+        self.palette_commands().get(self.palette.selected())
     }
 
     pub fn property_filter_query(&self) -> &str {
-        &self.property_filter_query
+        self.property_filters.query()
     }
 
     pub fn selected_property_filter_index(&self) -> usize {
-        self.selected_property_filter
+        self.property_filters.selected()
     }
 
     pub fn property_filter_rows(&self) -> Vec<PropertyFilterRow> {
-        let query = self.property_filter_query.trim();
+        let query = self.property_filters.query().trim();
         self.all_property_filter_rows()
             .into_iter()
             .filter(|row| property_filter_row_matches(row, query))
@@ -126,7 +128,7 @@ impl App {
 
     pub fn selected_property_filter_row(&self) -> Option<PropertyFilterRow> {
         self.property_filter_rows()
-            .get(self.selected_property_filter)
+            .get(self.property_filters.selected())
             .cloned()
     }
 
@@ -135,15 +137,15 @@ impl App {
     }
 
     pub fn message_field_query(&self) -> &str {
-        &self.message_field_query
+        self.message_fields.query()
     }
 
     pub fn selected_message_field_index(&self) -> usize {
-        self.selected_message_field
+        self.message_fields.selected()
     }
 
     pub fn message_field_rows(&self) -> Vec<&str> {
-        let query = self.message_field_query.trim();
+        let query = self.message_fields.query().trim();
         self.message_field_keys
             .iter()
             .map(String::as_str)
@@ -155,7 +157,7 @@ impl App {
 
     pub fn selected_message_field_key(&self) -> Option<&str> {
         self.message_field_rows()
-            .get(self.selected_message_field)
+            .get(self.message_fields.selected())
             .copied()
     }
 
@@ -272,11 +274,7 @@ impl App {
             return;
         };
 
-        self.prompt = if row.id.exclude {
-            exclude_property_prompt_value(predicate)
-        } else {
-            predicate.summary()
-        };
+        self.prompt = predicate.summary_for(row.id.exclude);
         self.editing_property_filter = Some(row.id);
         self.mode = Mode::Prompt(PromptKind::EditPropertyFilter);
         self.pending_g = false;
@@ -303,14 +301,11 @@ impl App {
     }
 
     pub fn move_palette_down(&mut self, amount: usize) {
-        self.palette_selected = self
-            .palette_selected
-            .saturating_add(amount)
-            .min(self.palette_max_index());
+        self.palette.move_down(amount, self.palette_commands().len());
     }
 
     pub fn move_palette_up(&mut self, amount: usize) {
-        self.palette_selected = self.palette_selected.saturating_sub(amount);
+        self.palette.move_up(amount);
     }
 
     pub fn open_property_filters(&mut self) {
@@ -339,23 +334,21 @@ impl App {
     }
 
     pub fn move_property_filter_down(&mut self, amount: usize) {
-        self.selected_property_filter = self
-            .selected_property_filter
-            .saturating_add(amount)
-            .min(self.property_filter_max_index());
+        self.property_filters
+            .move_down(amount, self.property_filter_rows().len());
     }
 
     pub fn move_property_filter_up(&mut self, amount: usize) {
-        self.selected_property_filter = self.selected_property_filter.saturating_sub(amount);
+        self.property_filters.move_up(amount);
     }
 
     pub fn push_property_filter_query_char(&mut self, value: char) {
-        self.property_filter_query.push(value);
+        self.property_filters.push_query_char(value);
         self.sync_property_filter_selection();
     }
 
     pub fn pop_property_filter_query_char(&mut self) {
-        self.property_filter_query.pop();
+        self.property_filters.pop_query_char();
         self.sync_property_filter_selection();
     }
 
@@ -370,23 +363,21 @@ impl App {
     }
 
     pub fn move_message_field_down(&mut self, amount: usize) {
-        self.selected_message_field = self
-            .selected_message_field
-            .saturating_add(amount)
-            .min(self.message_field_max_index());
+        self.message_fields
+            .move_down(amount, self.message_field_rows().len());
     }
 
     pub fn move_message_field_up(&mut self, amount: usize) {
-        self.selected_message_field = self.selected_message_field.saturating_sub(amount);
+        self.message_fields.move_up(amount);
     }
 
     pub fn push_message_field_query_char(&mut self, value: char) {
-        self.message_field_query.push(value);
+        self.message_fields.push_query_char(value);
         self.sync_message_field_selection();
     }
 
     pub fn pop_message_field_query_char(&mut self) {
-        self.message_field_query.pop();
+        self.message_fields.pop_query_char();
         self.sync_message_field_selection();
     }
 
@@ -562,7 +553,7 @@ impl App {
                 (self.selected + visible.len() - (step % visible.len())) % visible.len()
             };
 
-            if event_matches_search(visible[index], query) {
+            if event_contains(visible[index], query) {
                 self.selected = index;
                 self.sync_selected_property();
                 return;
@@ -596,31 +587,17 @@ impl App {
     }
 
     fn sync_palette_selection(&mut self) {
-        self.palette_selected = self.palette_selected.min(self.palette_max_index());
-    }
-
-    fn palette_max_index(&self) -> usize {
-        self.palette_commands().len().saturating_sub(1)
+        self.palette.sync(self.palette_commands().len());
     }
 
     fn sync_property_filter_selection(&mut self) {
-        self.selected_property_filter = self
-            .selected_property_filter
-            .min(self.property_filter_max_index());
-    }
-
-    fn property_filter_max_index(&self) -> usize {
-        self.property_filter_rows().len().saturating_sub(1)
+        let len = self.property_filter_rows().len();
+        self.property_filters.sync(len);
     }
 
     fn sync_message_field_selection(&mut self) {
-        self.selected_message_field = self
-            .selected_message_field
-            .min(self.message_field_max_index());
-    }
-
-    fn message_field_max_index(&self) -> usize {
-        self.message_field_rows().len().saturating_sub(1)
+        let len = self.message_field_rows().len();
+        self.message_fields.sync(len);
     }
 
     fn all_property_filter_rows(&self) -> Vec<PropertyFilterRow> {
@@ -634,7 +611,7 @@ impl App {
                     index,
                 },
                 kind: "show",
-                summary: predicate.summary(),
+                summary: predicate.summary_for(false),
             })
             .chain(
                 self.filters
@@ -647,7 +624,7 @@ impl App {
                             index,
                         },
                         kind: "ignore",
-                        summary: predicate.summary(),
+                        summary: predicate.summary_for(true),
                     }),
             )
             .collect()
@@ -658,27 +635,10 @@ fn property_prompt_value(property: &LogProperty) -> String {
     format!("{}={}", property.key, property.value)
 }
 
-fn exclude_property_prompt_value(predicate: &PropertyPredicate) -> String {
-    match predicate.value.as_ref() {
-        Some(value) => format!("{}!={}", predicate.key, value),
-        None => format!("!{}", predicate.key),
-    }
-}
-
 fn property_filter_row_matches(row: &PropertyFilterRow, query: &str) -> bool {
     query.is_empty()
         || crate::filter::contains_ignore_ascii_case(row.kind, query)
         || crate::filter::contains_ignore_ascii_case(&row.summary, query)
-}
-
-fn event_matches_search(event: &LogEvent, query: &str) -> bool {
-    crate::filter::contains_ignore_ascii_case(&event.raw, query)
-        || crate::filter::contains_ignore_ascii_case(&event.message, query)
-        || crate::filter::contains_ignore_ascii_case(&event.source, query)
-        || event.properties.iter().any(|property| {
-            crate::filter::contains_ignore_ascii_case(&property.key, query)
-                || crate::filter::contains_ignore_ascii_case(&property.value.to_string(), query)
-        })
 }
 
 #[cfg(test)]
@@ -878,7 +838,7 @@ mod tests {
         let rows = app.property_filter_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "ignore");
-        assert_eq!(rows[0].summary, "debug");
+        assert_eq!(rows[0].summary, "!debug");
     }
 
     #[test]

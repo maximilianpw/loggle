@@ -100,13 +100,7 @@ impl LogFilter {
             return true;
         };
 
-        contains_ignore_ascii_case(&event.raw, query)
-            || contains_ignore_ascii_case(&event.message, query)
-            || contains_ignore_ascii_case(&event.source, query)
-            || event.properties.iter().any(|property| {
-                contains_ignore_ascii_case(&property.key, query)
-                    || contains_ignore_ascii_case(&property.value.to_string(), query)
-            })
+        event_contains(event, query)
     }
 
     fn matches_source(&self, event: &LogEvent) -> bool {
@@ -159,6 +153,21 @@ impl PropertyPredicate {
         match self.value.as_ref() {
             Some(value) => format!("{}={}", self.key, value),
             None => self.key.clone(),
+        }
+    }
+
+    pub fn exclude_summary(&self) -> String {
+        match self.value.as_ref() {
+            Some(value) => format!("{}!={}", self.key, value),
+            None => format!("!{}", self.key),
+        }
+    }
+
+    pub fn summary_for(&self, exclude: bool) -> String {
+        if exclude {
+            self.exclude_summary()
+        } else {
+            self.summary()
         }
     }
 }
@@ -222,6 +231,16 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .contains(&needle.to_ascii_lowercase())
 }
 
+pub fn event_contains(event: &LogEvent, query: &str) -> bool {
+    contains_ignore_ascii_case(&event.raw, query)
+        || contains_ignore_ascii_case(&event.message, query)
+        || contains_ignore_ascii_case(&event.source, query)
+        || event.properties.iter().any(|property| {
+            contains_ignore_ascii_case(&property.key, query)
+                || contains_ignore_ascii_case(&property.value.to_string(), query)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +283,29 @@ mod tests {
         };
 
         assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn event_contains_checks_raw_source_message_and_properties() {
+        let mut event = LogEvent::from_line(0, "api | INFO request completed".to_string());
+        event.set_properties(vec![
+            crate::model::LogProperty {
+                key: "tenantId".to_string(),
+                value: crate::model::PropertyValue::String("tenant-1".to_string()),
+            },
+            crate::model::LogProperty {
+                key: "statusCode".to_string(),
+                value: crate::model::PropertyValue::Number("200".to_string()),
+            },
+        ]);
+
+        assert!(event_contains(&event, "|"));
+        assert!(event_contains(&event, "api"));
+        assert!(event_contains(&event, "request completed"));
+        assert!(event_contains(&event, "tenantid"));
+        assert!(event_contains(&event, "tenant-1"));
+        assert!(event_contains(&event, "200"));
+        assert!(!event_contains(&event, "missing"));
     }
 
     #[test]
@@ -352,6 +394,18 @@ mod tests {
                 predicate: PropertyPredicate::exists("debug")
             }
         );
+    }
+
+    #[test]
+    fn property_filter_summaries_format_include_and_exclude_filters() {
+        let exact = PropertyPredicate::exact("statusCode", "500");
+        let exists = PropertyPredicate::exists("debug");
+
+        assert_eq!(exact.summary(), "statusCode=500");
+        assert_eq!(exists.summary(), "debug");
+        assert_eq!(exact.exclude_summary(), "statusCode!=500");
+        assert_eq!(exists.exclude_summary(), "!debug");
+        assert_eq!(exact.summary_for(true), "statusCode!=500");
     }
 
     #[test]
