@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::model::{
-    LogEvent, PropertyBlockHeader, parse_property_block_header, parse_property_object,
+    LogEvent, ParsedLine, PropertyBlockHeader, parse_compose_line, parse_property_block_header,
+    parse_property_object,
 };
 
 #[derive(Debug)]
@@ -10,6 +11,7 @@ pub struct LogBuffer {
     next_sequence: u64,
     events: VecDeque<LogEvent>,
     pending_properties: Option<PendingPropertyBlock>,
+    active_source: Option<String>,
 }
 
 #[derive(Debug)]
@@ -27,6 +29,7 @@ impl LogBuffer {
             next_sequence: 0,
             events: VecDeque::with_capacity(capacity),
             pending_properties: None,
+            active_source: None,
         }
     }
 
@@ -46,6 +49,9 @@ impl LogBuffer {
     }
 
     fn push_event(&mut self, line: String) {
+        let mut parsed = parse_compose_line(&line);
+        self.apply_source_context(&mut parsed);
+
         if self.capacity == 0 {
             self.next_sequence += 1;
             return;
@@ -55,9 +61,24 @@ impl LogBuffer {
             self.events.pop_front();
         }
 
-        let event = LogEvent::from_line(self.next_sequence, line);
+        let event = LogEvent::from_parsed_line(self.next_sequence, line, parsed);
         self.next_sequence += 1;
         self.events.push_back(event);
+    }
+
+    fn apply_source_context(&mut self, parsed: &mut ParsedLine) {
+        if parsed.source_explicit {
+            self.active_source = Some(parsed.source.clone());
+            return;
+        }
+
+        if is_continuation_line(&parsed.message) {
+            if let Some(source) = self.active_source.as_ref() {
+                parsed.source = source.clone();
+            }
+        } else {
+            self.active_source = None;
+        }
     }
 
     fn push_pending_property_line(&mut self, line: &str) -> bool {
@@ -103,6 +124,75 @@ impl LogBuffer {
     pub fn events(&self) -> &VecDeque<LogEvent> {
         &self.events
     }
+}
+
+fn is_continuation_line(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if message.chars().next().is_some_and(char::is_whitespace) {
+        return true;
+    }
+
+    trimmed.starts_with("at ")
+        || trimmed.starts_with("Caused by:")
+        || trimmed.starts_with("Suppressed:")
+        || trimmed.starts_with("...")
+        || looks_like_error_continuation(trimmed)
+        || looks_like_structured_continuation(trimmed)
+}
+
+fn looks_like_error_continuation(trimmed: &str) -> bool {
+    let Some((head, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+
+    head == "Error" || head.ends_with("Error") || head.ends_with("Exception")
+}
+
+fn looks_like_structured_continuation(trimmed: &str) -> bool {
+    matches!(
+        trimmed.chars().next(),
+        Some('{' | '}' | '[' | ']' | ',' | ')')
+    ) || looks_like_property_entry(trimmed)
+}
+
+fn looks_like_property_entry(trimmed: &str) -> bool {
+    let Some((key, value)) = trimmed.split_once(':') else {
+        return false;
+    };
+
+    if !looks_like_property_key(key.trim()) {
+        return false;
+    }
+
+    let value = value.trim().trim_end_matches(',').trim();
+    value
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '"' | '\'' | '{' | '['))
+        || matches!(value, "true" | "false" | "null")
+        || value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '-' || ch.is_ascii_digit())
+}
+
+fn looks_like_property_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+
+    let double_quoted = key.starts_with('"') && key.ends_with('"');
+    let single_quoted = key.starts_with('\'') && key.ends_with('\'');
+    if double_quoted || single_quoted {
+        return key.len() > 2;
+    }
+
+    key.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 impl PendingPropertyBlock {
@@ -157,6 +247,14 @@ impl PendingPropertyBlock {
 mod tests {
     use super::*;
 
+    fn sources(buffer: &LogBuffer) -> Vec<&str> {
+        buffer
+            .events()
+            .iter()
+            .map(|event| event.source.as_str())
+            .collect()
+    }
+
     #[test]
     fn retains_only_the_configured_number_of_lines() {
         let mut buffer = LogBuffer::new(3);
@@ -182,6 +280,60 @@ mod tests {
     }
 
     #[test]
+    fn inherits_source_for_unprefixed_stack_continuations() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[backend] ERROR failed".to_string());
+        buffer.push_line("    at handler (/app/src/main.ts:10:3)".to_string());
+        buffer.push_line("Caused by: TypeError: missing user".to_string());
+
+        assert_eq!(sources(&buffer), vec!["backend", "backend", "backend"]);
+        assert_eq!(
+            buffer.events()[1].message,
+            "    at handler (/app/src/main.ts:10:3)"
+        );
+        assert_eq!(buffer.events()[2].message, "Caused by: TypeError: missing user");
+    }
+
+    #[test]
+    fn inherits_source_for_unprefixed_structured_continuations() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] INFO request completed".to_string());
+        buffer.push_line("{".to_string());
+        buffer.push_line("requestId: \"abc-123\",".to_string());
+        buffer.push_line("}".to_string());
+
+        assert_eq!(sources(&buffer), vec!["api", "api", "api", "api"]);
+    }
+
+    #[test]
+    fn standalone_unprefixed_lines_reset_source_inheritance() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[backend] INFO ready".to_string());
+        buffer.push_line("VITE ready in 200 ms".to_string());
+        buffer.push_line("  plugin ready".to_string());
+
+        assert_eq!(sources(&buffer), vec!["backend", "unknown", "unknown"]);
+    }
+
+    #[test]
+    fn explicit_sources_update_inherited_source_context() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[backend] ERROR failed".to_string());
+        buffer.push_line("    at backend_handler".to_string());
+        buffer.push_line("[frontend] ERROR failed".to_string());
+        buffer.push_line("    at frontend_handler".to_string());
+
+        assert_eq!(
+            sources(&buffer),
+            vec!["backend", "backend", "frontend", "frontend"]
+        );
+    }
+
+    #[test]
     fn merges_property_block_into_previous_structured_event() {
         let mut buffer = LogBuffer::new(10);
 
@@ -200,6 +352,24 @@ mod tests {
         assert_eq!(event.properties.len(), 2);
         assert_eq!(event.properties[0].key, "messageKey");
         assert_eq!(event.properties[1].key, "statusCode");
+    }
+
+    #[test]
+    fn merges_prefixed_property_block_into_previous_structured_event() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[backend] 14:06:58.892 INFO http.request ok".to_string());
+        buffer.push_line("[backend] [14:06:58.892] INFO (#147):".to_string());
+        buffer.push_line("{".to_string());
+        buffer.push_line("requestId: \"abc-123\",".to_string());
+        buffer.push_line("}".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        let event = buffer.events().back().unwrap();
+        assert_eq!(event.source, "backend");
+        assert_eq!(event.message, "http.request ok");
+        assert_eq!(event.properties.len(), 1);
+        assert_eq!(event.properties[0].key, "requestId");
     }
 
     #[test]

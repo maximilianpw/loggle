@@ -180,13 +180,19 @@ Loggle treats common local-development output as structured events:
 | `14:06:58.892 INFO request ok` | `unknown` | `info` | `request ok` |
 | `INFO request ok` | `unknown` | `info` | `request ok` |
 | `plain output` | `unknown` | inferred or `unknown` | `plain output` |
+| `    at handler` after `[api] ERROR failed` | `api` | inferred or `unknown` | `    at handler` |
 
 The `source | message` form matches Docker Compose output. The `[source]
 message` form matches concurrently-style named output, including padded names
-such as `[backend ] message`.
+such as `[backend ] message` and colored prefixes.
 
 If no supported prefix is found, the source is shown as `unknown`. Loggle does
-not infer source names from unprefixed message content.
+not infer source names from standalone unprefixed message content because that
+identity is lost once an upstream tool merges streams without a marker.
+Unprefixed continuation lines can inherit the previous explicit source when they
+look like part of the same event, such as indented stack frames, `Caused by:`
+lines, or structured object fragments. A standalone unprefixed line resets that
+source context.
 
 The original raw line is preserved in memory, while the displayed message is
 cleaned for terminal use:

@@ -70,6 +70,7 @@ pub struct LogProperty {
 pub struct ParsedLine {
     pub source: String,
     pub message: String,
+    pub source_explicit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,23 +98,31 @@ pub struct LogEvent {
 }
 
 impl LogEvent {
+    #[cfg(test)]
     pub fn from_line(sequence: u64, raw: String) -> Self {
         let parsed = parse_compose_line(&raw);
-        let structured = parse_structured_message(&parsed.message);
+        Self::from_parsed_line(sequence, raw, parsed)
+    }
+
+    pub(crate) fn from_parsed_line(sequence: u64, raw: String, parsed: ParsedLine) -> Self {
+        let ParsedLine {
+            source, message, ..
+        } = parsed;
+        let structured = parse_structured_message(&message);
         let timestamp = structured
             .as_ref()
             .and_then(|message| message.timestamp.clone());
         let level = structured
             .as_ref()
             .map(|message| message.level)
-            .unwrap_or_else(|| infer_level(&parsed.message));
+            .unwrap_or_else(|| infer_level(&message));
         let message = structured
             .map(|message| message.message)
-            .unwrap_or(parsed.message);
+            .unwrap_or(message);
 
         Self {
             sequence,
-            source: parsed.source,
+            source,
             timestamp,
             level,
             raw,
@@ -132,34 +141,39 @@ impl LogEvent {
 }
 
 pub fn parse_compose_line(line: &str) -> ParsedLine {
-    if let Some(parsed) = parse_bracket_prefixed_line(line) {
+    let line = clean_display_text(line);
+
+    if let Some(parsed) = parse_bracket_prefixed_line(&line) {
         return parsed;
     }
 
     if let Some((source, message)) = line.split_once('|') {
-        let source = clean_display_text(source.trim());
+        let source = source.trim().to_string();
         if !source.is_empty() {
             return ParsedLine {
                 source,
-                message: clean_display_text(message.trim_start()),
+                message: message.trim_start().to_string(),
+                source_explicit: true,
             };
         }
     }
 
     ParsedLine {
         source: "unknown".to_string(),
-        message: clean_display_text(line),
+        message: line,
+        source_explicit: false,
     }
 }
 
 fn parse_bracket_prefixed_line(line: &str) -> Option<ParsedLine> {
     let rest = line.strip_prefix('[')?;
     let (source, message) = rest.split_once(']')?;
-    let source = clean_display_text(source.trim());
+    let source = source.trim().to_string();
 
     (!source.is_empty()).then(|| ParsedLine {
         source,
-        message: clean_display_text(message.trim_start()),
+        message: message.trim_start().to_string(),
+        source_explicit: true,
     })
 }
 
@@ -186,8 +200,7 @@ pub fn parse_structured_message(message: &str) -> Option<StructuredMessage> {
 }
 
 pub fn parse_property_block_header(line: &str) -> Option<PropertyBlockHeader> {
-    let message = message_without_compose_prefix(line);
-    let message = clean_display_text(message);
+    let message = message_without_source_prefix(line);
     let rest = message.trim().strip_prefix('[')?;
     let (timestamp, after_timestamp) = rest.split_once(']')?;
     if !looks_like_timestamp(timestamp) {
@@ -211,10 +224,21 @@ pub fn parse_property_block_header(line: &str) -> Option<PropertyBlockHeader> {
     })
 }
 
-fn message_without_compose_prefix(line: &str) -> &str {
+fn message_without_source_prefix(line: &str) -> String {
+    let line = clean_display_text(line);
+
     if let Some((source, message)) = line.split_once('|') {
         if !source.trim().is_empty() {
-            return message.trim_start();
+            return message.trim_start().to_string();
+        }
+    }
+
+    if let Some(rest) = line.strip_prefix('[') {
+        if let Some((source, message)) = rest.split_once(']') {
+            let source = source.trim();
+            if !source.is_empty() && !looks_like_timestamp(source) {
+                return message.trim_start().to_string();
+            }
         }
     }
 
@@ -494,18 +518,36 @@ mod tests {
 
         assert_eq!(parsed.source, "frontend");
         assert_eq!(parsed.message, "VITE ready");
+        assert!(parsed.source_explicit);
+    }
+
+    #[test]
+    fn parses_colored_concurrently_named_prefix() {
+        let parsed = parse_compose_line("\u{1b}[36m[backend]\u{1b}[0m INFO ready");
+
+        assert_eq!(parsed.source, "backend");
+        assert_eq!(parsed.message, "INFO ready");
+        assert!(parsed.source_explicit);
+    }
+
+    #[test]
+    fn parses_colored_concurrently_padded_prefix() {
+        let parsed = parse_compose_line("\u{1b}[35m[backend ]\u{1b}[0m ERROR failed");
+
+        assert_eq!(parsed.source, "backend");
+        assert_eq!(parsed.message, "ERROR failed");
+        assert!(parsed.source_explicit);
     }
 
     #[test]
     fn parses_concurrently_backend_prefix_with_level() {
-        let event = LogEvent::from_line(
-            0,
-            "[backend] INFO http.request GET /api/v1/auth/me 200".to_string(),
-        );
+        let raw = "[backend] INFO http.request GET /api/v1/auth/me 200".to_string();
+        let event = LogEvent::from_line(0, raw.clone());
 
         assert_eq!(event.source, "backend");
         assert_eq!(event.message, "http.request GET /api/v1/auth/me 200");
         assert_eq!(event.level, Level::Info);
+        assert_eq!(event.raw, raw);
     }
 
     #[test]
@@ -560,6 +602,7 @@ mod tests {
 
         assert_eq!(parsed.source, "0");
         assert_eq!(parsed.message, "started");
+        assert!(parsed.source_explicit);
     }
 
     #[test]
@@ -568,6 +611,7 @@ mod tests {
 
         assert_eq!(parsed.source, "unknown");
         assert_eq!(parsed.message, "plain line with no prefix");
+        assert!(!parsed.source_explicit);
     }
 
     #[test]
@@ -614,6 +658,26 @@ mod tests {
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
         assert!(parse_property_block_header("[frontend] VITE ready").is_none());
+    }
+
+    #[test]
+    fn parses_prefixed_property_block_header() {
+        let header =
+            parse_property_block_header("[backend] [14:06:58.892] INFO (#147):").unwrap();
+
+        assert_eq!(header.timestamp, "14:06:58.892");
+        assert_eq!(header.level, Level::Info);
+    }
+
+    #[test]
+    fn parses_colored_prefixed_property_block_header() {
+        let header = parse_property_block_header(
+            "\u{1b}[36m[backend]\u{1b}[0m [14:06:58.892] INFO (#147):",
+        )
+        .unwrap();
+
+        assert_eq!(header.timestamp, "14:06:58.892");
+        assert_eq!(header.level, Level::Info);
     }
 
     #[test]
