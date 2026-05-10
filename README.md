@@ -112,12 +112,19 @@ When using pipe mode, include `2>&1`; otherwise stderr can bypass Loggle.
 ```sh
 loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
+loggle --source-field service,app < app.log
+loggle run --name api -- pnpm start --name web -- pnpm dev
 ```
 
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
 - `--no-color`: disables Loggle's source and severity coloring
+- `--source-field <FIELD>`: promotes matching parsed properties to the source
+  column when no explicit prefix exists. Repeat it or pass comma-separated
+  fields, e.g. `--source-field service,app`
 - `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
+- `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
+  prefixes each output line with `[NAME]`, and shows them in one Loggle session
 
 ## Controls
 
@@ -179,6 +186,7 @@ Loggle treats common local-development output as structured events:
 | `[worker] WARN retrying` | `worker` | `warn` | `retrying` |
 | `14:06:58.892 INFO request ok` | `unknown` | `info` | `request ok` |
 | `INFO request ok` | `unknown` | `info` | `request ok` |
+| `INFO ready service=api` | `api` | `info` | `ready service=api` |
 | `plain output` | `unknown` | inferred or `unknown` | `plain output` |
 | `    at handler` after `[api] ERROR failed` | `api` | inferred or `unknown` | `    at handler` |
 
@@ -186,9 +194,12 @@ The `source | message` form matches Docker Compose output. The `[source]
 message` form matches concurrently-style named output, including padded names
 such as `[backend ] message` and colored prefixes.
 
-If no supported prefix is found, the source is shown as `unknown`. Loggle does
-not infer source names from standalone unprefixed message content because that
-identity is lost once an upstream tool merges streams without a marker.
+If no supported prefix is found, Loggle looks for parsed properties in this
+order: user-provided `--source-field` values, then `source`, `service`, `app`,
+`logger`, `target`, and `component`. If none are present, the source is shown as
+`unknown`. Explicit prefixes always win over promoted fields. Loggle does not
+infer source names from arbitrary standalone message words because that identity
+is lost once an upstream tool merges streams without a marker.
 Unprefixed continuation lines can inherit the previous explicit source when they
 look like part of the same event, such as indented stack frames, `Caused by:`
 lines, or structured object fragments. A standalone unprefixed line resets that
@@ -226,6 +237,10 @@ previous event instead of shown as separate rows:
     durationMs: 96,
   }
 ```
+
+Inline `key=value` tokens in the displayed message are also parsed as
+properties. Quoted values such as `service="api server"` are supported for
+filtering and source promotion.
 
 Property filters support exact values and key existence. Use `key=value` or
 `key` to show matching rows, and `key!=value` or `!key` to hide matching rows.
