@@ -21,6 +21,8 @@ Loggle turns noisy multi-process output into a scannable live log view:
 
 ![Loggle running against Docker Compose logs](public/docker.jpg)
 
+![Loggle interactive demo](public/demo.gif)
+
 ```text
  loggle follow  retained 1248  visible 42
 >    147 api             info    http.request GET /api/v1/inventory 200 96ms requestId=716d1e62 durationMs=96
