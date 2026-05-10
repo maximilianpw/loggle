@@ -86,6 +86,15 @@ impl LogFilter {
         true
     }
 
+    pub fn property_highlight_values(&self) -> Vec<&str> {
+        self.property_includes
+            .iter()
+            .chain(self.property_excludes.iter())
+            .filter_map(|predicate| predicate.value.as_deref())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
     fn matches_text(&self, event: &LogEvent) -> bool {
         let Some(query) = self.text.as_ref().filter(|query| !query.is_empty()) else {
             return true;

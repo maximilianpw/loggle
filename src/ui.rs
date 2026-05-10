@@ -111,6 +111,7 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, app: &App, color_enabled: bool) 
     );
 
     let visible_events = app.visible_events();
+    let highlight_values = app.filters().property_highlight_values();
     let viewport_height = area.height as usize;
     let selected = app.selected();
     let start = selected.saturating_sub(viewport_height.saturating_sub(1));
@@ -126,6 +127,7 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, app: &App, color_enabled: bool) 
                 color_enabled,
                 visible_index == selected,
                 app.message_field_keys(),
+                &highlight_values,
             ))
         })
         .collect::<Vec<_>>();

@@ -13,6 +13,7 @@ pub(super) struct GraphiteTheme {
     pub debug: Color,
     pub trace: Color,
     pub unknown: Color,
+    pub highlight: Color,
     pub line_number_bg: Color,
     pub line_number_fg: Color,
 }
@@ -29,6 +30,7 @@ pub(super) const THEME: GraphiteTheme = GraphiteTheme {
     debug: Color::Rgb(127, 209, 255),
     trace: Color::Rgb(196, 155, 255),
     unknown: Color::Rgb(121, 133, 146),
+    highlight: Color::Rgb(255, 224, 102),
     line_number_bg: Color::Rgb(20, 24, 27),
     line_number_fg: Color::Rgb(121, 133, 146),
 };

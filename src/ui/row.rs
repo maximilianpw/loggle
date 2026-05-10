@@ -15,6 +15,7 @@ pub(super) fn render_event(
     color_enabled: bool,
     selected: bool,
     message_field_keys: &[String],
+    highlight_values: &[&str],
 ) -> Line<'static> {
     let row_bg = if selected {
         THEME.panel_alt
@@ -51,7 +52,11 @@ pub(super) fn render_event(
         Span::styled(format!("{:<7}", event.level.to_string()), level_style),
         Span::styled(" ", row_style),
     ];
-    spans.push(Span::styled(compact_whitespace(&event.message), row_style));
+    spans.extend(message_spans(
+        &compact_whitespace(&event.message),
+        row_style,
+        highlight_values,
+    ));
 
     for key in message_field_keys {
         if let Some(property) = event.property(key) {
@@ -64,6 +69,41 @@ pub(super) fn render_event(
     }
 
     Line::from(spans)
+}
+
+fn message_spans(message: &str, row_style: Style, highlight_values: &[&str]) -> Vec<Span<'static>> {
+    let highlight_style = row_style
+        .fg(THEME.background)
+        .bg(THEME.highlight)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut remaining = message;
+
+    while !remaining.is_empty() {
+        let Some((start, value)) = earliest_match(remaining, highlight_values) else {
+            spans.push(Span::styled(remaining.to_string(), row_style));
+            break;
+        };
+
+        if start > 0 {
+            spans.push(Span::styled(remaining[..start].to_string(), row_style));
+        }
+
+        let end = start + value.len();
+        spans.push(Span::styled(remaining[start..end].to_string(), highlight_style));
+        remaining = &remaining[end..];
+    }
+
+    spans
+}
+
+fn earliest_match<'a>(message: &str, highlight_values: &'a [&str]) -> Option<(usize, &'a str)> {
+    highlight_values
+        .iter()
+        .copied()
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| message.find(value).map(|index| (index, value)))
+        .min_by_key(|(index, value)| (*index, std::cmp::Reverse(value.len())))
 }
 
 fn level_color(level: Level) -> Color {
@@ -145,10 +185,59 @@ mod tests {
             false,
             false,
             &["tenantId".to_string(), "missing".to_string()],
+            &[],
         );
         let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
 
         assert!(text.ends_with("request completed tenantId=tenant-1"));
         assert!(!text.contains("missing="));
+    }
+
+    #[test]
+    fn property_values_are_highlighted_inside_message_text() {
+        let event = LogEvent::from_line(
+            1,
+            "api | INFO request tenant-1 completed for abc".to_string(),
+        );
+
+        let row = render_event(&event, false, false, &[], &["tenant-1"]);
+        let highlighted = row
+            .spans
+            .into_iter()
+            .filter(|span| span.style.bg == Some(THEME.highlight))
+            .map(|span| span.content)
+            .collect::<String>();
+
+        assert_eq!(highlighted, "tenant-1");
+    }
+
+    #[test]
+    fn multiple_property_values_are_highlighted_inside_message_text() {
+        let event = LogEvent::from_line(
+            1,
+            "api | INFO request tenant-1 completed for abc".to_string(),
+        );
+
+        let row = render_event(&event, false, false, &[], &["tenant-1", "abc"]);
+        let highlighted = row
+            .spans
+            .into_iter()
+            .filter(|span| span.style.bg == Some(THEME.highlight))
+            .map(|span| span.content)
+            .collect::<Vec<_>>();
+
+        assert_eq!(highlighted, vec!["tenant-1", "abc"]);
+    }
+
+    #[test]
+    fn empty_highlight_values_do_not_change_message_styling() {
+        let event = LogEvent::from_line(1, "api | INFO request completed".to_string());
+
+        let row = render_event(&event, false, false, &[], &[]);
+
+        assert!(row
+            .spans
+            .into_iter()
+            .all(|span| span.style.bg != Some(THEME.highlight)));
     }
 }
