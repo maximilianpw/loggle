@@ -12,4 +12,6 @@ pub use config::{
     named_config_path, parse_config, project_config_path,
 };
 pub use model::SourceConfig;
-pub use runtime::{NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, run};
+pub use runtime::{
+    NamedCommand, ReadySpec, RuntimeConfig, RuntimeError, RuntimeInput, StartCommand, run,
+};

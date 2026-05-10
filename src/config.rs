@@ -2,11 +2,12 @@ use std::{
     collections::BTreeMap,
     env, fmt, fs, io,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
 
-use crate::runtime::NamedCommand;
+use crate::runtime::{ReadySpec, StartCommand};
 
 const PROJECT_CONFIG_FILE: &str = ".loggle.toml";
 const CONFIG_DIR_NAME: &str = "loggle";
@@ -15,7 +16,7 @@ const CONFIG_DIR_NAME: &str = "loggle";
 pub struct StartConfig {
     pub root: PathBuf,
     pub source_fields: Vec<String>,
-    pub commands: Vec<NamedCommand>,
+    pub commands: Vec<StartCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,26 +203,13 @@ fn validate_config(
             if name.is_empty() {
                 return Err(validation_error(path.clone(), "command names must not be empty"));
             }
-            if command.is_empty() {
-                return Err(validation_error(
-                    path.clone(),
-                    format!("command '{name}' must not be empty"),
-                ));
-            }
-            if command[0].trim().is_empty() {
-                return Err(validation_error(
-                    path.clone(),
-                    format!("command '{name}' executable must not be empty"),
-                ));
-            }
 
-            Ok(NamedCommand {
-                name,
-                command,
-                cwd: Some(root.clone()),
-            })
+            let command = validate_command(name, command, &root, path.clone())?;
+            Ok(command)
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    validate_dependency_graph(&commands, path.clone())?;
 
     Ok(StartConfig {
         root,
@@ -235,6 +223,263 @@ fn validation_error(path: Option<PathBuf>, message: impl Into<String>) -> Config
         path,
         message: message.into(),
     }
+}
+
+fn validate_command(
+    name: String,
+    command: RawCommand,
+    root: &Path,
+    path: Option<PathBuf>,
+) -> Result<StartCommand, ConfigError> {
+    let RawCommandParts {
+        argv,
+        argv_field,
+        wait_for,
+        ready,
+    } = match command {
+        RawCommand::Simple(argv) => RawCommandParts {
+            argv,
+            argv_field: None,
+            wait_for: Vec::new(),
+            ready: None,
+        },
+        RawCommand::Advanced(command) => RawCommandParts {
+            argv: command.argv.ok_or_else(|| {
+                validation_error(
+                    path.clone(),
+                    format!("command '{name}' advanced form must include `argv`"),
+                )
+            })?,
+            argv_field: Some("argv"),
+            wait_for: command.wait_for,
+            ready: command.ready,
+        },
+    };
+
+    validate_argv(&name, &argv, argv_field, path.clone())?;
+
+    let wait_for = wait_for
+        .into_iter()
+        .map(|dependency| dependency.trim().to_string())
+        .map(|dependency| {
+            if dependency.is_empty() {
+                Err(validation_error(
+                    path.clone(),
+                    format!("command '{name}' wait_for must not contain empty command names"),
+                ))
+            } else {
+                Ok(dependency)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let ready = ready
+        .map(|ready| validate_ready(&name, ready, path.clone()))
+        .transpose()?;
+
+    Ok(StartCommand {
+        name,
+        argv,
+        cwd: Some(root.to_path_buf()),
+        wait_for,
+        ready,
+    })
+}
+
+struct RawCommandParts {
+    argv: Vec<String>,
+    argv_field: Option<&'static str>,
+    wait_for: Vec<String>,
+    ready: Option<RawReady>,
+}
+
+fn validate_argv(
+    command_name: &str,
+    argv: &[String],
+    field_name: Option<&str>,
+    path: Option<PathBuf>,
+) -> Result<(), ConfigError> {
+    if argv.is_empty() {
+        let field_name = field_name
+            .map(|field_name| format!(" {field_name}"))
+            .unwrap_or_default();
+        return Err(validation_error(
+            path,
+            format!("command '{command_name}'{field_name} must not be empty"),
+        ));
+    }
+    if argv[0].trim().is_empty() {
+        return Err(validation_error(
+            path,
+            format!("command '{command_name}' executable must not be empty"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_ready(
+    command_name: &str,
+    ready: RawReady,
+    path: Option<PathBuf>,
+) -> Result<ReadySpec, ConfigError> {
+    let strategy_count = usize::from(ready.line.is_some()) + usize::from(ready.command.is_some());
+    if strategy_count != 1 {
+        return Err(validation_error(
+            path,
+            format!(
+                "command '{command_name}' ready must include exactly one of `line` or `command`"
+            ),
+        ));
+    }
+
+    let timeout = duration_ms(
+        command_name,
+        "ready.timeout_ms",
+        ready.timeout_ms.unwrap_or(30_000),
+        path.clone(),
+    )?;
+
+    if let Some(line) = ready.line {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return Err(validation_error(
+                path,
+                format!("command '{command_name}' ready.line must not be empty"),
+            ));
+        }
+
+        return Ok(ReadySpec::Line {
+            text: line,
+            timeout,
+        });
+    }
+
+    let command = ready.command.unwrap_or_default();
+    validate_argv(command_name, &command, Some("ready.command"), path.clone())?;
+    let interval = duration_ms(command_name, "ready.ms", ready.ms.unwrap_or(500), path)?;
+
+    Ok(ReadySpec::Command {
+        command,
+        interval,
+        timeout,
+    })
+}
+
+fn duration_ms(
+    command_name: &str,
+    field_name: &str,
+    value: u64,
+    path: Option<PathBuf>,
+) -> Result<Duration, ConfigError> {
+    if value == 0 {
+        Err(validation_error(
+            path,
+            format!("command '{command_name}' {field_name} must be greater than zero"),
+        ))
+    } else {
+        Ok(Duration::from_millis(value))
+    }
+}
+
+fn validate_dependency_graph(
+    commands: &[StartCommand],
+    path: Option<PathBuf>,
+) -> Result<(), ConfigError> {
+    let command_indexes = commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| (command.name.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+
+    for command in commands {
+        for dependency in &command.wait_for {
+            if !command_indexes.contains_key(dependency.as_str()) {
+                return Err(validation_error(
+                    path,
+                    format!(
+                        "command '{}' waits for unknown command '{}'",
+                        command.name, dependency
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut states = vec![VisitState::Unvisited; commands.len()];
+    let mut stack = Vec::new();
+    for index in 0..commands.len() {
+        visit_dependencies(
+            index,
+            commands,
+            &command_indexes,
+            &mut states,
+            &mut stack,
+            path.clone(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn visit_dependencies(
+    index: usize,
+    commands: &[StartCommand],
+    command_indexes: &BTreeMap<&str, usize>,
+    states: &mut [VisitState],
+    stack: &mut Vec<usize>,
+    path: Option<PathBuf>,
+) -> Result<(), ConfigError> {
+    match states[index] {
+        VisitState::Visited => return Ok(()),
+        VisitState::Visiting => {
+            return Err(validation_error(
+                path,
+                format_cycle(commands, stack, index),
+            ));
+        }
+        VisitState::Unvisited => {}
+    }
+
+    states[index] = VisitState::Visiting;
+    stack.push(index);
+
+    for dependency in &commands[index].wait_for {
+        let dependency_index = command_indexes[dependency.as_str()];
+        visit_dependencies(
+            dependency_index,
+            commands,
+            command_indexes,
+            states,
+            stack,
+            path.clone(),
+        )?;
+    }
+
+    stack.pop();
+    states[index] = VisitState::Visited;
+    Ok(())
+}
+
+fn format_cycle(commands: &[StartCommand], stack: &[usize], repeated_index: usize) -> String {
+    let start = stack
+        .iter()
+        .position(|index| *index == repeated_index)
+        .unwrap_or(0);
+    let mut names = stack[start..]
+        .iter()
+        .map(|index| commands[*index].name.as_str())
+        .collect::<Vec<_>>();
+    names.push(commands[repeated_index].name.as_str());
+
+    format!("command dependency cycle detected: {}", names.join(" -> "))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    Unvisited,
+    Visiting,
+    Visited,
 }
 
 fn validate_config_name(name: &str) -> Result<&str, ConfigError> {
@@ -263,7 +508,32 @@ struct RawConfig {
     root: Option<PathBuf>,
     #[serde(default)]
     source_fields: Vec<String>,
-    commands: Option<BTreeMap<String, Vec<String>>>,
+    commands: Option<BTreeMap<String, RawCommand>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawCommand {
+    Simple(Vec<String>),
+    Advanced(RawAdvancedCommand),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAdvancedCommand {
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    wait_for: Vec<String>,
+    ready: Option<RawReady>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReady {
+    line: Option<String>,
+    command: Option<Vec<String>>,
+    ms: Option<u64>,
+    timeout_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -296,17 +566,101 @@ web = ["pnpm", "--filter", "web", "dev"]
         assert_eq!(
             config.commands,
             vec![
-                NamedCommand {
+                StartCommand {
                     name: "api".to_string(),
-                    command: command(&["pnpm", "--filter", "api", "dev"]),
+                    argv: command(&["pnpm", "--filter", "api", "dev"]),
                     cwd: Some(PathBuf::from("/Users/max-vev/Local/librestock")),
+                    wait_for: Vec::new(),
+                    ready: None,
                 },
-                NamedCommand {
+                StartCommand {
                     name: "web".to_string(),
-                    command: command(&["pnpm", "--filter", "web", "dev"]),
+                    argv: command(&["pnpm", "--filter", "web", "dev"]),
                     cwd: Some(PathBuf::from("/Users/max-vev/Local/librestock")),
+                    wait_for: Vec::new(),
+                    ready: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_advanced_start_config_with_readiness_dependencies() {
+        let config = parse_config(
+            r#"
+root = "/tmp/project"
+
+[commands.db]
+argv = ["docker", "compose", "up", "postgres"]
+
+[commands.db.ready]
+command = ["docker", "compose", "exec", "-T", "postgres", "pg_isready"]
+ms = 250
+timeout_ms = 1000
+
+[commands.api]
+argv = ["pnpm", "start"]
+wait_for = ["db"]
+ready = { line = "ready", timeout_ms = 2000 }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.commands,
+            vec![
+                StartCommand {
+                    name: "api".to_string(),
+                    argv: command(&["pnpm", "start"]),
+                    cwd: Some(PathBuf::from("/tmp/project")),
+                    wait_for: command(&["db"]),
+                    ready: Some(ReadySpec::Line {
+                        text: "ready".to_string(),
+                        timeout: Duration::from_millis(2000),
+                    }),
+                },
+                StartCommand {
+                    name: "db".to_string(),
+                    argv: command(&["docker", "compose", "up", "postgres"]),
+                    cwd: Some(PathBuf::from("/tmp/project")),
+                    wait_for: Vec::new(),
+                    ready: Some(ReadySpec::Command {
+                        command: command(&[
+                            "docker",
+                            "compose",
+                            "exec",
+                            "-T",
+                            "postgres",
+                            "pg_isready",
+                        ]),
+                        interval: Duration::from_millis(250),
+                        timeout: Duration::from_millis(1000),
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn applies_readiness_defaults() {
+        let config = parse_config(
+            r#"
+root = "/tmp/project"
+
+[commands.api]
+argv = ["pnpm", "start"]
+ready = { command = ["true"] }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.commands[0].ready,
+            Some(ReadySpec::Command {
+                command: command(&["true"]),
+                interval: Duration::from_millis(500),
+                timeout: Duration::from_millis(30_000),
+            })
         );
     }
 
@@ -345,6 +699,110 @@ web = ["pnpm", "--filter", "web", "dev"]
                 .unwrap_err()
                 .to_string(),
             "invalid config: command 'api' must not be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_advanced_argv() {
+        assert_eq!(
+            parse_config("root = \"/tmp\"\n[commands.api]\nargv = []")
+                .unwrap_err()
+                .to_string(),
+            "invalid config: command 'api' argv must not be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_ready_without_strategy() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+
+[commands.api]
+argv = ["pnpm", "start"]
+ready = { timeout_ms = 1000 }
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: command 'api' ready must include exactly one of `line` or `command`"
+        );
+    }
+
+    #[test]
+    fn rejects_ready_with_multiple_strategies() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+
+[commands.api]
+argv = ["pnpm", "start"]
+ready = { line = "ready", command = ["true"] }
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: command 'api' ready must include exactly one of `line` or `command`"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_ready_command() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+
+[commands.api]
+argv = ["pnpm", "start"]
+ready = { command = [] }
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: command 'api' ready.command must not be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_wait_target() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+
+[commands.api]
+argv = ["pnpm", "start"]
+wait_for = ["db"]
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: command 'api' waits for unknown command 'db'"
+        );
+    }
+
+    #[test]
+    fn rejects_dependency_cycles() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+
+[commands.api]
+argv = ["pnpm", "start"]
+wait_for = ["web"]
+
+[commands.web]
+argv = ["pnpm", "dev"]
+wait_for = ["api"]
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: command dependency cycle detected: api -> web -> api"
         );
     }
 

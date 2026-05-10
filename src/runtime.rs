@@ -2,7 +2,7 @@ mod input;
 mod keys;
 mod terminal;
 
-use std::{fmt, io, path::PathBuf, process::Child};
+use std::{fmt, io, path::PathBuf, process::Child, time::Duration};
 
 use tokio::sync::mpsc;
 
@@ -21,6 +21,7 @@ pub enum RuntimeInput {
     Stdin,
     Command(Vec<String>),
     Commands(Vec<NamedCommand>),
+    StartCommands(Vec<StartCommand>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,28 @@ pub struct NamedCommand {
     pub name: String,
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartCommand {
+    pub name: String,
+    pub argv: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub wait_for: Vec<String>,
+    pub ready: Option<ReadySpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadySpec {
+    Line {
+        text: String,
+        timeout: Duration,
+    },
+    Command {
+        command: Vec<String>,
+        interval: Duration,
+        timeout: Duration,
+    },
 }
 
 #[derive(Debug)]
@@ -91,5 +114,6 @@ fn start_input(
         }
         RuntimeInput::Command(command) => Ok(vec![input::spawn_command(command, tx)?]),
         RuntimeInput::Commands(commands) => Ok(input::spawn_named_commands(commands, tx)?),
+        RuntimeInput::StartCommands(commands) => Ok(input::spawn_start_commands(commands, tx)?),
     }
 }

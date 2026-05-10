@@ -3,7 +3,7 @@ use std::{error::Error, path::Path};
 use clap::Parser;
 use loggle::{
     ConfigEnv, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
-    load_named_config, load_project_config, run,
+    StartCommand, load_named_config, load_project_config, run,
 };
 
 #[derive(Debug, Parser)]
@@ -237,7 +237,7 @@ fn parse_start_command(
     .map_err(|error| error.to_string())?;
 
     Ok(ResolvedRuntimeInput {
-        input: RuntimeInput::Commands(config.commands),
+        input: RuntimeInput::StartCommands(config.commands),
         source_fields: config.source_fields,
     })
 }
@@ -406,10 +406,12 @@ api = ["pnpm", "start"]
         assert_eq!(resolved.source_fields, command(&["service", "app"]));
         assert_eq!(
             resolved.input,
-            RuntimeInput::Commands(vec![NamedCommand {
+            RuntimeInput::StartCommands(vec![StartCommand {
                 name: "api".to_string(),
-                command: command(&["pnpm", "start"]),
+                argv: command(&["pnpm", "start"]),
                 cwd: Some(root),
+                wait_for: Vec::new(),
+                ready: None,
             }])
         );
         let _ = fs::remove_dir_all(project_dir);
@@ -454,10 +456,12 @@ api = ["pnpm", "start"]
 
         assert_eq!(
             resolved.input,
-            RuntimeInput::Commands(vec![NamedCommand {
+            RuntimeInput::StartCommands(vec![StartCommand {
                 name: "api".to_string(),
-                command: command(&["pnpm", "start"]),
+                argv: command(&["pnpm", "start"]),
                 cwd: Some(root),
+                wait_for: Vec::new(),
+                ready: None,
             }])
         );
         let _ = fs::remove_dir_all(home);

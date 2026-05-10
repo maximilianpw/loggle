@@ -127,6 +127,50 @@ web = ["pnpm", "--filter", "web", "dev"]
 `root`, and is displayed with its table key as the source prefix, such as
 `[api]`.
 
+Commands can also use an advanced table form when startup ordering matters:
+
+```toml
+root = ".."
+
+[commands.db]
+argv = ["docker", "compose", "-f", "meta/docker-compose.yml", "up", "postgres"]
+
+[commands.db.ready]
+command = [
+  "docker",
+  "compose",
+  "-f",
+  "meta/docker-compose.yml",
+  "exec",
+  "-T",
+  "postgres",
+  "pg_isready",
+  "-U",
+  "postgres",
+]
+ms = 500
+timeout_ms = 30000
+
+[commands.api]
+argv = ["pnpm", "--filter", "@librestock/api", "start"]
+wait_for = ["db"]
+
+[commands.web]
+argv = ["pnpm", "--filter", "@librestock/web", "dev"]
+wait_for = ["api"]
+```
+
+`wait_for` delays a command until each named dependency is ready. A dependency
+without a `ready` block is ready immediately after it starts. Readiness supports
+one strategy per command:
+
+- `ready.line = "text"`: ready when stdout or stderr contains the substring.
+- `ready.command = ["cmd", "args"]`: ready when the probe exits successfully.
+
+`ready.timeout_ms` defaults to `30000`. `ready.ms` sets the probe interval for
+`ready.command` and defaults to `500`. Successful probe output is not shown in
+Loggle; timeout errors include recent probe output when there is any.
+
 Use `loggle start <name>` for reusable named configs. Named configs live at
 `$XDG_CONFIG_HOME/loggle/<name>.toml`, or `~/.config/loggle/<name>.toml` when
 `XDG_CONFIG_HOME` is not set.
