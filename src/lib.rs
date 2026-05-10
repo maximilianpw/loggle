@@ -7,4 +7,4 @@ mod runtime;
 mod ui;
 
 pub use model::SourceConfig;
-pub use runtime::{RuntimeConfig, RuntimeError, run};
+pub use runtime::{NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, run};

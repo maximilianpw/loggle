@@ -13,6 +13,19 @@ pub struct RuntimeConfig {
     pub buffer_lines: usize,
     pub color_enabled: bool,
     pub source_config: SourceConfig,
+    pub input: RuntimeInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeInput {
+    Stdin,
+    Command(Vec<String>),
+    Commands(Vec<NamedCommand>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedCommand {
+    pub name: String,
     pub command: Vec<String>,
 }
 
@@ -26,7 +39,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingInput => f.write_str(
-                "loggle reads newline-delimited logs from stdin or runs a command.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up",
+                "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle run --name api -- pnpm start --name web -- pnpm dev",
             ),
             Self::Io(error) => write!(f, "{error}"),
         }
@@ -50,30 +63,32 @@ impl From<io::Error> for RuntimeError {
 
 pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
     let (tx, rx) = mpsc::channel(input::LINE_CHANNEL_CAPACITY);
-    let child = start_input(&config.command, tx)?;
+    let children = start_input(&config.input, tx)?;
 
     terminal::run(
         rx,
         config.buffer_lines,
         config.color_enabled,
         config.source_config,
-        child,
+        children,
     )
     .map_err(RuntimeError::from)
 }
 
 fn start_input(
-    command: &[String],
+    input_mode: &RuntimeInput,
     tx: mpsc::Sender<String>,
-) -> Result<Option<Child>, RuntimeError> {
-    if command.is_empty() {
-        if input::stdin_is_terminal() {
-            return Err(RuntimeError::MissingInput);
-        }
+) -> Result<Vec<Child>, RuntimeError> {
+    match input_mode {
+        RuntimeInput::Stdin => {
+            if input::stdin_is_terminal() {
+                return Err(RuntimeError::MissingInput);
+            }
 
-        input::spawn_stdin_reader(tx)?;
-        Ok(None)
-    } else {
-        Ok(Some(input::spawn_command(command, tx)?))
+            input::spawn_stdin_reader(tx)?;
+            Ok(Vec::new())
+        }
+        RuntimeInput::Command(command) => Ok(vec![input::spawn_command(command, tx)?]),
+        RuntimeInput::Commands(commands) => Ok(input::spawn_named_commands(commands, tx)?),
     }
 }

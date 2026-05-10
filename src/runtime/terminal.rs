@@ -25,7 +25,7 @@ pub(super) fn run(
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
-    mut child: Option<Child>,
+    mut children: Vec<Child>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -39,11 +39,11 @@ pub(super) fn run(
         buffer_lines,
         color_enabled,
         source_config,
-        &mut child,
+        &mut children,
     );
 
     if result.is_err() {
-        if let Some(child) = child.as_mut() {
+        for child in &mut children {
             input::force_kill_child_group(child);
         }
     }
@@ -61,20 +61,28 @@ fn run_app(
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
-    child: &mut Option<Child>,
+    children: &mut Vec<Child>,
 ) -> io::Result<()> {
     let mut app = App::with_source_config(buffer_lines, source_config);
-    let mut shutdown: Option<ChildShutdown> = None;
+    let mut shutdown: Option<Vec<ChildShutdown>> = None;
 
     loop {
         while let Ok(line) = rx.try_recv() {
             app.push_line(line);
         }
 
-        if let (Some(active_child), Some(active_shutdown)) = (child.as_mut(), shutdown.as_mut()) {
-            if let ShutdownStatus::Exited = active_shutdown.tick(active_child, Instant::now())? {
-                input::reap_child(active_child);
-                child.take();
+        if let Some(active_shutdowns) = shutdown.as_mut() {
+            let mut all_exited = true;
+            for (active_child, active_shutdown) in children.iter_mut().zip(active_shutdowns) {
+                if let ShutdownStatus::Exited = active_shutdown.tick(active_child, Instant::now())? {
+                    input::reap_child(active_child);
+                } else {
+                    all_exited = false;
+                }
+            }
+
+            if all_exited {
+                children.clear();
                 return Ok(());
             }
         }
@@ -84,7 +92,7 @@ fn run_app(
                 frame,
                 &app,
                 color_enabled,
-                shutdown.as_ref().map(closing_message),
+                shutdown.as_deref().map(closing_message),
             )
         })?;
 
@@ -101,13 +109,22 @@ fn run_app(
             };
 
             if requested_quit {
-                match (child.as_ref(), shutdown.as_mut()) {
-                    (None, _) => return Ok(()),
-                    (Some(child), None) => {
-                        shutdown = Some(ChildShutdown::start(child, Instant::now()));
+                match shutdown.as_mut() {
+                    _ if children.is_empty() => return Ok(()),
+                    None => {
+                        let now = Instant::now();
+                        shutdown = Some(
+                            children
+                                .iter()
+                                .map(|child| ChildShutdown::start(child, now))
+                                .collect(),
+                        );
                     }
-                    (Some(_), Some(active_shutdown)) => {
-                        active_shutdown.escalate_now(Instant::now());
+                    Some(active_shutdowns) => {
+                        let now = Instant::now();
+                        for active_shutdown in active_shutdowns {
+                            active_shutdown.escalate_now(now);
+                        }
                     }
                 }
             }
@@ -115,11 +132,17 @@ fn run_app(
     }
 }
 
-fn closing_message(shutdown: &ChildShutdown) -> &'static str {
-    match shutdown.status() {
+fn closing_message(shutdowns: &[ChildShutdown]) -> &'static str {
+    let status = shutdowns
+        .iter()
+        .map(ChildShutdown::status)
+        .find(|status| !matches!(status, ShutdownStatus::Exited))
+        .unwrap_or(ShutdownStatus::Exited);
+
+    match status {
         ShutdownStatus::Waiting(ShutdownSignal::Interrupt) => "closing... sent interrupt",
-        ShutdownStatus::Waiting(ShutdownSignal::Terminate) => "closing... terminating child",
-        ShutdownStatus::Waiting(ShutdownSignal::Kill) => "closing... force killing child",
-        ShutdownStatus::Exited => "closing... child exited",
+        ShutdownStatus::Waiting(ShutdownSignal::Terminate) => "closing... terminating children",
+        ShutdownStatus::Waiting(ShutdownSignal::Kill) => "closing... force killing children",
+        ShutdownStatus::Exited => "closing... children exited",
     }
 }

@@ -1,14 +1,16 @@
 use std::{
     fs::File,
     io::{self, BufRead, IsTerminal, Read},
-    os::unix::process::CommandExt,
     os::fd::FromRawFd,
+    os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc;
+
+use super::NamedCommand;
 
 pub(super) const LINE_CHANNEL_CAPACITY: usize = 1024;
 
@@ -23,6 +25,53 @@ pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<String>) -> io::Result<()> {
 }
 
 pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io::Result<Child> {
+    let mut child = spawn_child(command)?;
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_line_reader(stdout, tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_line_reader(stderr, tx);
+    }
+
+    Ok(child)
+}
+
+pub(super) fn spawn_named_commands(
+    commands: &[NamedCommand],
+    tx: mpsc::Sender<String>,
+) -> io::Result<Vec<Child>> {
+    let mut children = Vec::with_capacity(commands.len());
+
+    for command in commands {
+        match spawn_named_command(command, tx.clone()) {
+            Ok(child) => children.push(child),
+            Err(error) => {
+                for child in &mut children {
+                    force_kill_child_group(child);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(children)
+}
+
+fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
+    let mut child = spawn_child(&command.command)?;
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_prefixed_line_reader(stdout, command.name.clone(), tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_prefixed_line_reader(stderr, command.name.clone(), tx);
+    }
+
+    Ok(child)
+}
+
+fn spawn_child(command: &[String]) -> io::Result<Child> {
     let mut command_builder = Command::new(&command[0]);
     command_builder
         .args(&command[1..])
@@ -39,16 +88,7 @@ pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io:
         });
     }
 
-    let mut child = command_builder.spawn()?;
-
-    if let Some(stdout) = child.stdout.take() {
-        spawn_line_reader(stdout, tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_line_reader(stderr, tx);
-    }
-
-    Ok(child)
+    command_builder.spawn()
 }
 
 fn prepare_terminal_input() -> io::Result<File> {
@@ -67,7 +107,21 @@ where
     thread::spawn(move || read_lines(input, tx));
 }
 
+fn spawn_prefixed_line_reader<R>(input: R, source: String, tx: mpsc::Sender<String>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || read_lines_with_prefix(input, Some(source), tx));
+}
+
 fn read_lines<R>(input: R, tx: mpsc::Sender<String>)
+where
+    R: Read,
+{
+    read_lines_with_prefix(input, None, tx);
+}
+
+fn read_lines_with_prefix<R>(input: R, source: Option<String>, tx: mpsc::Sender<String>)
 where
     R: Read,
 {
@@ -75,6 +129,10 @@ where
     for line in reader.lines() {
         match line {
             Ok(line) => {
+                let line = source
+                    .as_ref()
+                    .map(|source| format!("[{source}] {line}"))
+                    .unwrap_or(line);
                 if tx.blocking_send(line).is_err() {
                     break;
                 }
@@ -217,6 +275,17 @@ mod tests {
 
         assert_eq!(rx.blocking_recv(), Some("one".to_string()));
         assert_eq!(rx.blocking_recv(), Some("two".to_string()));
+        assert_eq!(rx.blocking_recv(), None);
+    }
+
+    #[test]
+    fn prefixed_line_reader_marks_each_line_with_source_name() {
+        let (tx, mut rx) = mpsc::channel(4);
+
+        read_lines_with_prefix("one\ntwo\n".as_bytes(), Some("api".to_string()), tx);
+
+        assert_eq!(rx.blocking_recv(), Some("[api] one".to_string()));
+        assert_eq!(rx.blocking_recv(), Some("[api] two".to_string()));
         assert_eq!(rx.blocking_recv(), None);
     }
 
