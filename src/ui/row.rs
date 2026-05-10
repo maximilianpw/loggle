@@ -102,8 +102,37 @@ fn earliest_match<'a>(message: &str, highlight_values: &'a [&str]) -> Option<(us
         .iter()
         .copied()
         .filter(|value| !value.is_empty())
-        .filter_map(|value| message.find(value).map(|index| (index, value)))
+        .filter_map(|value| highlight_match(message, value).map(|index| (index, value)))
         .min_by_key(|(index, value)| (*index, std::cmp::Reverse(value.len())))
+}
+
+fn highlight_match(message: &str, value: &str) -> Option<usize> {
+    message
+        .match_indices(value)
+        .find_map(|(index, _)| highlight_match_allowed(message, index, value).then_some(index))
+}
+
+fn highlight_match_allowed(message: &str, start: usize, value: &str) -> bool {
+    if value.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+
+    let end = start + value.len();
+    !adjacent_char(message, start, Direction::Before).is_some_and(char::is_alphanumeric)
+        && !adjacent_char(message, end, Direction::After).is_some_and(char::is_alphanumeric)
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Before,
+    After,
+}
+
+fn adjacent_char(message: &str, index: usize, direction: Direction) -> Option<char> {
+    match direction {
+        Direction::Before => message[..index].chars().next_back(),
+        Direction::After => message[index..].chars().next(),
+    }
 }
 
 fn level_color(level: Level) -> Color {
@@ -227,6 +256,33 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(highlighted, vec!["tenant-1", "abc"]);
+    }
+
+    #[test]
+    fn punctuation_highlight_values_do_not_match_inside_alphanumeric_tokens() {
+        let event = LogEvent::from_line(1, "api | INFO range 0-0 done".to_string());
+
+        let row = render_event(&event, false, false, &[], &["-"]);
+
+        assert!(row
+            .spans
+            .into_iter()
+            .all(|span| span.style.bg != Some(THEME.highlight)));
+    }
+
+    #[test]
+    fn punctuation_highlight_values_still_match_standalone_tokens() {
+        let event = LogEvent::from_line(1, "api | INFO empty - done".to_string());
+
+        let row = render_event(&event, false, false, &[], &["-"]);
+        let highlighted = row
+            .spans
+            .into_iter()
+            .filter(|span| span.style.bg == Some(THEME.highlight))
+            .map(|span| span.content)
+            .collect::<String>();
+
+        assert_eq!(highlighted, "-");
     }
 
     #[test]
