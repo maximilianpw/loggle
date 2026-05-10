@@ -46,6 +46,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool, closing: Opti
         );
     } else if app.mode() == &Mode::PropertyFilters {
         draw_property_filters_dialog(frame, app);
+    } else if app.mode() == &Mode::MessageFields {
+        draw_message_fields_dialog(frame, app);
     }
 
     if let Some(message) = closing {
@@ -123,6 +125,7 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, app: &App, color_enabled: bool) 
                 event,
                 color_enabled,
                 visible_index == selected,
+                app.message_field_keys(),
             ))
         })
         .collect::<Vec<_>>();
@@ -195,7 +198,7 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.mode() {
         Mode::Prompt(_) => draw_prompt(frame, area, app),
-        Mode::Normal | Mode::Palette | Mode::PropertyFilters => {
+        Mode::Normal | Mode::Palette | Mode::PropertyFilters | Mode::MessageFields => {
             status::draw_status(frame, area, app)
         }
     }
@@ -231,6 +234,39 @@ fn draw_property_filters_dialog(frame: &mut Frame<'_>, app: &App) {
         app.property_filter_query(),
         rendered,
         app.selected_property_filter_index(),
+    );
+}
+
+fn draw_message_fields_dialog(frame: &mut Frame<'_>, app: &App) {
+    let rows = app.message_field_rows();
+    let items;
+    let empty_items;
+    let rendered = if rows.is_empty() {
+        empty_items = [dialog::SelectableListItem {
+            shortcut: None,
+            label: "No message fields",
+            description: "Add fields with m from details",
+        }];
+        &empty_items[..]
+    } else {
+        items = rows
+            .iter()
+            .map(|key| dialog::SelectableListItem {
+                shortcut: None,
+                label: key,
+                description: "Backspace/Delete remove",
+            })
+            .collect::<Vec<_>>();
+        &items[..]
+    };
+
+    dialog::draw_searchable_dialog(
+        frame,
+        frame.area(),
+        "Message fields",
+        app.message_field_query(),
+        rendered,
+        app.selected_message_field_index(),
     );
 }
 
@@ -277,7 +313,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Prompt(PromptKind::IncludeProperty) => "show prop: ",
         Mode::Prompt(PromptKind::ExcludeProperty) => "hide prop: ",
         Mode::Prompt(PromptKind::EditPropertyFilter) => "edit prop: ",
-        Mode::Normal | Mode::Palette | Mode::PropertyFilters => "",
+        Mode::Normal | Mode::Palette | Mode::PropertyFilters | Mode::MessageFields => "",
     };
     let base = Style::default().fg(THEME.text).bg(THEME.panel_alt);
     let prompt = Line::from(vec![

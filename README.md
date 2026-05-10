@@ -11,12 +11,69 @@ It opens a live-tail TUI, parses source-prefixed log lines, infers log levels,
 keeps a bounded in-memory buffer, and provides Vim-style navigation and simple
 filtering.
 
+```text
+Live Docker logs -> source/level parsing -> searchable TUI -> inspect/filter properties
+```
+
+## At a Glance
+
+Loggle turns noisy multi-process output into a scannable live log view:
+
+```text
+ loggle follow  retained 1248  visible 42
+>    147 api             info    http.request GET /api/v1/inventory 200 96ms requestId=716d1e62 durationMs=96
+     148 worker          warn    retrying inventory sync tenantId=tenant-1
+     149 frontend        info    VITE ready in 312 ms
+
+ details source=api level=info time=14:06:58.892
+ message http.request GET /api/v1/inventory 200 96ms
+> messageKey = http.request
+  requestId = 716d1e62-46a1-46c0-9099-e939a2e4fbb0
+  statusCode = 200
+  durationMs = 96
+
+ filters source=-  level=-  search=-  props=-   q quit  / search  Enter details  ? commands
+```
+
+- Live tail with pause/resume, scrollback, search, and jump-to-match navigation
+- Source, level, text, and structured property filters for narrowing dense logs
+- Details pane for inspecting parsed timestamps, levels, messages, and properties
+- Inline message fields for adding selected properties such as `requestId` or
+  `durationMs` to every matching row
+- Command palette and searchable managers for discovering and pruning active
+  filters/fields
+- Graceful shutdown for launched commands: quit behaves like interrupting the
+  foreground process, then escalates if it does not exit
+
+## Why Loggle
+
+Plain `tail -f` is fast, but it leaves you reading one raw stream. `docker
+compose logs -f` keeps service names, but it is still hard to pause, inspect,
+filter, and jump around once output gets noisy. Loggle keeps the local terminal
+workflow and adds the pieces you usually reach for in heavier log tools:
+
+| Need | `tail -f` | `docker compose logs -f` | Loggle |
+|---|---:|---:|---:|
+| Live stream | yes | yes | yes |
+| Pause and scroll without losing context | no | no | yes |
+| Source and level columns | no | partial | yes |
+| Text/source/level filters | no | limited | yes |
+| Structured property inspection | no | no | yes |
+| Property filters and inline fields | no | no | yes |
+| Command-owned shutdown | no | no | yes |
+
 ## Usage
 
 From this repository:
 
 ```sh
 cargo run -- -- docker compose up
+```
+
+Try it without Docker:
+
+```sh
+cargo run -- sh -c 'i=0; while true; do i=$((i+1)); echo "api | INFO request completed"; echo "[14:06:58.892] INFO (#$i):"; echo "{ requestId: \"demo-$i\", statusCode: 200, durationMs: $((20 + i)) }"; sleep 1; done'
 ```
 
 Or install it locally:
@@ -62,25 +119,42 @@ loggle --no-color -- docker compose logs -f
 
 ## Controls
 
+### Navigation
+
 - `j` / `k`: move one line down/up
 - `Ctrl-d` / `Ctrl-u`: half-page down/up
 - `gg`: jump to top
 - `G`: jump to bottom and resume following
+- `n` / `N`: next/previous search match
+- `Space` or `p`: pause/resume following
+
+### Filtering
+
 - `/`: set text filter/search
 - `s`: set source/service filter
 - `l`: set level filter
-- `Enter`: toggle selected log details
-- `[` / `]`: move through properties in the details pane
-- `f`: show only rows with the selected property value
-- `P`: open searchable property filter manager
 - `+`: add a show property filter
 - `-`: add a hide property filter
 - `c`: clear filters
-- `n` / `N`: next/previous search match
-- `Space` or `p`: pause/resume following
+
+### Details and Properties
+
+- `Enter`: toggle selected log details
+- `[` / `]`: move through properties in the details pane
+- `f`: show only rows with the selected property value
+- `m`: append the selected property key to displayed log-row messages
+
+### Dialogs
+
+- `M`: open searchable message field manager
+- `P`: open searchable property filter manager
 - `?`: open/close the command palette
+- Message field manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Backspace` or `Delete` removes when search is empty; `Esc` closes
 - Property filter manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` edits; `Backspace` or `Delete` removes when search is empty; `Esc` closes
 - Command palette: `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` runs; `Esc` closes
+
+### Process Control
+
 - `Esc`: close prompt or clear transient mode
 - `q`: quit
 
@@ -91,16 +165,19 @@ immediately.
 
 ## Log Parsing
 
-Loggle treats lines in these shapes as source-prefixed logs:
+Loggle treats common local-development output as structured events:
 
-```text
-service-name | message
-[source] message
-```
+| Input shape | Parsed source | Parsed level | Displayed message |
+|---|---|---|---|
+| `api | INFO started` | `api` | `info` | `started` |
+| `[worker] WARN retrying` | `worker` | `warn` | `retrying` |
+| `14:06:58.892 INFO request ok` | `unknown` | `info` | `request ok` |
+| `INFO request ok` | `unknown` | `info` | `request ok` |
+| `plain output` | `unknown` | inferred or `unknown` | `plain output` |
 
-The first form matches Docker Compose output. The second form matches
-concurrently-style named output, including padded names such as
-`[backend ] message`.
+The `source | message` form matches Docker Compose output. The `[source]
+message` form matches concurrently-style named output, including padded names
+such as `[backend ] message`.
 
 If no supported prefix is found, the source is shown as `unknown`. Loggle does
 not infer source names from unprefixed message content.
@@ -139,8 +216,12 @@ previous event instead of shown as separate rows:
 ```
 
 Property filters support exact values and key existence. Use `key=value` or
-`key` to show matching rows, and `key!=value` or `!key` to hide matching rows. The details pane
-can prefill these filters from the selected event property.
+`key` to show matching rows, and `key!=value` or `!key` to hide matching rows.
+The details pane can prefill these filters from the selected event property.
+
+Message fields are session-local property keys appended to log rows after the
+parsed message as `key=value`. Rows that do not have a selected property omit
+that field.
 
 ## Development
 

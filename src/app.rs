@@ -19,6 +19,7 @@ pub enum Mode {
     Prompt(PromptKind),
     Palette,
     PropertyFilters,
+    MessageFields,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,9 @@ pub struct App {
     property_filter_query: String,
     selected_property_filter: usize,
     editing_property_filter: Option<PropertyFilterId>,
+    message_field_keys: Vec<String>,
+    message_field_query: String,
+    selected_message_field: usize,
 }
 
 impl App {
@@ -61,6 +65,9 @@ impl App {
             property_filter_query: String::new(),
             selected_property_filter: 0,
             editing_property_filter: None,
+            message_field_keys: Vec::new(),
+            message_field_query: String::new(),
+            selected_message_field: 0,
         }
     }
 
@@ -121,6 +128,35 @@ impl App {
         self.property_filter_rows()
             .get(self.selected_property_filter)
             .cloned()
+    }
+
+    pub fn message_field_keys(&self) -> &[String] {
+        &self.message_field_keys
+    }
+
+    pub fn message_field_query(&self) -> &str {
+        &self.message_field_query
+    }
+
+    pub fn selected_message_field_index(&self) -> usize {
+        self.selected_message_field
+    }
+
+    pub fn message_field_rows(&self) -> Vec<&str> {
+        let query = self.message_field_query.trim();
+        self.message_field_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| {
+                query.is_empty() || crate::filter::contains_ignore_ascii_case(key, query)
+            })
+            .collect()
+    }
+
+    pub fn selected_message_field_key(&self) -> Option<&str> {
+        self.message_field_rows()
+            .get(self.selected_message_field)
+            .copied()
     }
 
     pub fn filters(&self) -> &LogFilter {
@@ -290,6 +326,18 @@ impl App {
         self.pending_g = false;
     }
 
+    pub fn open_message_fields(&mut self) {
+        self.mode = Mode::MessageFields;
+        self.prompt.clear();
+        self.pending_g = false;
+        self.sync_message_field_selection();
+    }
+
+    pub fn close_message_fields(&mut self) {
+        self.mode = Mode::Normal;
+        self.pending_g = false;
+    }
+
     pub fn move_property_filter_down(&mut self, amount: usize) {
         self.selected_property_filter = self
             .selected_property_filter
@@ -319,6 +367,53 @@ impl App {
         self.filters.remove_property_filter(row.id);
         self.sync_property_filter_selection();
         self.sync_selection();
+    }
+
+    pub fn move_message_field_down(&mut self, amount: usize) {
+        self.selected_message_field = self
+            .selected_message_field
+            .saturating_add(amount)
+            .min(self.message_field_max_index());
+    }
+
+    pub fn move_message_field_up(&mut self, amount: usize) {
+        self.selected_message_field = self.selected_message_field.saturating_sub(amount);
+    }
+
+    pub fn push_message_field_query_char(&mut self, value: char) {
+        self.message_field_query.push(value);
+        self.sync_message_field_selection();
+    }
+
+    pub fn pop_message_field_query_char(&mut self) {
+        self.message_field_query.pop();
+        self.sync_message_field_selection();
+    }
+
+    pub fn add_selected_message_field(&mut self) {
+        self.pending_g = false;
+        let Some(key) = self.selected_property().map(|property| property.key.clone()) else {
+            return;
+        };
+
+        if !self.message_field_keys.iter().any(|existing| existing == &key) {
+            self.message_field_keys.push(key);
+        }
+        self.sync_message_field_selection();
+    }
+
+    pub fn delete_selected_message_field(&mut self) {
+        let Some(key) = self.selected_message_field_key().map(str::to_string) else {
+            return;
+        };
+        if let Some(index) = self
+            .message_field_keys
+            .iter()
+            .position(|candidate| candidate == &key)
+        {
+            self.message_field_keys.remove(index);
+        }
+        self.sync_message_field_selection();
     }
 
     pub fn push_prompt_char(&mut self, value: char) {
@@ -518,6 +613,16 @@ impl App {
         self.property_filter_rows().len().saturating_sub(1)
     }
 
+    fn sync_message_field_selection(&mut self) {
+        self.selected_message_field = self
+            .selected_message_field
+            .min(self.message_field_max_index());
+    }
+
+    fn message_field_max_index(&self) -> usize {
+        self.message_field_rows().len().saturating_sub(1)
+    }
+
     fn all_property_filter_rows(&self) -> Vec<PropertyFilterRow> {
         self.filters
             .property_includes
@@ -666,6 +771,65 @@ mod tests {
             app.filters.property_includes,
             vec![PropertyPredicate::exact("tenantId", "tenant-1")]
         );
+    }
+
+    #[test]
+    fn adding_selected_message_field_uses_property_key_once() {
+        let mut app = App::new(10);
+        app.push_line("14:06:58.892 INFO request completed".to_string());
+        app.push_line("[14:06:58.892] INFO (#1):".to_string());
+        app.push_line("{".to_string());
+        app.push_line("tenantId: \"tenant-1\",".to_string());
+        app.push_line("requestId: \"abc\",".to_string());
+        app.push_line("}".to_string());
+
+        app.add_selected_message_field();
+        app.add_selected_message_field();
+        app.next_property();
+        app.add_selected_message_field();
+
+        assert_eq!(
+            app.message_field_keys(),
+            &["tenantId".to_string(), "requestId".to_string()]
+        );
+    }
+
+    #[test]
+    fn message_field_dialog_searches_and_deletes_selected_fields() {
+        let mut app = App::new(10);
+        app.message_field_keys = vec![
+            "tenantId".to_string(),
+            "requestId".to_string(),
+            "durationMs".to_string(),
+        ];
+
+        app.open_message_fields();
+        app.push_message_field_query_char('r');
+        app.push_message_field_query_char('e');
+
+        assert_eq!(app.mode(), &Mode::MessageFields);
+        assert_eq!(app.message_field_rows(), vec!["requestId"]);
+
+        app.delete_selected_message_field();
+
+        assert_eq!(
+            app.message_field_keys(),
+            &["tenantId".to_string(), "durationMs".to_string()]
+        );
+        assert_eq!(app.mode(), &Mode::MessageFields);
+        assert_eq!(app.selected_message_field_index(), 0);
+    }
+
+    #[test]
+    fn message_field_dialog_backspace_deletes_when_search_is_empty() {
+        let mut app = App::new(10);
+        app.message_field_keys = vec!["tenantId".to_string()];
+
+        app.open_message_fields();
+        app.delete_selected_message_field();
+
+        assert!(app.message_field_keys().is_empty());
+        assert_eq!(app.mode(), &Mode::MessageFields);
     }
 
     #[test]

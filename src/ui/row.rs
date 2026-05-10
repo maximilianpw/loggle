@@ -14,6 +14,7 @@ pub(super) fn render_event(
     event: &LogEvent,
     color_enabled: bool,
     selected: bool,
+    message_field_keys: &[String],
 ) -> Line<'static> {
     let row_bg = if selected {
         THEME.panel_alt
@@ -42,15 +43,27 @@ pub(super) fn render_event(
         row_style
     };
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(" ", rail_style),
         sequence,
         Span::styled(format!("{:<14}", truncate_tail(&event.source, 14)), source_style),
         Span::styled(" ", row_style),
         Span::styled(format!("{:<7}", event.level.to_string()), level_style),
         Span::styled(" ", row_style),
-        Span::styled(compact_whitespace(&event.message), row_style),
-    ])
+    ];
+    spans.push(Span::styled(compact_whitespace(&event.message), row_style));
+
+    for key in message_field_keys {
+        if let Some(property) = event.property(key) {
+            spans.push(Span::styled(" ", row_style));
+            spans.push(Span::styled(
+                format!("{}={}", property.key, property.value),
+                row_style,
+            ));
+        }
+    }
+
+    Line::from(spans)
 }
 
 fn level_color(level: Level) -> Color {
@@ -85,6 +98,7 @@ fn source_color(source: &str) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{LogProperty, PropertyValue};
 
     #[test]
     fn display_message_compacts_nestjs_alignment_spacing() {
@@ -95,5 +109,46 @@ mod tests {
             compact_whitespace(message),
             "[Nest] 32 - 05/08/2026, 4:18:15 PM LOG [InstanceLoader]"
         );
+    }
+
+    #[test]
+    fn default_row_rendering_is_unchanged_without_message_fields() {
+        let mut event = LogEvent::from_line(1, "api | INFO request completed".to_string());
+        event.set_properties(vec![LogProperty {
+            key: "tenantId".to_string(),
+            value: PropertyValue::String("tenant-1".to_string()),
+        }]);
+
+        let row = render_event(&event, false, false, &[], &[]);
+        let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
+
+        assert!(text.ends_with("request completed"));
+        assert!(!text.contains("tenantId=tenant-1"));
+    }
+
+    #[test]
+    fn selected_message_fields_append_key_value_segments() {
+        let mut event = LogEvent::from_line(1, "api | INFO request completed".to_string());
+        event.set_properties(vec![
+            LogProperty {
+                key: "tenantId".to_string(),
+                value: PropertyValue::String("tenant-1".to_string()),
+            },
+            LogProperty {
+                key: "durationMs".to_string(),
+                value: PropertyValue::Number("96".to_string()),
+            },
+        ]);
+
+        let row = render_event(
+            &event,
+            false,
+            false,
+            &["tenantId".to_string(), "missing".to_string()],
+        );
+        let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
+
+        assert!(text.ends_with("request completed tenantId=tenant-1"));
+        assert!(!text.contains("missing="));
     }
 }

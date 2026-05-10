@@ -14,6 +14,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyO
         Mode::Prompt(_) => handle_prompt_key(app, key),
         Mode::Palette => handle_palette_key(app, key, half_page),
         Mode::PropertyFilters => handle_property_filters_key(app, key, half_page),
+        Mode::MessageFields => handle_message_fields_key(app, key, half_page),
         Mode::Normal => handle_normal_key(app, key, half_page),
     }
 }
@@ -50,6 +51,8 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('+'), _) => return execute_command(app, CommandAction::IncludeProperty),
         (KeyCode::Char('-'), _) => return execute_command(app, CommandAction::ExcludeProperty),
         (KeyCode::Char('f'), _) => return execute_command(app, CommandAction::FollowProperty),
+        (KeyCode::Char('m'), _) => return execute_command(app, CommandAction::AddMessageField),
+        (KeyCode::Char('M'), _) => return execute_command(app, CommandAction::MessageFields),
         (KeyCode::Char('P'), _) => return execute_command(app, CommandAction::PropertyFilters),
         (KeyCode::Char(']'), _) => return execute_command(app, CommandAction::NextProperty),
         (KeyCode::Char('['), _) => return execute_command(app, CommandAction::PreviousProperty),
@@ -91,6 +94,31 @@ fn handle_property_filters_key(app: &mut App, key: KeyEvent, half_page: usize) -
     KeyOutcome::Continue
 }
 
+fn handle_message_fields_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => app.close_message_fields(),
+        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_message_field_down(1),
+        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_message_field_up(1),
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.move_message_field_down(half_page),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.move_message_field_up(half_page),
+        (KeyCode::Backspace, _) if app.message_field_query().is_empty() => {
+            app.delete_selected_message_field()
+        }
+        (KeyCode::Backspace, _) => app.pop_message_field_query_char(),
+        (KeyCode::Delete, _) if app.message_field_query().is_empty() => {
+            app.delete_selected_message_field()
+        }
+        (KeyCode::Char(value), modifiers)
+            if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+        {
+            app.push_message_field_query_char(value);
+        }
+        _ => {}
+    }
+
+    KeyOutcome::Continue
+}
+
 fn handle_palette_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) | (KeyCode::Char('?'), _) => app.close_palette(),
@@ -121,6 +149,8 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::PreviousProperty => app.previous_property(),
         CommandAction::NextProperty => app.next_property(),
         CommandAction::FollowProperty => app.follow_selected_property(),
+        CommandAction::AddMessageField => app.add_selected_message_field(),
+        CommandAction::MessageFields => app.open_message_fields(),
         CommandAction::PropertyFilters => app.open_property_filters(),
         CommandAction::IncludeProperty => app.start_prompt(PromptKind::IncludeProperty),
         CommandAction::ExcludeProperty => app.start_prompt(PromptKind::ExcludeProperty),
@@ -222,6 +252,15 @@ mod tests {
     }
 
     #[test]
+    fn capital_m_opens_message_fields_dialog() {
+        let mut app = App::new(10);
+
+        handle_key(&mut app, key(KeyCode::Char('M')), 5);
+
+        assert_eq!(app.mode(), &Mode::MessageFields);
+    }
+
+    #[test]
     fn property_filter_dialog_searches_and_deletes() {
         let mut app = App::new(10);
         add_include_filter(&mut app, "tenantId=tenant-1");
@@ -249,6 +288,35 @@ mod tests {
 
         assert!(app.filters().property_includes.is_empty());
         assert_eq!(app.mode(), &Mode::PropertyFilters);
+    }
+
+    #[test]
+    fn message_fields_dialog_searches_and_deletes() {
+        let mut app = App::new(10);
+        add_message_field_from_selected_property(&mut app);
+
+        app.open_message_fields();
+        handle_key(&mut app, key(KeyCode::Char('t')), 5);
+        assert_eq!(app.message_field_query(), "t");
+
+        handle_key(&mut app, key(KeyCode::Backspace), 5);
+        assert_eq!(app.message_field_query(), "");
+
+        handle_key(&mut app, key(KeyCode::Delete), 5);
+        assert!(app.message_field_keys().is_empty());
+        assert_eq!(app.mode(), &Mode::MessageFields);
+    }
+
+    #[test]
+    fn message_fields_dialog_backspace_deletes_when_search_is_empty() {
+        let mut app = App::new(10);
+        add_message_field_from_selected_property(&mut app);
+
+        app.open_message_fields();
+        handle_key(&mut app, key(KeyCode::Backspace), 5);
+
+        assert!(app.message_field_keys().is_empty());
+        assert_eq!(app.mode(), &Mode::MessageFields);
     }
 
     #[test]
@@ -352,5 +420,16 @@ mod tests {
             handle_key(app, key(KeyCode::Char(ch)), 5);
         }
         handle_key(app, key(KeyCode::Enter), 5);
+    }
+
+    fn add_message_field_from_selected_property(app: &mut App) {
+        app.push_line("14:06:58.892 INFO request completed".to_string());
+        app.push_line("[14:06:58.892] INFO (#1):".to_string());
+        app.push_line("{".to_string());
+        app.push_line("tenantId: \"tenant-1\",".to_string());
+        app.push_line("}".to_string());
+
+        handle_key(app, key(KeyCode::Char('m')), 5);
+        assert_eq!(app.message_field_keys(), &["tenantId".to_string()]);
     }
 }

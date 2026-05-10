@@ -7,6 +7,8 @@ pub enum CommandAction {
     PreviousProperty,
     NextProperty,
     FollowProperty,
+    AddMessageField,
+    MessageFields,
     PropertyFilters,
     IncludeProperty,
     ExcludeProperty,
@@ -69,6 +71,18 @@ pub const COMMANDS: &[Command] = &[
         label: "Filter selected value",
         description: "Show rows with the selected property's exact value",
         action: CommandAction::FollowProperty,
+    },
+    Command {
+        shortcut: "m",
+        label: "Add message field",
+        description: "Append selected property values to log-row messages",
+        action: CommandAction::AddMessageField,
+    },
+    Command {
+        shortcut: "M",
+        label: "Message fields",
+        description: "View, search, and remove displayed message fields",
+        action: CommandAction::MessageFields,
     },
     Command {
         shortcut: "P",
