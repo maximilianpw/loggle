@@ -28,8 +28,13 @@ cargo install --path .
 Then run it from any Compose project:
 
 ```sh
+loggle dc
 loggle -- docker compose up
 ```
+
+`loggle dc` is an exact shortcut for `loggle -- docker compose up`. Only bare
+`dc` is special; use the `-- docker compose ...` form for other Compose
+commands.
 
 The `--` form is recommended because Loggle starts the command itself and
 captures both stdout and stderr. That prevents Docker Compose or service output
@@ -52,6 +57,7 @@ loggle --no-color -- docker compose logs -f
 
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
 - `--no-color`: disables Loggle's source and severity coloring
+- `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 
 ## Controls
