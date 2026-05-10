@@ -87,4 +87,16 @@ mod tests {
 
         assert!(filter.matches(&event));
     }
+
+    #[test]
+    fn source_filter_matches_concurrently_prefix() {
+        let event = LogEvent::from_line(0, "[backend] INFO listening".to_string());
+        let filter = LogFilter {
+            text: None,
+            source: Some("backend".to_string()),
+            level: None,
+        };
+
+        assert!(filter.matches(&event));
+    }
 }

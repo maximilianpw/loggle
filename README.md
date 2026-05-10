@@ -1,15 +1,15 @@
 # Loggle
 
 Loggle is a terminal log viewer for local, newline-delimited logs. It is built for
-Docker Compose workflows such as:
+Docker Compose and multi-process development workflows such as:
 
 ```sh
 loggle -- docker compose up
 ```
 
-It opens a live-tail TUI, parses Compose-style `service | message` lines, infers
-log levels, keeps a bounded in-memory buffer, and provides Vim-style navigation
-and simple filtering.
+It opens a live-tail TUI, parses source-prefixed log lines, infers log levels,
+keeps a bounded in-memory buffer, and provides Vim-style navigation and simple
+filtering.
 
 ## Usage
 
@@ -77,13 +77,19 @@ loggle --no-color -- docker compose logs -f
 
 ## Log Parsing
 
-Loggle treats lines in this shape as Docker Compose logs:
+Loggle treats lines in these shapes as source-prefixed logs:
 
 ```text
 service-name | message
+[source] message
 ```
 
-If no Compose prefix is found, the source is shown as `unknown`.
+The first form matches Docker Compose output. The second form matches
+concurrently-style named output, including padded names such as
+`[backend ] message`.
+
+If no supported prefix is found, the source is shown as `unknown`. Loggle does
+not infer source names from unprefixed message content.
 
 The original raw line is preserved in memory, while the displayed message is
 cleaned for terminal use:

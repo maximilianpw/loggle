@@ -72,6 +72,10 @@ impl LogEvent {
 }
 
 pub fn parse_compose_line(line: &str) -> ParsedLine {
+    if let Some(parsed) = parse_bracket_prefixed_line(line) {
+        return parsed;
+    }
+
     if let Some((source, message)) = line.split_once('|') {
         let source = clean_display_text(source.trim());
         if !source.is_empty() {
@@ -86,6 +90,17 @@ pub fn parse_compose_line(line: &str) -> ParsedLine {
         source: "unknown".to_string(),
         message: clean_display_text(line),
     }
+}
+
+fn parse_bracket_prefixed_line(line: &str) -> Option<ParsedLine> {
+    let rest = line.strip_prefix('[')?;
+    let (source, message) = rest.split_once(']')?;
+    let source = clean_display_text(source.trim());
+
+    (!source.is_empty()).then(|| ParsedLine {
+        source,
+        message: clean_display_text(message.trim_start()),
+    })
 }
 
 pub fn clean_display_text(input: &str) -> String {
@@ -189,11 +204,58 @@ mod tests {
     }
 
     #[test]
+    fn parses_concurrently_named_prefix() {
+        let parsed = parse_compose_line("[frontend] VITE ready");
+
+        assert_eq!(parsed.source, "frontend");
+        assert_eq!(parsed.message, "VITE ready");
+    }
+
+    #[test]
+    fn parses_concurrently_backend_prefix_with_level() {
+        let event = LogEvent::from_line(
+            0,
+            "[backend] INFO http.request GET /api/v1/auth/me 200".to_string(),
+        );
+
+        assert_eq!(event.source, "backend");
+        assert_eq!(event.message, "INFO http.request GET /api/v1/auth/me 200");
+        assert_eq!(event.level, Level::Info);
+    }
+
+    #[test]
+    fn parses_concurrently_padded_prefix() {
+        let parsed = parse_compose_line("[backend ] ERROR failed");
+
+        assert_eq!(parsed.source, "backend");
+        assert_eq!(parsed.message, "ERROR failed");
+    }
+
+    #[test]
+    fn parses_concurrently_numeric_prefix() {
+        let parsed = parse_compose_line("[0] started");
+
+        assert_eq!(parsed.source, "0");
+        assert_eq!(parsed.message, "started");
+    }
+
+    #[test]
     fn falls_back_to_unknown_for_raw_lines() {
         let parsed = parse_compose_line("plain line with no prefix");
 
         assert_eq!(parsed.source, "unknown");
         assert_eq!(parsed.message, "plain line with no prefix");
+    }
+
+    #[test]
+    fn keeps_unprefixed_vite_and_api_lines_unknown() {
+        let vite = parse_compose_line("VITE v5.4.0  ready in 200 ms");
+        let api = parse_compose_line("GET /api/v1/auth/me 200");
+
+        assert_eq!(vite.source, "unknown");
+        assert_eq!(vite.message, "VITE v5.4.0  ready in 200 ms");
+        assert_eq!(api.source, "unknown");
+        assert_eq!(api.message, "GET /api/v1/auth/me 200");
     }
 
     #[test]
