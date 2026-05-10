@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::model::{
-    LogEvent, ParsedLine, PropertyBlockHeader, parse_compose_line, parse_property_block_header,
-    parse_property_object,
+    LogEvent, ParsedLine, PropertyBlockHeader, SourceConfig, parse_compose_line,
+    parse_property_block_header, parse_property_object,
 };
 
 #[derive(Debug)]
@@ -12,6 +12,7 @@ pub struct LogBuffer {
     events: VecDeque<LogEvent>,
     pending_properties: Option<PendingPropertyBlock>,
     active_source: Option<String>,
+    source_config: SourceConfig,
 }
 
 #[derive(Debug)]
@@ -23,13 +24,19 @@ struct PendingPropertyBlock {
 }
 
 impl LogBuffer {
+    #[cfg(test)]
     pub fn new(capacity: usize) -> Self {
+        Self::with_source_config(capacity, SourceConfig::default())
+    }
+
+    pub fn with_source_config(capacity: usize, source_config: SourceConfig) -> Self {
         Self {
             capacity,
             next_sequence: 0,
             events: VecDeque::with_capacity(capacity),
             pending_properties: None,
             active_source: None,
+            source_config,
         }
     }
 
@@ -61,7 +68,8 @@ impl LogBuffer {
             self.events.pop_front();
         }
 
-        let event = LogEvent::from_parsed_line(self.next_sequence, line, parsed);
+        let mut event = LogEvent::from_parsed_line(self.next_sequence, line, parsed);
+        Self::promote_source(&self.source_config, &mut event);
         self.next_sequence += 1;
         self.events.push_back(event);
     }
@@ -108,12 +116,33 @@ impl LogBuffer {
             return;
         };
 
+        let source_config = self.source_config.clone();
         if let Some(event) = self
             .events
             .iter_mut()
             .find(|event| event.sequence == pending.target_sequence)
         {
             event.set_properties(properties);
+            Self::promote_source(&source_config, event);
+        }
+    }
+
+    fn promote_source(source_config: &SourceConfig, event: &mut LogEvent) {
+        if event.source != "unknown" {
+            return;
+        }
+
+        for field in source_config.fields() {
+            let Some(source) = event.property(field).map(|property| property.value.to_string())
+            else {
+                continue;
+            };
+
+            let source = source.trim();
+            if !source.is_empty() {
+                event.source = source.to_string();
+                return;
+            }
         }
     }
 
@@ -255,6 +284,10 @@ mod tests {
             .collect()
     }
 
+    fn source_config(fields: &[&str]) -> SourceConfig {
+        SourceConfig::with_fields(fields)
+    }
+
     #[test]
     fn retains_only_the_configured_number_of_lines() {
         let mut buffer = LogBuffer::new(3);
@@ -334,6 +367,43 @@ mod tests {
     }
 
     #[test]
+    fn promotes_default_source_fields_from_inline_properties() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("INFO ready service=api".to_string());
+        buffer.push_line("INFO ready app=web".to_string());
+
+        assert_eq!(sources(&buffer), vec!["api", "web"]);
+    }
+
+    #[test]
+    fn promotes_configured_source_fields_before_default_fields() {
+        let mut buffer = LogBuffer::with_source_config(10, source_config(&["logger", "service"]));
+
+        buffer.push_line("INFO ready service=backend logger=api".to_string());
+
+        assert_eq!(sources(&buffer), vec!["api"]);
+    }
+
+    #[test]
+    fn promotes_quoted_inline_source_field_values() {
+        let mut buffer = LogBuffer::with_source_config(10, source_config(&["service"]));
+
+        buffer.push_line("INFO ready service=\"api server\"".to_string());
+
+        assert_eq!(sources(&buffer), vec!["api server"]);
+    }
+
+    #[test]
+    fn explicit_source_prefix_wins_over_inline_source_fields() {
+        let mut buffer = LogBuffer::with_source_config(10, source_config(&["service"]));
+
+        buffer.push_line("[frontend] INFO ready service=backend".to_string());
+
+        assert_eq!(sources(&buffer), vec!["frontend"]);
+    }
+
+    #[test]
     fn merges_property_block_into_previous_structured_event() {
         let mut buffer = LogBuffer::new(10);
 
@@ -370,6 +440,20 @@ mod tests {
         assert_eq!(event.message, "http.request ok");
         assert_eq!(event.properties.len(), 1);
         assert_eq!(event.properties[0].key, "requestId");
+    }
+
+    #[test]
+    fn promotes_source_fields_from_merged_property_blocks() {
+        let mut buffer = LogBuffer::with_source_config(10, source_config(&["service"]));
+
+        buffer.push_line("14:06:58.892 INFO http.request ok".to_string());
+        buffer.push_line("[14:06:58.892] INFO (#147):".to_string());
+        buffer.push_line("{".to_string());
+        buffer.push_line("service: \"api\",".to_string());
+        buffer.push_line("}".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        assert_eq!(buffer.events().back().unwrap().source, "api");
     }
 
     #[test]

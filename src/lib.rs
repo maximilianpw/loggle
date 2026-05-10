@@ -6,4 +6,5 @@ mod model;
 mod runtime;
 mod ui;
 
+pub use model::SourceConfig;
 pub use runtime::{RuntimeConfig, RuntimeError, run};

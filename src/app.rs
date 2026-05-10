@@ -5,7 +5,7 @@ use crate::commands::{Command, COMMANDS};
 use crate::filter::{
     event_contains, LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate,
 };
-use crate::model::{Level, LogEvent, LogProperty};
+use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
 
 use list_state::SearchableListState;
 
@@ -54,9 +54,14 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(buffer_lines: usize) -> Self {
+        Self::with_source_config(buffer_lines, SourceConfig::default())
+    }
+
+    pub fn with_source_config(buffer_lines: usize, source_config: SourceConfig) -> Self {
         Self {
-            buffer: LogBuffer::new(buffer_lines),
+            buffer: LogBuffer::with_source_config(buffer_lines, source_config),
             filters: LogFilter::default(),
             selected: 0,
             follow: true,

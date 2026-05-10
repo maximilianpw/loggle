@@ -67,6 +67,50 @@ pub struct LogProperty {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceConfig {
+    fields: Vec<String>,
+}
+
+impl SourceConfig {
+    pub fn with_fields<I, S>(fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut config = Self { fields: Vec::new() };
+        for field in fields {
+            config.push_field(field.as_ref());
+        }
+        for field in DEFAULT_SOURCE_FIELDS {
+            config.push_field(field);
+        }
+        config
+    }
+
+    pub(crate) fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    fn push_field(&mut self, field: &str) {
+        let field = field.trim();
+        if field.is_empty() || self.fields.iter().any(|existing| existing == field) {
+            return;
+        }
+
+        self.fields.push(field.to_string());
+    }
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self::with_fields(Vec::<String>::new())
+    }
+}
+
+const DEFAULT_SOURCE_FIELDS: &[&str] =
+    &["source", "service", "app", "logger", "target", "component"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLine {
     pub source: String,
     pub message: String,
@@ -119,6 +163,7 @@ impl LogEvent {
         let message = structured
             .map(|message| message.message)
             .unwrap_or(message);
+        let properties = parse_inline_properties(&message);
 
         Self {
             sequence,
@@ -127,7 +172,7 @@ impl LogEvent {
             level,
             raw,
             message,
-            properties: Vec::new(),
+            properties,
         }
     }
 
@@ -310,6 +355,122 @@ pub fn parse_property_object(input: &str) -> Option<Vec<LogProperty>> {
     }
 
     saw_open.then_some(properties)
+}
+
+pub fn parse_inline_properties(message: &str) -> Vec<LogProperty> {
+    let mut properties = Vec::new();
+    let mut index = 0;
+
+    while index < message.len() {
+        index = skip_inline_separators(message, index);
+        if index >= message.len() {
+            break;
+        }
+
+        let key_start = index;
+        while index < message.len() {
+            let Some(ch) = message[index..].chars().next() else {
+                break;
+            };
+
+            if !is_inline_property_key_char(ch) {
+                break;
+            }
+
+            index += ch.len_utf8();
+        }
+
+        if key_start == index || !message[index..].starts_with('=') {
+            index = skip_inline_token(message, key_start);
+            continue;
+        }
+
+        let key = &message[key_start..index];
+        index += '='.len_utf8();
+        let value_start = index;
+        index = inline_property_value_end(message, value_start);
+        let value = &message[value_start..index];
+
+        if !value.is_empty() {
+            properties.push(LogProperty {
+                key: key.to_string(),
+                value: parse_property_value(value),
+            });
+        }
+    }
+
+    properties
+}
+
+fn skip_inline_separators(message: &str, mut index: usize) -> usize {
+    while index < message.len() {
+        let Some(ch) = message[index..].chars().next() else {
+            break;
+        };
+
+        if !ch.is_whitespace() {
+            break;
+        }
+
+        index += ch.len_utf8();
+    }
+
+    index
+}
+
+fn skip_inline_token(message: &str, mut index: usize) -> usize {
+    while index < message.len() {
+        let Some(ch) = message[index..].chars().next() else {
+            break;
+        };
+
+        if ch.is_whitespace() {
+            break;
+        }
+
+        index += ch.len_utf8();
+    }
+
+    index
+}
+
+fn inline_property_value_end(message: &str, value_start: usize) -> usize {
+    let Some(quote) = message[value_start..].chars().next() else {
+        return value_start;
+    };
+
+    if quote != '"' && quote != '\'' {
+        return skip_inline_token(message, value_start);
+    }
+
+    let mut index = value_start + quote.len_utf8();
+    let mut escaped = false;
+    while index < message.len() {
+        let Some(ch) = message[index..].chars().next() else {
+            break;
+        };
+
+        index += ch.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == quote {
+            return index;
+        }
+    }
+
+    skip_inline_token(message, value_start)
+}
+
+fn is_inline_property_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
 }
 
 fn parse_property_entry(entry: &str) -> Option<LogProperty> {
@@ -548,6 +709,38 @@ mod tests {
         assert_eq!(event.message, "http.request GET /api/v1/auth/me 200");
         assert_eq!(event.level, Level::Info);
         assert_eq!(event.raw, raw);
+    }
+
+    #[test]
+    fn parses_inline_key_value_properties() {
+        let event = LogEvent::from_line(
+            0,
+            "INFO request completed service=backend app=frontend logger=api".to_string(),
+        );
+
+        assert_eq!(
+            event.property("service").map(|property| &property.value),
+            Some(&PropertyValue::Text("backend".to_string()))
+        );
+        assert_eq!(
+            event.property("app").map(|property| &property.value),
+            Some(&PropertyValue::Text("frontend".to_string()))
+        );
+        assert_eq!(
+            event.property("logger").map(|property| &property.value),
+            Some(&PropertyValue::Text("api".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_quoted_inline_property_values() {
+        let event =
+            LogEvent::from_line(0, "INFO request completed service=\"api server\"".to_string());
+
+        assert_eq!(
+            event.property("service").map(|property| &property.value),
+            Some(&PropertyValue::String("api server".to_string()))
+        );
     }
 
     #[test]

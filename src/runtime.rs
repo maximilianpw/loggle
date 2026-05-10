@@ -6,10 +6,13 @@ use std::{fmt, io, process::Child};
 
 use tokio::sync::mpsc;
 
+use crate::model::SourceConfig;
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub buffer_lines: usize,
     pub color_enabled: bool,
+    pub source_config: SourceConfig,
     pub command: Vec<String>,
 }
 
@@ -49,7 +52,14 @@ pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
     let (tx, rx) = mpsc::channel(input::LINE_CHANNEL_CAPACITY);
     let child = start_input(&config.command, tx)?;
 
-    terminal::run(rx, config.buffer_lines, config.color_enabled, child).map_err(RuntimeError::from)
+    terminal::run(
+        rx,
+        config.buffer_lines,
+        config.color_enabled,
+        config.source_config,
+        child,
+    )
+    .map_err(RuntimeError::from)
 }
 
 fn start_input(

@@ -13,7 +13,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use crate::{app::App, ui};
+use crate::{app::App, model::SourceConfig, ui};
 
 use super::{
     input::{self, ChildShutdown, ShutdownSignal, ShutdownStatus},
@@ -24,6 +24,7 @@ pub(super) fn run(
     mut rx: mpsc::Receiver<String>,
     buffer_lines: usize,
     color_enabled: bool,
+    source_config: SourceConfig,
     mut child: Option<Child>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
@@ -37,6 +38,7 @@ pub(super) fn run(
         &mut rx,
         buffer_lines,
         color_enabled,
+        source_config,
         &mut child,
     );
 
@@ -58,9 +60,10 @@ fn run_app(
     rx: &mut mpsc::Receiver<String>,
     buffer_lines: usize,
     color_enabled: bool,
+    source_config: SourceConfig,
     child: &mut Option<Child>,
 ) -> io::Result<()> {
-    let mut app = App::new(buffer_lines);
+    let mut app = App::with_source_config(buffer_lines, source_config);
     let mut shutdown: Option<ChildShutdown> = None;
 
     loop {

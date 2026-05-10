@@ -1,12 +1,13 @@
 use std::error::Error;
 
 use clap::Parser;
-use loggle::{RuntimeConfig, RuntimeError, run};
+use loggle::{RuntimeConfig, RuntimeError, SourceConfig, run};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "loggle",
-    about = "A terminal log viewer for piped Docker Compose-style logs."
+    about = "A terminal log viewer for piped Docker Compose-style logs.",
+    dont_delimit_trailing_values = true
 )]
 struct Cli {
     #[arg(long, default_value_t = 100_000, value_parser = parse_buffer_lines)]
@@ -14,6 +15,9 @@ struct Cli {
 
     #[arg(long)]
     no_color: bool,
+
+    #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
+    source_fields: Vec<String>,
 
     #[arg(
         trailing_var_arg = true,
@@ -35,12 +39,22 @@ fn parse_buffer_lines(input: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_source_field(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        Err("source field must not be empty".to_string())
+    } else {
+        Ok(input.to_string())
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match run(RuntimeConfig {
         buffer_lines: cli.buffer_lines,
         color_enabled: !cli.no_color,
+        source_config: SourceConfig::with_fields(cli.source_fields),
         command: command_for_runtime(cli.command),
     }) {
         Ok(()) => Ok(()),
