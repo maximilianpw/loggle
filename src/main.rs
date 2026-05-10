@@ -1,7 +1,10 @@
-use std::error::Error;
+use std::{error::Error, path::Path};
 
 use clap::Parser;
-use loggle::{NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig, run};
+use loggle::{
+    ConfigEnv, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
+    load_named_config, load_project_config, run,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,19 +54,21 @@ fn parse_source_field(input: &str) -> Result<String, String> {
 fn main() -> Result<(), Box<dyn Error>> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
     let cli = Cli::parse();
-    let input = match runtime_input_for_command(command_tail_from_args(&raw_args, &cli.command)) {
+    let command_tail = command_tail_from_args(&raw_args, &cli.command);
+    let resolved_input = match runtime_input_for_command(command_tail) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("error: {error}");
             std::process::exit(2);
         }
     };
+    let source_fields = merged_source_fields(cli.source_fields, resolved_input.source_fields);
 
     match run(RuntimeConfig {
         buffer_lines: cli.buffer_lines,
         color_enabled: !cli.no_color,
-        source_config: SourceConfig::with_fields(cli.source_fields),
-        input,
+        source_config: SourceConfig::with_fields(source_fields),
+        input: resolved_input.input,
     }) {
         Ok(()) => Ok(()),
         Err(RuntimeError::MissingInput) => {
@@ -102,16 +107,61 @@ fn command_tail_from_args(raw_args: &[String], clap_command: &[String]) -> Vec<S
     clap_command.to_vec()
 }
 
-fn runtime_input_for_command(command: Vec<String>) -> Result<RuntimeInput, String> {
+fn merged_source_fields(
+    cli_source_fields: Vec<String>,
+    config_source_fields: Vec<String>,
+) -> Vec<String> {
+    cli_source_fields
+        .into_iter()
+        .chain(config_source_fields)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRuntimeInput {
+    input: RuntimeInput,
+    source_fields: Vec<String>,
+}
+
+impl ResolvedRuntimeInput {
+    fn new(input: RuntimeInput) -> Self {
+        Self {
+            input,
+            source_fields: Vec::new(),
+        }
+    }
+}
+
+fn runtime_input_for_command(command: Vec<String>) -> Result<ResolvedRuntimeInput, String> {
+    let current_dir = std::env::current_dir()
+        .map_err(|error| format!("could not read current directory: {error}"))?;
+    let config_env = ConfigEnv::from_env();
+
+    runtime_input_for_command_with_context(command, &current_dir, &config_env)
+}
+
+fn runtime_input_for_command_with_context(
+    command: Vec<String>,
+    current_dir: &Path,
+    config_env: &ConfigEnv,
+) -> Result<ResolvedRuntimeInput, String> {
     if command.is_empty() {
-        return Ok(RuntimeInput::Stdin);
+        return Ok(ResolvedRuntimeInput::new(RuntimeInput::Stdin));
     }
 
     if command[0] == "run" {
-        return parse_runner_commands(&command[1..]).map(RuntimeInput::Commands);
+        return parse_runner_commands(&command[1..])
+            .map(RuntimeInput::Commands)
+            .map(ResolvedRuntimeInput::new);
     }
 
-    Ok(RuntimeInput::Command(command_for_runtime(command)))
+    if command[0] == "start" {
+        return parse_start_command(&command[1..], current_dir, config_env);
+    }
+
+    Ok(ResolvedRuntimeInput::new(RuntimeInput::Command(
+        command_for_runtime(command),
+    )))
 }
 
 fn command_for_runtime(command: Vec<String>) -> Vec<String> {
@@ -163,15 +213,39 @@ fn parse_runner_commands(args: &[String]) -> Result<Vec<NamedCommand>, String> {
         commands.push(NamedCommand {
             name,
             command: args[command_start..index].to_vec(),
+            cwd: None,
         });
     }
 
     Ok(commands)
 }
 
+fn parse_start_command(
+    args: &[String],
+    current_dir: &Path,
+    config_env: &ConfigEnv,
+) -> Result<ResolvedRuntimeInput, String> {
+    if args.len() > 1 {
+        return Err("start accepts at most one config name".to_string());
+    }
+
+    let config = if let Some(name) = args.first() {
+        load_named_config(name, config_env)
+    } else {
+        load_project_config(current_dir)
+    }
+    .map_err(|error| error.to_string())?;
+
+    Ok(ResolvedRuntimeInput {
+        input: RuntimeInput::Commands(config.commands),
+        source_fields: config.source_fields,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn command(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -181,13 +255,45 @@ mod tests {
         NamedCommand {
             name: name.to_string(),
             command: command(values),
+            cwd: None,
         }
+    }
+
+    fn runtime_input(command: Vec<String>) -> RuntimeInput {
+        runtime_input_for_command(command).unwrap().input
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "loggle-cli-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_config(path: &std::path::Path, root: &std::path::Path) {
+        fs::write(
+            path,
+            format!(
+                r#"
+root = "{}"
+source_fields = ["service", "app"]
+
+[commands]
+api = ["pnpm", "start"]
+"#,
+                root.display()
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
     fn dc_expands_to_docker_compose_up() {
         assert_eq!(
-            runtime_input_for_command(command(&["dc"])).unwrap(),
+            runtime_input(command(&["dc"])),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
@@ -195,7 +301,7 @@ mod tests {
     #[test]
     fn dc_with_arguments_is_not_a_compose_shortcut() {
         assert_eq!(
-            runtime_input_for_command(command(&["dc", "logs", "-f"])).unwrap(),
+            runtime_input(command(&["dc", "logs", "-f"])),
             RuntimeInput::Command(command(&["dc", "logs", "-f"]))
         );
     }
@@ -203,16 +309,21 @@ mod tests {
     #[test]
     fn ordinary_commands_are_unchanged() {
         assert_eq!(
-            runtime_input_for_command(command(&["docker", "compose", "logs", "-f"])).unwrap(),
+            runtime_input(command(&["docker", "compose", "logs", "-f"])),
             RuntimeInput::Command(command(&["docker", "compose", "logs", "-f"]))
         );
     }
 
     #[test]
     fn empty_command_reads_from_stdin() {
+        assert_eq!(runtime_input(Vec::new()), RuntimeInput::Stdin);
+    }
+
+    #[test]
+    fn cli_source_fields_are_checked_before_config_source_fields() {
         assert_eq!(
-            runtime_input_for_command(Vec::new()).unwrap(),
-            RuntimeInput::Stdin
+            merged_source_fields(command(&["logger"]), command(&["service", "logger"])),
+            command(&["logger", "service", "logger"])
         );
     }
 
@@ -227,7 +338,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            runtime_input_for_command(command_tail_from_args(&raw_args, &cli.command)).unwrap(),
+            runtime_input(command_tail_from_args(&raw_args, &cli.command)),
             RuntimeInput::Commands(vec![
                 named_command("api", &["pnpm", "start"]),
                 named_command("web", &["pnpm", "dev"]),
@@ -244,7 +355,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            runtime_input_for_command(command_tail_from_args(&raw_args, &cli.command)).unwrap(),
+            runtime_input(command_tail_from_args(&raw_args, &cli.command)),
             RuntimeInput::Command(command(&["docker", "compose", "up", "--watch"]))
         );
     }
@@ -272,6 +383,99 @@ mod tests {
             runtime_input_for_command(command(&["run", "--name", "api", "pnpm", "start"]))
                 .unwrap_err(),
             "runner command 'api' must include -- before the command"
+        );
+    }
+
+    #[test]
+    fn start_without_name_loads_project_config() {
+        let project_dir = temp_dir("project");
+        let root = project_dir.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        write_config(&project_dir.join(".loggle.toml"), &root);
+
+        let resolved = runtime_input_for_command_with_context(
+            command(&["start"]),
+            &project_dir,
+            &ConfigEnv {
+                xdg_config_home: None,
+                home: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.source_fields, command(&["service", "app"]));
+        assert_eq!(
+            resolved.input,
+            RuntimeInput::Commands(vec![NamedCommand {
+                name: "api".to_string(),
+                command: command(&["pnpm", "start"]),
+                cwd: Some(root),
+            }])
+        );
+        let _ = fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn start_without_name_reports_missing_project_config() {
+        let project_dir = temp_dir("missing-project");
+        let error = runtime_input_for_command_with_context(
+            command(&["start"]),
+            &project_dir,
+            &ConfigEnv {
+                xdg_config_home: None,
+                home: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains(".loggle.toml"));
+        assert!(error.starts_with("config file not found: "));
+        let _ = fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn start_with_name_loads_named_home_config() {
+        let home = temp_dir("home");
+        let config_dir = home.join(".config").join("loggle");
+        let root = home.join("workspace");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_config(&config_dir.join("libre.toml"), &root);
+
+        let resolved = runtime_input_for_command_with_context(
+            command(&["start", "libre"]),
+            &home,
+            &ConfigEnv {
+                xdg_config_home: None,
+                home: Some(home.clone()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.input,
+            RuntimeInput::Commands(vec![NamedCommand {
+                name: "api".to_string(),
+                command: command(&["pnpm", "start"]),
+                cwd: Some(root),
+            }])
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn start_rejects_extra_args() {
+        assert_eq!(
+            runtime_input_for_command_with_context(
+                command(&["start", "libre", "extra"]),
+                Path::new("/tmp"),
+                &ConfigEnv {
+                    xdg_config_home: None,
+                    home: Some(std::path::PathBuf::from("/tmp")),
+                },
+            )
+            .unwrap_err(),
+            "start accepts at most one config name"
         );
     }
 }

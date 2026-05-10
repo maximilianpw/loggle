@@ -3,6 +3,7 @@ use std::{
     io::{self, BufRead, IsTerminal, Read},
     os::fd::FromRawFd,
     os::unix::process::CommandExt,
+    path::Path,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -25,7 +26,7 @@ pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<String>) -> io::Result<()> {
 }
 
 pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io::Result<Child> {
-    let mut child = spawn_child(command)?;
+    let mut child = spawn_child(command, None)?;
 
     if let Some(stdout) = child.stdout.take() {
         spawn_line_reader(stdout, tx.clone());
@@ -59,7 +60,7 @@ pub(super) fn spawn_named_commands(
 }
 
 fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
-    let mut child = spawn_child(&command.command)?;
+    let mut child = spawn_child(&command.command, command.cwd.as_deref())?;
 
     if let Some(stdout) = child.stdout.take() {
         spawn_prefixed_line_reader(stdout, command.name.clone(), tx.clone());
@@ -71,13 +72,17 @@ fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::
     Ok(child)
 }
 
-fn spawn_child(command: &[String]) -> io::Result<Child> {
+fn spawn_child(command: &[String], cwd: Option<&Path>) -> io::Result<Child> {
     let mut command_builder = Command::new(&command[0]);
     command_builder
         .args(&command[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(cwd) = cwd {
+        command_builder.current_dir(cwd);
+    }
 
     unsafe {
         command_builder.pre_exec(|| {
@@ -266,6 +271,17 @@ fn kill_retry_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "loggle-runtime-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn read_lines_sends_each_line_until_eof() {
@@ -287,6 +303,30 @@ mod tests {
         assert_eq!(rx.blocking_recv(), Some("[api] one".to_string()));
         assert_eq!(rx.blocking_recv(), Some("[api] two".to_string()));
         assert_eq!(rx.blocking_recv(), None);
+    }
+
+    #[test]
+    fn named_commands_run_from_configured_cwd_and_keep_source_prefix() {
+        let cwd = temp_dir("cwd");
+        fs::write(cwd.join("marker"), "").unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut children = spawn_named_commands(
+            &[NamedCommand {
+                name: "api".to_string(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "test -f marker && echo cwd-ok".to_string(),
+                ],
+                cwd: Some(cwd.clone()),
+            }],
+            tx,
+        )
+        .unwrap();
+
+        assert_eq!(rx.blocking_recv(), Some("[api] cwd-ok".to_string()));
+        assert!(children.pop().unwrap().wait().unwrap().success());
+        let _ = fs::remove_dir_all(cwd);
     }
 
     #[test]

@@ -2,7 +2,7 @@ mod input;
 mod keys;
 mod terminal;
 
-use std::{fmt, io, process::Child};
+use std::{fmt, io, path::PathBuf, process::Child};
 
 use tokio::sync::mpsc;
 
@@ -27,6 +27,7 @@ pub enum RuntimeInput {
 pub struct NamedCommand {
     pub name: String,
     pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -39,7 +40,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingInput => f.write_str(
-                "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle run --name api -- pnpm start --name web -- pnpm dev",
+                "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle run --name api -- pnpm start --name web -- pnpm dev\n  loggle start [name]",
             ),
             Self::Io(error) => write!(f, "{error}"),
         }

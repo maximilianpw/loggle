@@ -89,6 +89,8 @@ Then run it from any Compose project:
 ```sh
 loggle dc
 loggle -- docker compose up
+loggle start
+loggle start libre
 ```
 
 `loggle dc` is an exact shortcut for `loggle -- docker compose up`. Only bare
@@ -107,6 +109,31 @@ docker compose up 2>&1 | loggle
 
 When using pipe mode, include `2>&1`; otherwise stderr can bypass Loggle.
 
+### Start Configs
+
+Use `loggle start` to launch a project-local `.loggle.toml` from the current
+directory:
+
+```toml
+root = "/Users/max-vev/Local/librestock"
+source_fields = ["service", "app", "logger"]
+
+[commands]
+api = ["pnpm", "--filter", "api", "dev"]
+web = ["pnpm", "--filter", "web", "dev"]
+```
+
+`root` and `[commands]` are required. Each command is an argv array, runs from
+`root`, and is displayed with its table key as the source prefix, such as
+`[api]`.
+
+Use `loggle start <name>` for reusable named configs. Named configs live at
+`$XDG_CONFIG_HOME/loggle/<name>.toml`, or `~/.config/loggle/<name>.toml` when
+`XDG_CONFIG_HOME` is not set.
+
+Config `source_fields` extend source promotion for that session. CLI
+`--source-field` values take precedence and are checked before config fields.
+
 ## Options
 
 ```sh
@@ -114,6 +141,8 @@ loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
+loggle start
+loggle start libre
 ```
 
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
@@ -125,6 +154,8 @@ loggle run --name api -- pnpm start --name web -- pnpm dev
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
   prefixes each output line with `[NAME]`, and shows them in one Loggle session
+- `start [NAME]`: launches commands from `.loggle.toml` in the current
+  directory, or from a named config in the Loggle user config directory
 
 ## Controls
 
