@@ -3,7 +3,7 @@ use std::{error::Error, path::Path};
 use clap::Parser;
 use loggle::{
     ConfigEnv, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
-    StartCommand, load_named_config, load_project_config, run,
+    load_named_config, load_project_config, run,
 };
 
 #[derive(Debug, Parser)]
@@ -245,6 +245,8 @@ fn parse_start_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loggle::StartCommand;
+    use std::collections::BTreeMap;
     use std::fs;
 
     fn command(values: &[&str]) -> Vec<String> {
@@ -410,6 +412,7 @@ api = ["pnpm", "start"]
                 name: "api".to_string(),
                 argv: command(&["pnpm", "start"]),
                 cwd: Some(root),
+                env: BTreeMap::new(),
                 wait_for: Vec::new(),
                 ready: None,
             }])
@@ -460,6 +463,7 @@ api = ["pnpm", "start"]
                 name: "api".to_string(),
                 argv: command(&["pnpm", "start"]),
                 cwd: Some(root),
+                env: BTreeMap::new(),
                 wait_for: Vec::new(),
                 ready: None,
             }])

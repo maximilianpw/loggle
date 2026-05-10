@@ -186,6 +186,9 @@ fn validate_config(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let env = raw.env;
+    validate_env("top-level env", &env, path.clone())?;
+
     let commands = raw
         .commands
         .ok_or_else(|| validation_error(path.clone(), "missing required table `[commands]`"))?;
@@ -204,7 +207,7 @@ fn validate_config(
                 return Err(validation_error(path.clone(), "command names must not be empty"));
             }
 
-            let command = validate_command(name, command, &root, path.clone())?;
+            let command = validate_command(name, command, &root, &env, path.clone())?;
             Ok(command)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -229,17 +232,20 @@ fn validate_command(
     name: String,
     command: RawCommand,
     root: &Path,
+    config_env: &BTreeMap<String, String>,
     path: Option<PathBuf>,
 ) -> Result<StartCommand, ConfigError> {
     let RawCommandParts {
         argv,
         argv_field,
+        env,
         wait_for,
         ready,
     } = match command {
         RawCommand::Simple(argv) => RawCommandParts {
             argv,
             argv_field: None,
+            env: BTreeMap::new(),
             wait_for: Vec::new(),
             ready: None,
         },
@@ -251,12 +257,15 @@ fn validate_command(
                 )
             })?,
             argv_field: Some("argv"),
+            env: command.env,
             wait_for: command.wait_for,
             ready: command.ready,
         },
     };
 
     validate_argv(&name, &argv, argv_field, path.clone())?;
+    validate_env(&format!("command '{name}' env"), &env, path.clone())?;
+    let env = merged_env(config_env, env);
 
     let wait_for = wait_for
         .into_iter()
@@ -281,6 +290,7 @@ fn validate_command(
         name,
         argv,
         cwd: Some(root.to_path_buf()),
+        env,
         wait_for,
         ready,
     })
@@ -289,6 +299,7 @@ fn validate_command(
 struct RawCommandParts {
     argv: Vec<String>,
     argv_field: Option<&'static str>,
+    env: BTreeMap<String, String>,
     wait_for: Vec<String>,
     ready: Option<RawReady>,
 }
@@ -380,6 +391,38 @@ fn duration_ms(
     } else {
         Ok(Duration::from_millis(value))
     }
+}
+
+fn validate_env(
+    label: &str,
+    env: &BTreeMap<String, String>,
+    path: Option<PathBuf>,
+) -> Result<(), ConfigError> {
+    for (name, value) in env {
+        if name.is_empty() || name.contains('=') || name.contains('\0') {
+            return Err(validation_error(
+                path,
+                format!("{label} contains invalid variable name '{name}'"),
+            ));
+        }
+        if value.contains('\0') {
+            return Err(validation_error(
+                path,
+                format!("{label} variable '{name}' contains a null byte"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn merged_env(
+    config_env: &BTreeMap<String, String>,
+    command_env: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = config_env.clone();
+    env.extend(command_env);
+    env
 }
 
 fn validate_dependency_graph(
@@ -508,6 +551,8 @@ struct RawConfig {
     root: Option<PathBuf>,
     #[serde(default)]
     source_fields: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     commands: Option<BTreeMap<String, RawCommand>>,
 }
 
@@ -522,6 +567,8 @@ enum RawCommand {
 #[serde(deny_unknown_fields)]
 struct RawAdvancedCommand {
     argv: Option<Vec<String>>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     #[serde(default)]
     wait_for: Vec<String>,
     ready: Option<RawReady>,
@@ -542,6 +589,13 @@ mod tests {
 
     fn command(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn env(values: &[(&str, &str)]) -> BTreeMap<String, String> {
+        values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
     }
 
     #[test]
@@ -570,6 +624,7 @@ web = ["pnpm", "--filter", "web", "dev"]
                     name: "api".to_string(),
                     argv: command(&["pnpm", "--filter", "api", "dev"]),
                     cwd: Some(PathBuf::from("/Users/max-vev/Local/librestock")),
+                    env: BTreeMap::new(),
                     wait_for: Vec::new(),
                     ready: None,
                 },
@@ -577,10 +632,42 @@ web = ["pnpm", "--filter", "web", "dev"]
                     name: "web".to_string(),
                     argv: command(&["pnpm", "--filter", "web", "dev"]),
                     cwd: Some(PathBuf::from("/Users/max-vev/Local/librestock")),
+                    env: BTreeMap::new(),
                     wait_for: Vec::new(),
                     ready: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_top_level_and_command_env() {
+        let config = parse_config(
+            r#"
+root = "/tmp/project"
+env = { NODE_ENV = "development", SHARED = "top" }
+
+[commands.api]
+argv = ["pnpm", "start"]
+env = { DATABASE_URL = "postgres://localhost/db", SHARED = "command" }
+
+[commands.web]
+argv = ["pnpm", "dev"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.commands[0].env,
+            env(&[
+                ("DATABASE_URL", "postgres://localhost/db"),
+                ("NODE_ENV", "development"),
+                ("SHARED", "command"),
+            ])
+        );
+        assert_eq!(
+            config.commands[1].env,
+            env(&[("NODE_ENV", "development"), ("SHARED", "top")])
         );
     }
 
@@ -613,6 +700,7 @@ ready = { line = "ready", timeout_ms = 2000 }
                     name: "api".to_string(),
                     argv: command(&["pnpm", "start"]),
                     cwd: Some(PathBuf::from("/tmp/project")),
+                    env: BTreeMap::new(),
                     wait_for: command(&["db"]),
                     ready: Some(ReadySpec::Line {
                         text: "ready".to_string(),
@@ -623,6 +711,7 @@ ready = { line = "ready", timeout_ms = 2000 }
                     name: "db".to_string(),
                     argv: command(&["docker", "compose", "up", "postgres"]),
                     cwd: Some(PathBuf::from("/tmp/project")),
+                    env: BTreeMap::new(),
                     wait_for: Vec::new(),
                     ready: Some(ReadySpec::Command {
                         command: command(&[
@@ -709,6 +798,42 @@ ready = { command = ["true"] }
                 .unwrap_err()
                 .to_string(),
             "invalid config: command 'api' argv must not be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_top_level_env_name() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+env = { "BAD=NAME" = "value" }
+
+[commands]
+api = ["pnpm", "start"]
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: top-level env contains invalid variable name 'BAD=NAME'"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_command_env_name() {
+        assert_eq!(
+            parse_config(
+                r#"
+root = "/tmp"
+
+[commands.api]
+argv = ["pnpm", "start"]
+env = { "BAD=NAME" = "value" }
+"#
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid config: command 'api' env contains invalid variable name 'BAD=NAME'"
         );
     }
 

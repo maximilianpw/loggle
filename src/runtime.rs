@@ -2,7 +2,7 @@ mod input;
 mod keys;
 mod terminal;
 
-use std::{fmt, io, path::PathBuf, process::Child, time::Duration};
+use std::{collections::BTreeMap, fmt, io, path::PathBuf, process::Child, time::Duration};
 
 use tokio::sync::mpsc;
 
@@ -36,6 +36,7 @@ pub struct StartCommand {
     pub name: String,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
     pub wait_for: Vec<String>,
     pub ready: Option<ReadySpec>,
 }

@@ -131,6 +131,7 @@ Commands can also use an advanced table form when startup ordering matters:
 
 ```toml
 root = ".."
+env = { NODE_ENV = "development" }
 
 [commands.db]
 argv = ["docker", "compose", "-f", "meta/docker-compose.yml", "up", "postgres"]
@@ -154,6 +155,7 @@ timeout_ms = 30000
 [commands.api]
 argv = ["pnpm", "--filter", "@librestock/api", "start"]
 wait_for = ["db"]
+env = { DATABASE_URL = "postgres://postgres:postgres@localhost:5432/librestock" }
 
 [commands.web]
 argv = ["pnpm", "--filter", "@librestock/web", "dev"]
@@ -170,6 +172,12 @@ one strategy per command:
 `ready.timeout_ms` defaults to `30000`. `ready.ms` sets the probe interval for
 `ready.command` and defaults to `500`. Successful probe output is not shown in
 Loggle; timeout errors include recent probe output when there is any.
+
+Top-level `env` applies to every `loggle start` command. Per-command `env`
+applies only to that command and overrides top-level keys. Loggle still inherits
+the environment from the parent shell; config env adds or overrides variables for
+the spawned command and any `ready.command` probes. Env values are literal TOML
+strings: Loggle does not load `.env` files or expand shell variables.
 
 Use `loggle start <name>` for reusable named configs. Named configs live at
 `$XDG_CONFIG_HOME/loggle/<name>.toml`, or `~/.config/loggle/<name>.toml` when

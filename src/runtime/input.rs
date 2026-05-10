@@ -85,7 +85,7 @@ fn spawn_start_command(
     command: &StartCommand,
     tx: mpsc::Sender<String>,
 ) -> io::Result<SpawnedStartCommand> {
-    let mut child = spawn_child(&command.argv, command.cwd.as_deref())?;
+    let mut child = spawn_child_with_env(&command.argv, command.cwd.as_deref(), &command.env)?;
     let ready_line = match &command.ready {
         Some(ReadySpec::Line { text, .. }) => Some(text.clone()),
         _ => None,
@@ -122,6 +122,14 @@ fn spawn_start_command(
 }
 
 fn spawn_child(command: &[String], cwd: Option<&Path>) -> io::Result<Child> {
+    spawn_child_with_env(command, cwd, &BTreeMap::new())
+}
+
+fn spawn_child_with_env(
+    command: &[String],
+    cwd: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> io::Result<Child> {
     let mut command_builder = Command::new(&command[0]);
     command_builder
         .args(&command[1..])
@@ -132,6 +140,7 @@ fn spawn_child(command: &[String], cwd: Option<&Path>) -> io::Result<Child> {
     if let Some(cwd) = cwd {
         command_builder.current_dir(cwd);
     }
+    command_builder.envs(env);
 
     unsafe {
         command_builder.pre_exec(|| {
@@ -145,7 +154,11 @@ fn spawn_child(command: &[String], cwd: Option<&Path>) -> io::Result<Child> {
     command_builder.spawn()
 }
 
-fn spawn_probe(command: &[String], cwd: Option<&Path>) -> io::Result<Child> {
+fn spawn_probe(
+    command: &[String],
+    cwd: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> io::Result<Child> {
     let mut command_builder = Command::new(&command[0]);
     command_builder
         .args(&command[1..])
@@ -156,6 +169,7 @@ fn spawn_probe(command: &[String], cwd: Option<&Path>) -> io::Result<Child> {
     if let Some(cwd) = cwd {
         command_builder.current_dir(cwd);
     }
+    command_builder.envs(env);
 
     unsafe {
         command_builder.pre_exec(|| {
@@ -408,7 +422,11 @@ impl<'a> StartScheduler<'a> {
             if let Some(command_ready) = self.command_ready[index].as_mut() {
                 if command_ready.is_command_probe_due(now) {
                     let probe_outcome =
-                        command_ready.run_probe(self.commands[index].cwd.as_deref(), now);
+                        command_ready.run_probe(
+                            self.commands[index].cwd.as_deref(),
+                            &self.commands[index].env,
+                            now,
+                        );
                     let probe_outcome = match probe_outcome {
                         Ok(outcome) => outcome,
                         Err(error) => return Err(error),
@@ -503,7 +521,12 @@ impl CommandReadyState {
         )
     }
 
-    fn run_probe(&mut self, cwd: Option<&Path>, now: Instant) -> io::Result<ProbeOutcome> {
+    fn run_probe(
+        &mut self,
+        cwd: Option<&Path>,
+        env: &BTreeMap<String, String>,
+        now: Instant,
+    ) -> io::Result<ProbeOutcome> {
         let ReadyKind::Command {
             command,
             interval,
@@ -513,7 +536,7 @@ impl CommandReadyState {
             return Ok(ProbeOutcome::NotReady);
         };
 
-        let probe = run_probe_with_deadline(command, cwd, self.deadline)?;
+        let probe = run_probe_with_deadline(command, cwd, env, self.deadline)?;
         self.recent_output.push(probe.output_summary());
 
         if probe.success {
@@ -629,9 +652,10 @@ impl RecentProbeOutput {
 fn run_probe_with_deadline(
     command: &[String],
     cwd: Option<&Path>,
+    env: &BTreeMap<String, String>,
     deadline: Instant,
 ) -> io::Result<ProbeRun> {
-    let mut child = spawn_probe(command, cwd)?;
+    let mut child = spawn_probe(command, cwd, env)?;
     let stdout = child
         .stdout
         .take()
@@ -832,6 +856,7 @@ mod tests {
             name: name.to_string(),
             argv: command(argv),
             cwd: None,
+            env: BTreeMap::new(),
             wait_for: Vec::new(),
             ready: None,
         }
@@ -973,6 +998,40 @@ mod tests {
     fn start_command_without_ready_unblocks_dependents_after_spawn() {
         let (tx, mut rx) = mpsc::channel(16);
         let db = start_command("db", &["/bin/sh", "-c", "sleep 1"]);
+        let mut api = start_command("api", &["/bin/sh", "-c", "echo api-started"]);
+        api.wait_for = command(&["db"]);
+
+        let mut children = spawn_start_commands(&[db, api], tx).unwrap();
+        let lines = recv_lines(&mut rx, 1);
+
+        cleanup_children(&mut children);
+        assert_eq!(lines, vec!["[api] api-started".to_string()]);
+    }
+
+    #[test]
+    fn start_commands_apply_configured_env() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut api = start_command("api", &["/bin/sh", "-c", "echo env=$LOGGLE_TEST_ENV"]);
+        api.env
+            .insert("LOGGLE_TEST_ENV".to_string(), "configured".to_string());
+
+        let mut children = spawn_start_commands(&[api], tx).unwrap();
+        let lines = recv_lines(&mut rx, 1);
+
+        cleanup_children(&mut children);
+        assert_eq!(lines, vec!["[api] env=configured".to_string()]);
+    }
+
+    #[test]
+    fn ready_command_uses_configured_env() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut db = start_command("db", &["/bin/sh", "-c", "sleep 1"]);
+        db.env.insert("LOGGLE_READY".to_string(), "yes".to_string());
+        db.ready = Some(ReadySpec::Command {
+            command: command(&["/bin/sh", "-c", "test \"$LOGGLE_READY\" = yes"]),
+            interval: Duration::from_millis(25),
+            timeout: Duration::from_secs(2),
+        });
         let mut api = start_command("api", &["/bin/sh", "-c", "echo api-started"]);
         api.wait_for = command(&["db"]);
 

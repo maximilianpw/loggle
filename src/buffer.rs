@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 
 use crate::model::{
-    LogEvent, ParsedLine, PropertyBlockHeader, SourceConfig, parse_compose_line,
-    parse_property_block_header, parse_property_object,
+    LogEvent, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig,
+    message_without_source_prefix, parse_compose_line, parse_property_block_header,
+    parse_property_object,
 };
 
 #[derive(Debug)]
@@ -11,6 +12,7 @@ pub struct LogBuffer {
     next_sequence: u64,
     events: VecDeque<LogEvent>,
     pending_properties: Option<PendingPropertyBlock>,
+    completed_property_blocks: VecDeque<CompletedPropertyBlock>,
     active_source: Option<String>,
     source_config: SourceConfig,
 }
@@ -18,9 +20,17 @@ pub struct LogBuffer {
 #[derive(Debug)]
 struct PendingPropertyBlock {
     target_sequence: u64,
+    deferred_header: Option<PropertyBlockHeader>,
     lines: Vec<String>,
     brace_depth: i32,
     saw_open: bool,
+}
+
+#[derive(Debug)]
+struct CompletedPropertyBlock {
+    header_sequence: u64,
+    header: PropertyBlockHeader,
+    properties: Vec<LogProperty>,
 }
 
 impl LogBuffer {
@@ -35,6 +45,7 @@ impl LogBuffer {
             next_sequence: 0,
             events: VecDeque::with_capacity(capacity),
             pending_properties: None,
+            completed_property_blocks: VecDeque::new(),
             active_source: None,
             source_config,
         }
@@ -47,31 +58,42 @@ impl LogBuffer {
 
         if let Some(header) = parse_property_block_header(&line) {
             if let Some(target_sequence) = self.property_target_sequence(&header) {
-                self.pending_properties = Some(PendingPropertyBlock::new(target_sequence));
+                self.pending_properties = Some(PendingPropertyBlock::new(target_sequence, None));
                 return;
             }
+
+            if let Some(target_sequence) = self.push_event(line) {
+                self.pending_properties =
+                    Some(PendingPropertyBlock::new(target_sequence, Some(header)));
+                return;
+            }
+
+            return;
         }
 
         self.push_event(line);
     }
 
-    fn push_event(&mut self, line: String) {
+    fn push_event(&mut self, line: String) -> Option<u64> {
         let mut parsed = parse_compose_line(&line);
         self.apply_source_context(&mut parsed);
 
         if self.capacity == 0 {
             self.next_sequence += 1;
-            return;
+            return None;
         }
 
         if self.events.len() == self.capacity {
             self.events.pop_front();
         }
 
+        let sequence = self.next_sequence;
         let mut event = LogEvent::from_parsed_line(self.next_sequence, line, parsed);
         Self::promote_source(&self.source_config, &mut event);
         self.next_sequence += 1;
         self.events.push_back(event);
+        self.apply_completed_property_block_to_back();
+        Some(sequence)
     }
 
     fn apply_source_context(&mut self, parsed: &mut ParsedLine) {
@@ -94,7 +116,10 @@ impl LogBuffer {
             return false;
         };
 
-        pending.push_line(line);
+        if !pending.push_line(line) {
+            return false;
+        }
+
         if pending.is_complete() {
             self.apply_pending_properties(pending);
         } else {
@@ -122,8 +147,64 @@ impl LogBuffer {
             .iter_mut()
             .find(|event| event.sequence == pending.target_sequence)
         {
-            event.set_properties(properties);
+            event.set_properties(properties.clone());
             Self::promote_source(&source_config, event);
+        }
+
+        if let Some(header) = pending.deferred_header {
+            self.completed_property_blocks.push_back(CompletedPropertyBlock {
+                header_sequence: pending.target_sequence,
+                header,
+                properties,
+            });
+            self.trim_completed_property_blocks();
+        }
+    }
+
+    fn apply_completed_property_block_to_back(&mut self) {
+        let Some(event) = self.events.back() else {
+            return;
+        };
+
+        let Some(position) = self
+            .completed_property_blocks
+            .iter()
+            .position(|block| {
+                event.sequence != block.header_sequence
+                    && event.timestamp.as_deref() == Some(block.header.timestamp.as_str())
+                    && event.level == block.header.level
+            })
+        else {
+            return;
+        };
+
+        let Some(block) = self.completed_property_blocks.remove(position) else {
+            return;
+        };
+        let target_sequence = event.sequence;
+        let source_config = self.source_config.clone();
+
+        if let Some(event) = self
+            .events
+            .iter_mut()
+            .find(|event| event.sequence == target_sequence)
+        {
+            event.set_properties(block.properties);
+            Self::promote_source(&source_config, event);
+        }
+
+        if let Some(position) = self
+            .events
+            .iter()
+            .position(|event| event.sequence == block.header_sequence)
+        {
+            self.events.remove(position);
+        }
+    }
+
+    fn trim_completed_property_blocks(&mut self) {
+        while self.completed_property_blocks.len() > self.capacity {
+            self.completed_property_blocks.pop_front();
         }
     }
 
@@ -225,18 +306,26 @@ fn looks_like_property_key(key: &str) -> bool {
 }
 
 impl PendingPropertyBlock {
-    fn new(target_sequence: u64) -> Self {
+    fn new(target_sequence: u64, deferred_header: Option<PropertyBlockHeader>) -> Self {
         Self {
             target_sequence,
+            deferred_header,
             lines: Vec::new(),
             brace_depth: 0,
             saw_open: false,
         }
     }
 
-    fn push_line(&mut self, line: &str) {
-        self.update_brace_depth(line);
-        self.lines.push(line.to_string());
+    fn push_line(&mut self, line: &str) -> bool {
+        let line = message_without_source_prefix(line);
+        let trimmed = line.trim();
+        if !self.saw_open && !trimmed.is_empty() && !trimmed.starts_with('{') {
+            return false;
+        }
+
+        self.update_brace_depth(&line);
+        self.lines.push(line);
+        true
     }
 
     fn is_complete(&self) -> bool {
@@ -443,6 +532,66 @@ mod tests {
     }
 
     #[test]
+    fn merges_bracket_prefixed_property_block_body_into_previous_structured_event() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 21:05:37.312 INFO http.request ok".to_string());
+        buffer.push_line("[api] [21:05:37.312] INFO (#140):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] messageKey: \"http.request\",".to_string());
+        buffer.push_line("[api] statusCode: 200,".to_string());
+        buffer.push_line("[api] }".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        let event = buffer.events().back().unwrap();
+        assert_eq!(event.source, "api");
+        assert_eq!(event.message, "http.request ok");
+        assert_eq!(event.properties.len(), 2);
+        assert_eq!(event.properties[0].key, "messageKey");
+        assert_eq!(event.properties[1].key, "statusCode");
+    }
+
+    #[test]
+    fn merges_compose_prefixed_property_block_body_into_previous_structured_event() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("api | 21:05:37.312 INFO http.request ok".to_string());
+        buffer.push_line("api | [21:05:37.312] INFO (#140):".to_string());
+        buffer.push_line("api | {".to_string());
+        buffer.push_line("api | requestId: \"abc-123\",".to_string());
+        buffer.push_line("api | statusCode: 200,".to_string());
+        buffer.push_line("api | }".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        let event = buffer.events().back().unwrap();
+        assert_eq!(event.source, "api");
+        assert_eq!(event.message, "http.request ok");
+        assert_eq!(event.properties.len(), 2);
+        assert_eq!(event.properties[0].key, "requestId");
+        assert_eq!(event.properties[1].key, "statusCode");
+    }
+
+    #[test]
+    fn moves_property_block_onto_following_structured_event() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] [21:05:37.312] INFO (#140):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] requestId: \"89698d63\",".to_string());
+        buffer.push_line("[api] statusCode: 200,".to_string());
+        buffer.push_line("[api] }".to_string());
+        buffer.push_line("[api] 21:05:37.312 INFO http.request ok".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        let event = buffer.events().back().unwrap();
+        assert_eq!(event.source, "api");
+        assert_eq!(event.message, "http.request ok");
+        assert_eq!(event.properties.len(), 2);
+        assert_eq!(event.properties[0].key, "requestId");
+        assert_eq!(event.properties[1].key, "statusCode");
+    }
+
+    #[test]
     fn promotes_source_fields_from_merged_property_blocks() {
         let mut buffer = LogBuffer::with_source_config(10, source_config(&["service"]));
 
@@ -466,6 +615,25 @@ mod tests {
         assert_eq!(
             buffer.events().back().unwrap().raw,
             "[14:06:58.892] INFO (#147):"
+        );
+    }
+
+    #[test]
+    fn keeps_following_non_object_line_visible_after_unmatched_property_header() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[14:06:58.892] INFO (#147):".to_string());
+        buffer.push_line("VITE ready in 200 ms".to_string());
+
+        let raws = buffer
+            .events()
+            .iter()
+            .map(|event| event.raw.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            raws,
+            vec!["[14:06:58.892] INFO (#147):", "VITE ready in 200 ms"]
         );
     }
 }

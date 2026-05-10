@@ -269,7 +269,7 @@ pub fn parse_property_block_header(line: &str) -> Option<PropertyBlockHeader> {
     })
 }
 
-fn message_without_source_prefix(line: &str) -> String {
+pub(crate) fn message_without_source_prefix(line: &str) -> String {
     let line = clean_display_text(line);
 
     if let Some((source, message)) = line.split_once('|') {
