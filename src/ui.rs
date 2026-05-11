@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 
-use crate::app::{App, Mode, PromptKind};
+use crate::app::{App, DialogKind, Mode, PromptKind};
 
 use theme::THEME;
 
@@ -44,10 +44,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool, closing: Opti
             &items,
             app.palette_selected(),
         );
-    } else if app.mode() == &Mode::PropertyFilters {
-        draw_property_filters_dialog(frame, app);
-    } else if app.mode() == &Mode::MessageFields {
-        draw_message_fields_dialog(frame, app);
+    } else if let Mode::Dialog(kind) = *app.mode() {
+        draw_searchable_dialog(frame, app, kind);
     }
 
     if let Some(message) = closing {
@@ -200,76 +198,77 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.mode() {
         Mode::Prompt(_) => draw_prompt(frame, area, app),
-        Mode::Normal | Mode::Palette | Mode::PropertyFilters | Mode::MessageFields => {
-            status::draw_status(frame, area, app)
-        }
+        Mode::Normal | Mode::Palette | Mode::Dialog(_) => status::draw_status(frame, area, app),
     }
 }
 
-fn draw_property_filters_dialog(frame: &mut Frame<'_>, app: &App) {
-    let rows = app.property_filter_rows();
+fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
+    let title = match kind {
+        DialogKind::PropertyFilters => "Property filters",
+        DialogKind::MessageFields => "Message fields",
+    };
+    let empty_item = empty_dialog_item(kind);
+    let property_rows;
+    let message_rows;
     let items;
-    let empty_items;
-    let rendered = if rows.is_empty() {
-        empty_items = [dialog::SelectableListItem {
-            shortcut: None,
-            label: "No property filters",
-            description: "Add filters with f, +, or -",
-        }];
-        &empty_items[..]
-    } else {
-        items = rows
-            .iter()
-            .map(|row| dialog::SelectableListItem {
-                shortcut: Some(row.kind),
-                label: &row.summary,
-                description: "Enter edit  Backspace/Delete remove",
-            })
-            .collect::<Vec<_>>();
-        &items[..]
+    let rendered = match kind {
+        DialogKind::PropertyFilters => {
+            property_rows = app.property_filter_rows();
+            if property_rows.is_empty() {
+                std::slice::from_ref(&empty_item)
+            } else {
+                items = property_rows
+                    .iter()
+                    .map(|row| dialog::SelectableListItem {
+                        shortcut: Some(row.kind),
+                        label: &row.summary,
+                        description: "Enter edit  Backspace/Delete remove",
+                    })
+                    .collect::<Vec<_>>();
+                &items[..]
+            }
+        }
+        DialogKind::MessageFields => {
+            message_rows = app.message_field_rows();
+            if message_rows.is_empty() {
+                std::slice::from_ref(&empty_item)
+            } else {
+                items = message_rows
+                    .iter()
+                    .map(|key| dialog::SelectableListItem {
+                        shortcut: None,
+                        label: key,
+                        description: "Backspace/Delete remove",
+                    })
+                    .collect::<Vec<_>>();
+                &items[..]
+            }
+        }
     };
 
     dialog::draw_searchable_dialog(
         frame,
         frame.area(),
-        "Property filters",
-        app.property_filter_query(),
+        title,
+        app.dialog_query(kind),
         rendered,
-        app.selected_property_filter_index(),
+        app.selected_dialog_index(kind),
     );
 }
 
-fn draw_message_fields_dialog(frame: &mut Frame<'_>, app: &App) {
-    let rows = app.message_field_rows();
-    let items;
-    let empty_items;
-    let rendered = if rows.is_empty() {
-        empty_items = [dialog::SelectableListItem {
+fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
+    match kind {
+        DialogKind::PropertyFilters => dialog::SelectableListItem {
+            shortcut: None,
+            label: "No property filters",
+            description: "Add filters with f, +, or -",
+        },
+        DialogKind::MessageFields => dialog::SelectableListItem {
             shortcut: None,
             label: "No message fields",
             description: "Add fields with m from details",
-        }];
-        &empty_items[..]
-    } else {
-        items = rows
-            .iter()
-            .map(|key| dialog::SelectableListItem {
-                shortcut: None,
-                label: key,
-                description: "Backspace/Delete remove",
-            })
-            .collect::<Vec<_>>();
-        &items[..]
-    };
-
-    dialog::draw_searchable_dialog(
-        frame,
-        frame.area(),
-        "Message fields",
-        app.message_field_query(),
-        rendered,
-        app.selected_message_field_index(),
-    );
+        },
+    }
 }
 
 fn draw_closing_overlay(frame: &mut Frame<'_>, area: Rect, message: &str) {
@@ -315,7 +314,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Prompt(PromptKind::IncludeProperty) => "show prop: ",
         Mode::Prompt(PromptKind::ExcludeProperty) => "hide prop: ",
         Mode::Prompt(PromptKind::EditPropertyFilter) => "edit prop: ",
-        Mode::Normal | Mode::Palette | Mode::PropertyFilters | Mode::MessageFields => "",
+        Mode::Normal | Mode::Palette | Mode::Dialog(_) => "",
     };
     let base = Style::default().fg(THEME.text).bg(THEME.panel_alt);
     let prompt = Line::from(vec![

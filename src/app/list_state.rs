@@ -22,12 +22,14 @@ impl SearchableListState {
         self.selected = self.selected.saturating_sub(amount);
     }
 
-    pub(super) fn push_query_char(&mut self, value: char) {
+    pub(super) fn push_query_char(&mut self, value: char, len: usize) {
         self.query.push(value);
+        self.sync(len);
     }
 
-    pub(super) fn pop_query_char(&mut self) {
+    pub(super) fn pop_query_char(&mut self, len: usize) {
         self.query.pop();
+        self.sync(len);
     }
 
     pub(super) fn sync(&mut self, len: usize) {
@@ -61,12 +63,12 @@ mod tests {
         let mut state = SearchableListState::default();
         state.move_down(2, 5);
 
-        state.push_query_char('r');
-        state.push_query_char('e');
+        state.push_query_char('r', 5);
+        state.push_query_char('e', 5);
         assert_eq!(state.query(), "re");
         assert_eq!(state.selected(), 2);
 
-        state.pop_query_char();
+        state.pop_query_char(5);
         assert_eq!(state.query(), "r");
 
         state.sync(1);

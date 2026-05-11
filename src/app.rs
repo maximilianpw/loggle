@@ -19,13 +19,18 @@ pub enum PromptKind {
     EditPropertyFilter,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    PropertyFilters,
+    MessageFields,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Prompt(PromptKind),
     Palette,
-    PropertyFilters,
-    MessageFields,
+    Dialog(DialogKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,12 +120,12 @@ impl App {
         self.palette_commands().get(self.palette.selected())
     }
 
-    pub fn property_filter_query(&self) -> &str {
-        self.property_filters.query()
+    pub fn dialog_query(&self, kind: DialogKind) -> &str {
+        self.dialog_state(kind).query()
     }
 
-    pub fn selected_property_filter_index(&self) -> usize {
-        self.property_filters.selected()
+    pub fn selected_dialog_index(&self, kind: DialogKind) -> usize {
+        self.dialog_state(kind).selected()
     }
 
     pub fn property_filter_rows(&self) -> Vec<PropertyFilterRow> {
@@ -139,14 +144,6 @@ impl App {
 
     pub fn message_field_keys(&self) -> &[String] {
         &self.message_field_keys
-    }
-
-    pub fn message_field_query(&self) -> &str {
-        self.message_fields.query()
-    }
-
-    pub fn selected_message_field_index(&self) -> usize {
-        self.message_fields.selected()
     }
 
     pub fn message_field_rows(&self) -> Vec<&str> {
@@ -313,77 +310,38 @@ impl App {
         self.palette.move_up(amount);
     }
 
-    pub fn open_property_filters(&mut self) {
-        self.mode = Mode::PropertyFilters;
+    pub fn open_dialog(&mut self, kind: DialogKind) {
+        self.mode = Mode::Dialog(kind);
         self.prompt.clear();
         self.pending_g = false;
-        self.editing_property_filter = None;
-        self.sync_property_filter_selection();
+        if kind == DialogKind::PropertyFilters {
+            self.editing_property_filter = None;
+        }
+        self.sync_dialog_selection(kind);
     }
 
-    pub fn close_property_filters(&mut self) {
+    pub fn close_dialog(&mut self) {
         self.mode = Mode::Normal;
         self.pending_g = false;
     }
 
-    pub fn open_message_fields(&mut self) {
-        self.mode = Mode::MessageFields;
-        self.prompt.clear();
-        self.pending_g = false;
-        self.sync_message_field_selection();
+    pub fn move_dialog_down(&mut self, kind: DialogKind, amount: usize) {
+        let len = self.dialog_len(kind);
+        self.dialog_state_mut(kind).move_down(amount, len);
     }
 
-    pub fn close_message_fields(&mut self) {
-        self.mode = Mode::Normal;
-        self.pending_g = false;
+    pub fn move_dialog_up(&mut self, kind: DialogKind, amount: usize) {
+        self.dialog_state_mut(kind).move_up(amount);
     }
 
-    pub fn move_property_filter_down(&mut self, amount: usize) {
-        self.property_filters
-            .move_down(amount, self.property_filter_rows().len());
+    pub fn push_dialog_query_char(&mut self, kind: DialogKind, value: char) {
+        let len = self.dialog_len_after_query_push(kind, value);
+        self.dialog_state_mut(kind).push_query_char(value, len);
     }
 
-    pub fn move_property_filter_up(&mut self, amount: usize) {
-        self.property_filters.move_up(amount);
-    }
-
-    pub fn push_property_filter_query_char(&mut self, value: char) {
-        self.property_filters.push_query_char(value);
-        self.sync_property_filter_selection();
-    }
-
-    pub fn pop_property_filter_query_char(&mut self) {
-        self.property_filters.pop_query_char();
-        self.sync_property_filter_selection();
-    }
-
-    pub fn delete_selected_property_filter(&mut self) {
-        let Some(row) = self.selected_property_filter_row() else {
-            return;
-        };
-
-        self.filters.remove_property_filter(row.id);
-        self.sync_property_filter_selection();
-        self.sync_selection();
-    }
-
-    pub fn move_message_field_down(&mut self, amount: usize) {
-        self.message_fields
-            .move_down(amount, self.message_field_rows().len());
-    }
-
-    pub fn move_message_field_up(&mut self, amount: usize) {
-        self.message_fields.move_up(amount);
-    }
-
-    pub fn push_message_field_query_char(&mut self, value: char) {
-        self.message_fields.push_query_char(value);
-        self.sync_message_field_selection();
-    }
-
-    pub fn pop_message_field_query_char(&mut self) {
-        self.message_fields.pop_query_char();
-        self.sync_message_field_selection();
+    pub fn pop_dialog_query_char(&mut self, kind: DialogKind) {
+        let len = self.dialog_len_after_query_pop(kind);
+        self.dialog_state_mut(kind).pop_query_char(len);
     }
 
     pub fn add_selected_message_field(&mut self) {
@@ -398,18 +356,17 @@ impl App {
         self.sync_message_field_selection();
     }
 
-    pub fn delete_selected_message_field(&mut self) {
-        let Some(key) = self.selected_message_field_key().map(str::to_string) else {
-            return;
-        };
-        if let Some(index) = self
-            .message_field_keys
-            .iter()
-            .position(|candidate| candidate == &key)
-        {
-            self.message_field_keys.remove(index);
+    pub fn activate_selected_dialog_row(&mut self, kind: DialogKind) {
+        if kind == DialogKind::PropertyFilters {
+            self.start_property_filter_edit();
         }
-        self.sync_message_field_selection();
+    }
+
+    pub fn delete_selected_dialog_row(&mut self, kind: DialogKind) {
+        match kind {
+            DialogKind::PropertyFilters => self.delete_selected_property_filter(),
+            DialogKind::MessageFields => self.delete_selected_message_field(),
+        }
     }
 
     pub fn push_prompt_char(&mut self, value: char) {
@@ -422,7 +379,7 @@ impl App {
 
     pub fn cancel_prompt(&mut self) {
         self.mode = if self.editing_property_filter.is_some() {
-            Mode::PropertyFilters
+            Mode::Dialog(DialogKind::PropertyFilters)
         } else {
             Mode::Normal
         };
@@ -471,7 +428,7 @@ impl App {
         }
 
         self.mode = if matches!(kind, PromptKind::EditPropertyFilter) {
-            Mode::PropertyFilters
+            Mode::Dialog(DialogKind::PropertyFilters)
         } else {
             Mode::Normal
         };
@@ -591,18 +548,96 @@ impl App {
         }
     }
 
+    fn dialog_state(&self, kind: DialogKind) -> &SearchableListState {
+        match kind {
+            DialogKind::PropertyFilters => &self.property_filters,
+            DialogKind::MessageFields => &self.message_fields,
+        }
+    }
+
+    fn dialog_state_mut(&mut self, kind: DialogKind) -> &mut SearchableListState {
+        match kind {
+            DialogKind::PropertyFilters => &mut self.property_filters,
+            DialogKind::MessageFields => &mut self.message_fields,
+        }
+    }
+
+    fn dialog_len(&self, kind: DialogKind) -> usize {
+        match kind {
+            DialogKind::PropertyFilters => self.property_filter_rows().len(),
+            DialogKind::MessageFields => self.message_field_rows().len(),
+        }
+    }
+
+    fn dialog_len_after_query_push(&self, kind: DialogKind, value: char) -> usize {
+        let mut query = self.dialog_query(kind).to_string();
+        query.push(value);
+        self.dialog_len_for_query(kind, query.trim())
+    }
+
+    fn dialog_len_after_query_pop(&self, kind: DialogKind) -> usize {
+        let mut query = self.dialog_query(kind).to_string();
+        query.pop();
+        self.dialog_len_for_query(kind, query.trim())
+    }
+
+    fn dialog_len_for_query(&self, kind: DialogKind, query: &str) -> usize {
+        match kind {
+            DialogKind::PropertyFilters => self
+                .all_property_filter_rows()
+                .into_iter()
+                .filter(|row| property_filter_row_matches(row, query))
+                .count(),
+            DialogKind::MessageFields => self
+                .message_field_keys
+                .iter()
+                .filter(|key| {
+                    query.is_empty()
+                        || crate::filter::contains_ignore_ascii_case(key.as_str(), query)
+                })
+                .count(),
+        }
+    }
+
     fn sync_palette_selection(&mut self) {
         self.palette.sync(self.palette_commands().len());
     }
 
+    fn sync_dialog_selection(&mut self, kind: DialogKind) {
+        let len = self.dialog_len(kind);
+        self.dialog_state_mut(kind).sync(len);
+    }
+
     fn sync_property_filter_selection(&mut self) {
-        let len = self.property_filter_rows().len();
-        self.property_filters.sync(len);
+        self.sync_dialog_selection(DialogKind::PropertyFilters);
     }
 
     fn sync_message_field_selection(&mut self) {
-        let len = self.message_field_rows().len();
-        self.message_fields.sync(len);
+        self.sync_dialog_selection(DialogKind::MessageFields);
+    }
+
+    fn delete_selected_property_filter(&mut self) {
+        let Some(row) = self.selected_property_filter_row() else {
+            return;
+        };
+
+        self.filters.remove_property_filter(row.id);
+        self.sync_property_filter_selection();
+        self.sync_selection();
+    }
+
+    fn delete_selected_message_field(&mut self) {
+        let Some(key) = self.selected_message_field_key().map(str::to_string) else {
+            return;
+        };
+        if let Some(index) = self
+            .message_field_keys
+            .iter()
+            .position(|candidate| candidate == &key)
+        {
+            self.message_field_keys.remove(index);
+        }
+        self.sync_message_field_selection();
     }
 
     fn all_property_filter_rows(&self) -> Vec<PropertyFilterRow> {
@@ -768,21 +803,21 @@ mod tests {
             "durationMs".to_string(),
         ];
 
-        app.open_message_fields();
-        app.push_message_field_query_char('r');
-        app.push_message_field_query_char('e');
+        app.open_dialog(DialogKind::MessageFields);
+        app.push_dialog_query_char(DialogKind::MessageFields, 'r');
+        app.push_dialog_query_char(DialogKind::MessageFields, 'e');
 
-        assert_eq!(app.mode(), &Mode::MessageFields);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
         assert_eq!(app.message_field_rows(), vec!["requestId"]);
 
-        app.delete_selected_message_field();
+        app.delete_selected_dialog_row(DialogKind::MessageFields);
 
         assert_eq!(
             app.message_field_keys(),
             &["tenantId".to_string(), "durationMs".to_string()]
         );
-        assert_eq!(app.mode(), &Mode::MessageFields);
-        assert_eq!(app.selected_message_field_index(), 0);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
+        assert_eq!(app.selected_dialog_index(DialogKind::MessageFields), 0);
     }
 
     #[test]
@@ -790,11 +825,11 @@ mod tests {
         let mut app = App::new(10);
         app.message_field_keys = vec!["tenantId".to_string()];
 
-        app.open_message_fields();
-        app.delete_selected_message_field();
+        app.open_dialog(DialogKind::MessageFields);
+        app.delete_selected_dialog_row(DialogKind::MessageFields);
 
         assert!(app.message_field_keys().is_empty());
-        assert_eq!(app.mode(), &Mode::MessageFields);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
     }
 
     #[test]
@@ -835,11 +870,11 @@ mod tests {
             predicate: PropertyPredicate::exists("debug"),
         });
 
-        app.open_property_filters();
-        app.push_property_filter_query_char('i');
-        app.push_property_filter_query_char('g');
+        app.open_dialog(DialogKind::PropertyFilters);
+        app.push_dialog_query_char(DialogKind::PropertyFilters, 'i');
+        app.push_dialog_query_char(DialogKind::PropertyFilters, 'g');
 
-        assert_eq!(app.mode(), &Mode::PropertyFilters);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
         let rows = app.property_filter_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "ignore");
@@ -858,17 +893,17 @@ mod tests {
             predicate: PropertyPredicate::exists("debug"),
         });
 
-        app.open_property_filters();
-        app.move_property_filter_down(1);
-        app.delete_selected_property_filter();
+        app.open_dialog(DialogKind::PropertyFilters);
+        app.move_dialog_down(DialogKind::PropertyFilters, 1);
+        app.delete_selected_dialog_row(DialogKind::PropertyFilters);
 
         assert_eq!(
             app.filters.property_includes,
             vec![PropertyPredicate::exact("tenantId", "tenant-1")]
         );
         assert!(app.filters.property_excludes.is_empty());
-        assert_eq!(app.mode(), &Mode::PropertyFilters);
-        assert_eq!(app.selected_property_filter_index(), 0);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
+        assert_eq!(app.selected_dialog_index(DialogKind::PropertyFilters), 0);
     }
 
     #[test]
@@ -879,7 +914,7 @@ mod tests {
             predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
         });
 
-        app.open_property_filters();
+        app.open_dialog(DialogKind::PropertyFilters);
         app.start_property_filter_edit();
         assert_eq!(app.mode(), &Mode::Prompt(PromptKind::EditPropertyFilter));
         assert_eq!(app.prompt(), "tenantId=tenant-1");
@@ -891,7 +926,7 @@ mod tests {
         }
         app.apply_prompt();
 
-        assert_eq!(app.mode(), &Mode::PropertyFilters);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
         assert!(app.filters.property_includes.is_empty());
         assert_eq!(
             app.filters.property_excludes,

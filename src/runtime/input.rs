@@ -23,19 +23,13 @@ pub(super) fn stdin_is_terminal() -> bool {
 
 pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<String>) -> io::Result<()> {
     let input = prepare_terminal_input()?;
-    spawn_line_reader(input, tx);
+    spawn_line_reader(input, tx, LineReaderConfig::default());
     Ok(())
 }
 
 pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io::Result<Child> {
     let mut child = spawn_child(command, None)?;
-
-    if let Some(stdout) = child.stdout.take() {
-        spawn_line_reader(stdout, tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_line_reader(stderr, tx);
-    }
+    spawn_output_readers(&mut child, tx, LineReaderConfig::default());
 
     Ok(child)
 }
@@ -70,13 +64,7 @@ pub(super) fn spawn_start_commands(
 
 fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
     let mut child = spawn_child(&command.command, command.cwd.as_deref())?;
-
-    if let Some(stdout) = child.stdout.take() {
-        spawn_prefixed_line_reader(stdout, command.name.clone(), tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_prefixed_line_reader(stderr, command.name.clone(), tx);
-    }
+    spawn_output_readers(&mut child, tx, LineReaderConfig::with_source(command.name.clone()));
 
     Ok(child)
 }
@@ -96,24 +84,11 @@ fn spawn_start_command(
         .map(|(tx, rx)| (Some(tx), Some(rx)))
         .unwrap_or((None, None));
 
-    if let Some(stdout) = child.stdout.take() {
-        spawn_start_line_reader(
-            stdout,
-            command.name.clone(),
-            tx.clone(),
-            ready_line.clone(),
-            ready_tx.clone(),
-        );
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_start_line_reader(
-            stderr,
-            command.name.clone(),
-            tx,
-            ready_line,
-            ready_tx,
-        );
-    }
+    spawn_output_readers(
+        &mut child,
+        tx,
+        LineReaderConfig::with_source_and_ready(command.name.clone(), ready_line, ready_tx),
+    );
 
     Ok(SpawnedStartCommand {
         child,
@@ -159,28 +134,7 @@ fn spawn_probe(
     cwd: Option<&Path>,
     env: &BTreeMap<String, String>,
 ) -> io::Result<Child> {
-    let mut command_builder = Command::new(&command[0]);
-    command_builder
-        .args(&command[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(cwd) = cwd {
-        command_builder.current_dir(cwd);
-    }
-    command_builder.envs(env);
-
-    unsafe {
-        command_builder.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    command_builder.spawn()
+    spawn_child_with_env(command, cwd, env)
 }
 
 fn prepare_terminal_input() -> io::Result<File> {
@@ -192,67 +146,57 @@ fn prepare_terminal_input() -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(stdin_fd) })
 }
 
-fn spawn_line_reader<R>(input: R, tx: mpsc::Sender<String>)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || read_lines(input, tx));
-}
-
-fn spawn_prefixed_line_reader<R>(input: R, source: String, tx: mpsc::Sender<String>)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || read_lines_with_prefix(input, Some(source), tx));
-}
-
-fn spawn_start_line_reader<R>(
-    input: R,
-    source: String,
-    tx: mpsc::Sender<String>,
+#[derive(Clone, Default)]
+struct LineReaderConfig {
+    source: Option<String>,
     ready_line: Option<String>,
     ready_tx: Option<std_mpsc::Sender<()>>,
-) where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || read_start_lines(input, source, tx, ready_line, ready_tx));
 }
 
-fn read_lines<R>(input: R, tx: mpsc::Sender<String>)
-where
-    R: Read,
-{
-    read_lines_with_prefix(input, None, tx);
-}
+impl LineReaderConfig {
+    fn with_source(source: String) -> Self {
+        Self {
+            source: Some(source),
+            ready_line: None,
+            ready_tx: None,
+        }
+    }
 
-fn read_lines_with_prefix<R>(input: R, source: Option<String>, tx: mpsc::Sender<String>)
-where
-    R: Read,
-{
-    let reader = io::BufReader::new(input);
-    for line in reader.lines() {
-        match line {
-            Ok(line) => {
-                let line = source
-                    .as_ref()
-                    .map(|source| format!("[{source}] {line}"))
-                    .unwrap_or(line);
-                if tx.blocking_send(line).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
+    fn with_source_and_ready(
+        source: String,
+        ready_line: Option<String>,
+        ready_tx: Option<std_mpsc::Sender<()>>,
+    ) -> Self {
+        Self {
+            source: Some(source),
+            ready_line,
+            ready_tx,
         }
     }
 }
 
-fn read_start_lines<R>(
-    input: R,
-    source: String,
+fn spawn_output_readers(
+    child: &mut Child,
     tx: mpsc::Sender<String>,
-    ready_line: Option<String>,
-    ready_tx: Option<std_mpsc::Sender<()>>,
-) where
+    config: LineReaderConfig,
+) {
+    if let Some(stdout) = child.stdout.take() {
+        spawn_line_reader(stdout, tx.clone(), config.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_line_reader(stderr, tx, config);
+    }
+}
+
+fn spawn_line_reader<R>(input: R, tx: mpsc::Sender<String>, config: LineReaderConfig)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || read_lines(input, tx, config));
+}
+
+fn read_lines<R>(input: R, tx: mpsc::Sender<String>, config: LineReaderConfig)
+where
     R: Read,
 {
     let reader = io::BufReader::new(input);
@@ -261,14 +205,22 @@ fn read_start_lines<R>(
     for line in reader.lines() {
         match line {
             Ok(line) => {
-                let matches_ready = ready_line
+                let matches_ready = config
+                    .ready_line
                     .as_ref()
                     .is_some_and(|ready_line| line.contains(ready_line));
-                if tx.blocking_send(format!("[{source}] {line}")).is_err() {
+                let line = config
+                    .source
+                    .as_ref()
+                    .map(|source| format!("[{source}] {line}"))
+                    .unwrap_or(line);
+
+                if tx.blocking_send(line).is_err() {
                     break;
                 }
+
                 if matches_ready && !signaled_ready {
-                    if let Some(ready_tx) = &ready_tx {
+                    if let Some(ready_tx) = &config.ready_tx {
                         let _ = ready_tx.send(());
                     }
                     signaled_ready = true;
@@ -893,7 +845,7 @@ mod tests {
     fn read_lines_sends_each_line_until_eof() {
         let (tx, mut rx) = mpsc::channel(4);
 
-        read_lines("one\ntwo\n".as_bytes(), tx);
+        read_lines("one\ntwo\n".as_bytes(), tx, LineReaderConfig::default());
 
         assert_eq!(rx.blocking_recv(), Some("one".to_string()));
         assert_eq!(rx.blocking_recv(), Some("two".to_string()));
@@ -904,7 +856,11 @@ mod tests {
     fn prefixed_line_reader_marks_each_line_with_source_name() {
         let (tx, mut rx) = mpsc::channel(4);
 
-        read_lines_with_prefix("one\ntwo\n".as_bytes(), Some("api".to_string()), tx);
+        read_lines(
+            "one\ntwo\n".as_bytes(),
+            tx,
+            LineReaderConfig::with_source("api".to_string()),
+        );
 
         assert_eq!(rx.blocking_recv(), Some("[api] one".to_string()));
         assert_eq!(rx.blocking_recv(), Some("[api] two".to_string()));
