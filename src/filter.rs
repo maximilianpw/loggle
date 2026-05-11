@@ -28,6 +28,14 @@ pub struct PropertyFilterId {
 }
 
 impl LogFilter {
+    pub fn has_active_filters(&self) -> bool {
+        self.text.as_ref().is_some_and(|query| !query.is_empty())
+            || self.source.as_ref().is_some_and(|source| !source.is_empty())
+            || self.level.is_some()
+            || !self.property_includes.is_empty()
+            || !self.property_excludes.is_empty()
+    }
+
     pub fn matches(&self, event: &LogEvent) -> bool {
         self.matches_text(event)
             && self.matches_source(event)
@@ -257,6 +265,17 @@ mod tests {
         };
 
         assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn empty_text_and_source_are_not_active_filters() {
+        let filter = LogFilter {
+            text: Some(String::new()),
+            source: Some(String::new()),
+            ..LogFilter::default()
+        };
+
+        assert!(!filter.has_active_filters());
     }
 
     #[test]

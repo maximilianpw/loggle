@@ -2,9 +2,7 @@ mod list_state;
 
 use crate::buffer::LogBuffer;
 use crate::commands::{Command, COMMANDS};
-use crate::filter::{
-    event_contains, LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate,
-};
+use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate};
 use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
 
 use list_state::SearchableListState;
@@ -175,24 +173,8 @@ impl App {
         self.selected_property
     }
 
-    pub fn visible_indices(&self) -> Vec<usize> {
-        self.buffer
-            .events()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| self.filters.matches(event).then_some(index))
-            .collect()
-    }
-
-    pub fn visible_events(&self) -> Vec<&LogEvent> {
-        self.visible_indices()
-            .into_iter()
-            .filter_map(|index| self.buffer.events().get(index))
-            .collect()
-    }
-
     pub fn selected_event(&self) -> Option<&LogEvent> {
-        self.visible_events().get(self.selected).copied()
+        self.visible_event_at(self.selected)
     }
 
     pub fn selected_property(&self) -> Option<&LogProperty> {
@@ -200,16 +182,72 @@ impl App {
             .and_then(|event| event.properties.get(self.selected_property))
     }
 
+    pub fn visible_count(&self) -> usize {
+        if !self.filters.has_active_filters() {
+            return self.buffer.len();
+        }
+
+        self.buffer
+            .events()
+            .iter()
+            .filter(|event| self.filters.matches(event))
+            .count()
+    }
+
+    pub fn visible_event_at(&self, visible_index: usize) -> Option<&LogEvent> {
+        if !self.filters.has_active_filters() {
+            return self.buffer.events().get(visible_index);
+        }
+
+        self.buffer
+            .events()
+            .iter()
+            .filter(|event| self.filters.matches(event))
+            .nth(visible_index)
+    }
+
+    pub fn for_each_visible_event(
+        &self,
+        start: usize,
+        limit: usize,
+        mut visit: impl FnMut(usize, &LogEvent),
+    ) {
+        if limit == 0 {
+            return;
+        }
+
+        if !self.filters.has_active_filters() {
+            let end = start.saturating_add(limit).min(self.buffer.len());
+            for visible_index in start..end {
+                if let Some(event) = self.buffer.events().get(visible_index) {
+                    visit(visible_index, event);
+                }
+            }
+            return;
+        }
+
+        for (visible_index, event) in self
+            .buffer
+            .events()
+            .iter()
+            .filter(|event| self.filters.matches(event))
+            .enumerate()
+            .skip(start)
+            .take(limit)
+        {
+            visit(visible_index, event);
+        }
+    }
+
     #[cfg(test)]
     pub fn event_at_visible(&self, visible_index: usize) -> Option<&LogEvent> {
-        let buffer_index = self.visible_indices().get(visible_index).copied()?;
-        self.buffer.events().get(buffer_index)
+        self.visible_event_at(visible_index)
     }
 
     pub fn move_down(&mut self, amount: usize) {
         self.follow = false;
         self.pending_g = false;
-        let visible_len = self.visible_indices().len();
+        let visible_len = self.visible_count();
         if visible_len == 0 {
             self.selected = 0;
         } else {
@@ -498,33 +536,27 @@ impl App {
 
     fn move_to_search_match(&mut self, forward: bool) {
         self.pending_g = false;
-        let Some(query) = self.filters.text.as_ref().filter(|query| !query.is_empty()) else {
+        let Some(_) = self.filters.text.as_ref().filter(|query| !query.is_empty()) else {
             return;
         };
         self.follow = false;
 
-        let visible = self.visible_events();
-        if visible.is_empty() {
+        let visible_len = self.visible_count();
+        if visible_len == 0 {
             return;
         }
 
-        for step in 1..=visible.len() {
-            let index = if forward {
-                (self.selected + step) % visible.len()
-            } else {
-                (self.selected + visible.len() - (step % visible.len())) % visible.len()
-            };
-
-            if event_contains(visible[index], query) {
-                self.selected = index;
-                self.sync_selected_property();
-                return;
-            }
-        }
+        let selected = self.selected.min(visible_len - 1);
+        self.selected = if forward {
+            (selected + 1) % visible_len
+        } else {
+            (selected + visible_len - 1) % visible_len
+        };
+        self.sync_selected_property();
     }
 
     fn sync_selection(&mut self) {
-        let visible_len = self.visible_indices().len();
+        let visible_len = self.visible_count();
         if visible_len == 0 {
             self.selected = 0;
         } else if self.follow {
@@ -737,6 +769,40 @@ mod tests {
 
         app.previous_search_match();
         assert_eq!(app.event_at_visible(app.selected()).unwrap().raw, "api | ERROR one");
+    }
+
+    #[test]
+    fn visible_count_matches_retained_len_without_filters() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("worker | WARN three".to_string());
+
+        assert_eq!(app.visible_count(), app.retained_len());
+        assert_eq!(app.visible_event_at(1).unwrap().raw, "web | INFO two");
+    }
+
+    #[test]
+    fn visible_window_iterates_only_requested_filtered_rows() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("worker | ERROR three".to_string());
+        app.push_line("api | ERROR four".to_string());
+        app.filters.level = Some(Level::Error);
+
+        let mut rows = Vec::new();
+        app.for_each_visible_event(1, 2, |visible_index, event| {
+            rows.push((visible_index, event.raw.clone()));
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                (1, "worker | ERROR three".to_string()),
+                (2, "api | ERROR four".to_string())
+            ]
+        );
     }
 
     #[test]

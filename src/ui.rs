@@ -31,8 +31,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool, closing: Opti
         frame.area(),
     );
 
-    draw_header(frame, chunks[0], app);
-    draw_body(frame, chunks[1], app, color_enabled);
+    let visible_count = app.visible_count();
+
+    draw_header(frame, chunks[0], app, visible_count);
+    draw_body(frame, chunks[1], app, color_enabled, visible_count);
     draw_footer(frame, chunks[2], app);
 
     if app.mode() == &Mode::Palette {
@@ -53,13 +55,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool, closing: Opti
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, visible_count: usize) {
     let follow = if app.is_following() {
         "follow"
     } else {
         "paused"
     };
-    let visible = app.visible_events().len();
     let style = Style::default().fg(THEME.muted).bg(THEME.panel_alt);
     let accent_style = Style::default()
         .fg(THEME.accent)
@@ -79,7 +80,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::styled("  visible ", style),
         Span::styled(
-            visible.to_string(),
+            visible_count.to_string(),
             Style::default().fg(THEME.text).bg(THEME.panel_alt),
         ),
     ]);
@@ -87,7 +88,13 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(header).style(style), area);
 }
 
-fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App, color_enabled: bool) {
+fn draw_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    color_enabled: bool,
+    visible_count: usize,
+) {
     if app.details_open() && area.height >= 4 {
         let details_height = area.height.saturating_sub(1).min(10).max(3);
         let chunks = Layout::default()
@@ -95,40 +102,41 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App, color_enabled: bool) 
             .constraints([Constraint::Min(1), Constraint::Length(details_height)])
             .split(area);
 
-        draw_logs(frame, chunks[0], app, color_enabled);
+        draw_logs(frame, chunks[0], app, color_enabled, visible_count);
         draw_details(frame, chunks[1], app);
     } else {
-        draw_logs(frame, area, app, color_enabled);
+        draw_logs(frame, area, app, color_enabled, visible_count);
     }
 }
 
-fn draw_logs(frame: &mut Frame<'_>, area: Rect, app: &App, color_enabled: bool) {
+fn draw_logs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    color_enabled: bool,
+    visible_count: usize,
+) {
     frame.render_widget(
         Block::default().style(Style::default().bg(THEME.background)),
         area,
     );
 
-    let visible_events = app.visible_events();
     let highlight_values = app.filters().property_highlight_values();
     let viewport_height = area.height as usize;
     let selected = app.selected();
     let start = selected.saturating_sub(viewport_height.saturating_sub(1));
-    let end = (start + viewport_height).min(visible_events.len());
+    let end = start.saturating_add(viewport_height).min(visible_count);
 
-    let items = visible_events[start..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, event)| {
-            let visible_index = start + offset;
-            ListItem::new(row::render_event(
-                event,
-                color_enabled,
-                visible_index == selected,
-                app.message_field_keys(),
-                &highlight_values,
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(end.saturating_sub(start));
+    app.for_each_visible_event(start, end.saturating_sub(start), |visible_index, event| {
+        items.push(ListItem::new(row::render_event(
+            event,
+            color_enabled,
+            visible_index == selected,
+            app.message_field_keys(),
+            &highlight_values,
+        )));
+    });
 
     let list = List::new(items);
     frame.render_widget(list, area);
