@@ -65,16 +65,24 @@ fn run_app(
 ) -> io::Result<()> {
     let mut app = App::with_source_config(buffer_lines, source_config);
     let mut shutdown: Option<Vec<ChildShutdown>> = None;
+    let mut dirty = true;
 
     loop {
         while let Ok(line) = rx.try_recv() {
             app.push_line(line);
+            dirty = true;
         }
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
             let mut all_exited = true;
             for (active_child, active_shutdown) in children.iter_mut().zip(active_shutdowns) {
-                if let ShutdownStatus::Exited = active_shutdown.tick(active_child, Instant::now())? {
+                let previous_status = active_shutdown.status();
+                let status = active_shutdown.tick(active_child, Instant::now())?;
+                if status != previous_status {
+                    dirty = true;
+                }
+
+                if let ShutdownStatus::Exited = status {
                     input::reap_child(active_child);
                 } else {
                     all_exited = false;
@@ -87,46 +95,55 @@ fn run_app(
             }
         }
 
-        terminal.draw(|frame| {
-            ui::draw(
-                frame,
-                &app,
-                color_enabled,
-                shutdown.as_deref().map(closing_message),
-            )
-        })?;
+        if dirty {
+            terminal.draw(|frame| {
+                ui::draw(
+                    frame,
+                    &app,
+                    color_enabled,
+                    shutdown.as_deref().map(closing_message),
+                )
+            })?;
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(50))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
+            match event::read()? {
+                Event::Key(key) => {
+                    let requested_quit = if shutdown.is_some() {
+                        matches!(key.code, KeyCode::Char('q'))
+                    } else {
+                        let half_page = (terminal.size()?.height as usize / 2).max(1);
+                        keys::handle_key(&mut app, key, half_page) == KeyOutcome::Quit
+                    };
 
-            let requested_quit = if shutdown.is_some() {
-                matches!(key.code, KeyCode::Char('q'))
-            } else {
-                let half_page = (terminal.size()?.height as usize / 2).max(1);
-                keys::handle_key(&mut app, key, half_page) == KeyOutcome::Quit
-            };
-
-            if requested_quit {
-                match shutdown.as_mut() {
-                    _ if children.is_empty() => return Ok(()),
-                    None => {
-                        let now = Instant::now();
-                        shutdown = Some(
-                            children
-                                .iter()
-                                .map(|child| ChildShutdown::start(child, now))
-                                .collect(),
-                        );
-                    }
-                    Some(active_shutdowns) => {
-                        let now = Instant::now();
-                        for active_shutdown in active_shutdowns {
-                            active_shutdown.escalate_now(now);
+                    if requested_quit {
+                        match shutdown.as_mut() {
+                            _ if children.is_empty() => return Ok(()),
+                            None => {
+                                let now = Instant::now();
+                                shutdown = Some(
+                                    children
+                                        .iter()
+                                        .map(|child| ChildShutdown::start(child, now))
+                                        .collect(),
+                                );
+                            }
+                            Some(active_shutdowns) => {
+                                let now = Instant::now();
+                                for active_shutdown in active_shutdowns {
+                                    active_shutdown.escalate_now(now);
+                                }
+                            }
                         }
                     }
+
+                    dirty = true;
                 }
+                Event::Resize(_, _) => {
+                    dirty = true;
+                }
+                _ => {}
             }
         }
     }
