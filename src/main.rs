@@ -19,6 +19,9 @@ struct Cli {
     #[arg(long)]
     no_color: bool,
 
+    #[arg(long)]
+    record: Option<std::path::PathBuf>,
+
     #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
     source_fields: Vec<String>,
 
@@ -69,6 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         color_enabled: !cli.no_color,
         source_config: SourceConfig::with_fields(source_fields),
         input: resolved_input.input,
+        record_path: cli.record,
     }) {
         Ok(()) => Ok(()),
         Err(RuntimeError::MissingInput) => {
@@ -85,7 +89,7 @@ fn command_tail_from_args(raw_args: &[String], clap_command: &[String]) -> Vec<S
         let value = raw_args[index].as_str();
         match value {
             "--" => return raw_args[index + 1..].to_vec(),
-            "--buffer-lines" | "--source-field" => {
+            "--buffer-lines" | "--source-field" | "--record" => {
                 index += 2;
             }
             "--no-color" => {
@@ -95,6 +99,9 @@ fn command_tail_from_args(raw_args: &[String], clap_command: &[String]) -> Vec<S
                 index += 1;
             }
             value if value.starts_with("--source-field=") => {
+                index += 1;
+            }
+            value if value.starts_with("--record=") => {
                 index += 1;
             }
             value if value.starts_with('-') => {
@@ -359,6 +366,20 @@ api = ["pnpm", "start"]
         assert_eq!(
             runtime_input(command_tail_from_args(&raw_args, &cli.command)),
             RuntimeInput::Command(command(&["docker", "compose", "up", "--watch"]))
+        );
+    }
+
+    #[test]
+    fn record_option_does_not_consume_runtime_command() {
+        let raw_args = command(&["--record", "session.log", "docker", "compose", "up"]);
+        let cli = Cli::try_parse_from(
+            std::iter::once("loggle".to_string()).chain(raw_args.iter().cloned()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_input(command_tail_from_args(&raw_args, &cli.command)),
+            RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
 

@@ -1,5 +1,7 @@
 use std::{
-    io,
+    fs::File,
+    io::{self, Write},
+    path::PathBuf,
     process::Child,
     time::{Duration, Instant},
 };
@@ -25,6 +27,7 @@ pub(super) fn run(
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
+    record_path: Option<PathBuf>,
     mut children: Vec<Child>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
@@ -39,6 +42,7 @@ pub(super) fn run(
         buffer_lines,
         color_enabled,
         source_config,
+        record_path,
         &mut children,
     );
 
@@ -61,14 +65,19 @@ fn run_app(
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
+    record_path: Option<PathBuf>,
     children: &mut Vec<Child>,
 ) -> io::Result<()> {
     let mut app = App::with_source_config(buffer_lines, source_config);
     let mut shutdown: Option<Vec<ChildShutdown>> = None;
     let mut dirty = true;
+    let mut recorder = record_path.map(SessionRecorder::create).transpose()?;
 
     loop {
         while let Ok(line) = rx.try_recv() {
+            if let Some(recorder) = recorder.as_mut() {
+                recorder.record_line(&line)?;
+            }
             app.push_line(line);
             dirty = true;
         }
@@ -149,6 +158,23 @@ fn run_app(
     }
 }
 
+struct SessionRecorder {
+    file: File,
+}
+
+impl SessionRecorder {
+    fn create(path: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            file: File::create(path)?,
+        })
+    }
+
+    fn record_line(&mut self, line: &str) -> io::Result<()> {
+        writeln!(self.file, "{line}")?;
+        self.file.flush()
+    }
+}
+
 fn closing_message(shutdowns: &[ChildShutdown]) -> &'static str {
     let status = shutdowns
         .iter()
@@ -161,5 +187,28 @@ fn closing_message(shutdowns: &[ChildShutdown]) -> &'static str {
         ShutdownStatus::Waiting(ShutdownSignal::Terminate) => "closing... terminating children",
         ShutdownStatus::Waiting(ShutdownSignal::Kill) => "closing... force killing children",
         ShutdownStatus::Exited => "closing... children exited",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_recorder_writes_raw_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "loggle-record-test-{}.log",
+            std::process::id()
+        ));
+        {
+            let mut recorder = SessionRecorder::create(path.clone()).unwrap();
+            recorder.record_line("api | one").unwrap();
+            recorder.record_line("web | two").unwrap();
+        }
+
+        let output = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(output, "api | one\nweb | two\n");
     }
 }

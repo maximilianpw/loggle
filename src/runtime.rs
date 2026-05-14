@@ -14,6 +14,7 @@ pub struct RuntimeConfig {
     pub color_enabled: bool,
     pub source_config: SourceConfig,
     pub input: RuntimeInput,
+    pub record_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,7 @@ pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
         config.buffer_lines,
         config.color_enabled,
         config.source_config,
+        config.record_path,
         children,
     )
     .map_err(RuntimeError::from)

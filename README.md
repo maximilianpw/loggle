@@ -193,6 +193,7 @@ Config `source_fields` extend source promotion for that session. CLI
 ```sh
 loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
+loggle --record session.log -- docker compose up
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
 loggle start
@@ -201,6 +202,7 @@ loggle start libre
 
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
 - `--no-color`: disables Loggle's source and severity coloring
+- `--record <PATH>`: writes every raw incoming line to a session log file
 - `--source-field <FIELD>`: promotes matching parsed properties to the source
   column when no explicit prefix exists. Repeat it or pass comma-separated
   fields, e.g. `--source-field service,app`
