@@ -17,6 +17,13 @@ pub struct LogBuffer {
     source_config: SourceConfig,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BufferChange {
+    pub(crate) appended: Option<u64>,
+    pub(crate) removed: Vec<u64>,
+    pub(crate) updated: Vec<u64>,
+}
+
 #[derive(Debug)]
 struct PendingPropertyBlock {
     target_sequence: u64,
@@ -51,30 +58,32 @@ impl LogBuffer {
         }
     }
 
-    pub fn push_line(&mut self, line: String) {
-        if self.push_pending_property_line(&line) {
-            return;
+    pub(crate) fn push_line(&mut self, line: String) -> BufferChange {
+        let mut change = BufferChange::default();
+        if self.push_pending_property_line(&line, &mut change) {
+            return change;
         }
 
         if let Some(header) = parse_property_block_header(&line) {
             if let Some(target_sequence) = self.property_target_sequence(&header) {
                 self.pending_properties = Some(PendingPropertyBlock::new(target_sequence, None));
-                return;
+                return change;
             }
 
-            if let Some(target_sequence) = self.push_event(line) {
+            if let Some(target_sequence) = self.push_event(line, &mut change) {
                 self.pending_properties =
                     Some(PendingPropertyBlock::new(target_sequence, Some(header)));
-                return;
+                return change;
             }
 
-            return;
+            return change;
         }
 
-        self.push_event(line);
+        self.push_event(line, &mut change);
+        change
     }
 
-    fn push_event(&mut self, line: String) -> Option<u64> {
+    fn push_event(&mut self, line: String, change: &mut BufferChange) -> Option<u64> {
         let mut parsed = parse_compose_line(&line);
         self.apply_source_context(&mut parsed);
 
@@ -84,7 +93,9 @@ impl LogBuffer {
         }
 
         if self.events.len() == self.capacity {
-            self.events.pop_front();
+            if let Some(event) = self.events.pop_front() {
+                change.removed.push(event.sequence);
+            }
         }
 
         let sequence = self.next_sequence;
@@ -92,7 +103,8 @@ impl LogBuffer {
         Self::promote_source(&self.source_config, &mut event);
         self.next_sequence += 1;
         self.events.push_back(event);
-        self.apply_completed_property_block_to_back();
+        change.appended = Some(sequence);
+        self.apply_completed_property_block_to_back(change);
         Some(sequence)
     }
 
@@ -111,7 +123,7 @@ impl LogBuffer {
         }
     }
 
-    fn push_pending_property_line(&mut self, line: &str) -> bool {
+    fn push_pending_property_line(&mut self, line: &str, change: &mut BufferChange) -> bool {
         let Some(mut pending) = self.pending_properties.take() else {
             return false;
         };
@@ -121,7 +133,7 @@ impl LogBuffer {
         }
 
         if pending.is_complete() {
-            self.apply_pending_properties(pending);
+            self.apply_pending_properties(pending, change);
         } else {
             self.pending_properties = Some(pending);
         }
@@ -136,7 +148,11 @@ impl LogBuffer {
         .then_some(event.sequence)
     }
 
-    fn apply_pending_properties(&mut self, pending: PendingPropertyBlock) {
+    fn apply_pending_properties(
+        &mut self,
+        pending: PendingPropertyBlock,
+        change: &mut BufferChange,
+    ) {
         let Some(properties) = parse_property_object(&pending.lines.join("\n")) else {
             return;
         };
@@ -149,6 +165,7 @@ impl LogBuffer {
         {
             event.set_properties(properties.clone());
             Self::promote_source(&source_config, event);
+            change.updated.push(pending.target_sequence);
         }
 
         if let Some(header) = pending.deferred_header {
@@ -161,7 +178,7 @@ impl LogBuffer {
         }
     }
 
-    fn apply_completed_property_block_to_back(&mut self) {
+    fn apply_completed_property_block_to_back(&mut self, change: &mut BufferChange) {
         let Some(event) = self.events.back() else {
             return;
         };
@@ -191,6 +208,7 @@ impl LogBuffer {
         {
             event.set_properties(block.properties);
             Self::promote_source(&source_config, event);
+            change.updated.push(target_sequence);
         }
 
         if let Some(position) = self
@@ -198,7 +216,9 @@ impl LogBuffer {
             .iter()
             .position(|event| event.sequence == block.header_sequence)
         {
-            self.events.remove(position);
+            if let Some(event) = self.events.remove(position) {
+                change.removed.push(event.sequence);
+            }
         }
     }
 
@@ -233,6 +253,10 @@ impl LogBuffer {
 
     pub fn events(&self) -> &VecDeque<LogEvent> {
         &self.events
+    }
+
+    pub(crate) fn event_by_sequence(&self, sequence: u64) -> Option<&LogEvent> {
+        self.events().iter().find(|event| event.sequence == sequence)
     }
 }
 

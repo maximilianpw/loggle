@@ -1,6 +1,6 @@
 mod list_state;
 
-use crate::buffer::LogBuffer;
+use crate::buffer::{BufferChange, LogBuffer};
 use crate::commands::{Command, COMMANDS};
 use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate};
 use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
@@ -42,6 +42,7 @@ pub struct PropertyFilterRow {
 pub struct App {
     buffer: LogBuffer,
     filters: LogFilter,
+    visible_cache: Vec<u64>,
     selected: usize,
     follow: bool,
     mode: Mode,
@@ -66,6 +67,7 @@ impl App {
         Self {
             buffer: LogBuffer::with_source_config(buffer_lines, source_config),
             filters: LogFilter::default(),
+            visible_cache: Vec::new(),
             selected: 0,
             follow: true,
             mode: Mode::Normal,
@@ -82,7 +84,8 @@ impl App {
     }
 
     pub fn push_line(&mut self, line: String) {
-        self.buffer.push_line(line);
+        let change = self.buffer.push_line(line);
+        self.apply_buffer_change(change);
         self.sync_selection();
     }
 
@@ -187,11 +190,7 @@ impl App {
             return self.buffer.len();
         }
 
-        self.buffer
-            .events()
-            .iter()
-            .filter(|event| self.filters.matches(event))
-            .count()
+        self.visible_cache.len()
     }
 
     pub fn visible_event_at(&self, visible_index: usize) -> Option<&LogEvent> {
@@ -199,11 +198,9 @@ impl App {
             return self.buffer.events().get(visible_index);
         }
 
-        self.buffer
-            .events()
-            .iter()
-            .filter(|event| self.filters.matches(event))
-            .nth(visible_index)
+        self.visible_cache
+            .get(visible_index)
+            .and_then(|sequence| self.buffer.event_by_sequence(*sequence))
     }
 
     pub fn for_each_visible_event(
@@ -226,16 +223,15 @@ impl App {
             return;
         }
 
-        for (visible_index, event) in self
-            .buffer
-            .events()
-            .iter()
-            .filter(|event| self.filters.matches(event))
-            .enumerate()
-            .skip(start)
-            .take(limit)
-        {
-            visit(visible_index, event);
+        let end = start.saturating_add(limit).min(self.visible_cache.len());
+        for visible_index in start..end {
+            if let Some(event) = self
+                .visible_cache
+                .get(visible_index)
+                .and_then(|sequence| self.buffer.event_by_sequence(*sequence))
+            {
+                visit(visible_index, event);
+            }
         }
     }
 
@@ -465,6 +461,7 @@ impl App {
             }
         }
 
+        self.sync_visible_cache();
         self.mode = if matches!(kind, PromptKind::EditPropertyFilter) {
             Mode::Dialog(DialogKind::PropertyFilters)
         } else {
@@ -478,6 +475,7 @@ impl App {
 
     pub fn clear_filters(&mut self) {
         self.filters.clear();
+        self.sync_visible_cache();
         self.pending_g = false;
         self.sync_selection();
     }
@@ -515,6 +513,7 @@ impl App {
             exclude: false,
             predicate,
         });
+        self.sync_visible_cache();
         self.sync_selection();
     }
 
@@ -565,6 +564,65 @@ impl App {
             self.selected = self.selected.min(visible_len - 1);
         }
         self.sync_selected_property();
+    }
+
+    fn apply_buffer_change(&mut self, change: BufferChange) {
+        if !self.filters.has_active_filters() {
+            self.visible_cache.clear();
+            return;
+        }
+
+        for sequence in change.removed {
+            self.remove_visible_sequence(sequence);
+        }
+
+        if let Some(sequence) = change.appended {
+            self.refresh_visible_sequence(sequence);
+        }
+
+        for sequence in change.updated {
+            self.refresh_visible_sequence(sequence);
+        }
+    }
+
+    fn sync_visible_cache(&mut self) {
+        self.visible_cache.clear();
+        if !self.filters.has_active_filters() {
+            return;
+        }
+
+        self.visible_cache.extend(
+            self.buffer
+                .events()
+                .iter()
+                .filter(|event| self.filters.matches(event))
+                .map(|event| event.sequence),
+        );
+    }
+
+    fn refresh_visible_sequence(&mut self, sequence: u64) {
+        self.remove_visible_sequence(sequence);
+        let Some(event) = self.buffer.event_by_sequence(sequence) else {
+            return;
+        };
+        if !self.filters.matches(event) {
+            return;
+        }
+
+        let index = self
+            .visible_cache
+            .partition_point(|cached_sequence| *cached_sequence < sequence);
+        self.visible_cache.insert(index, sequence);
+    }
+
+    fn remove_visible_sequence(&mut self, sequence: u64) {
+        if let Some(index) = self
+            .visible_cache
+            .iter()
+            .position(|cached_sequence| *cached_sequence == sequence)
+        {
+            self.visible_cache.remove(index);
+        }
     }
 
     fn sync_selected_property(&mut self) {
@@ -654,6 +712,7 @@ impl App {
         };
 
         self.filters.remove_property_filter(row.id);
+        self.sync_visible_cache();
         self.sync_property_filter_selection();
         self.sync_selection();
     }
@@ -762,6 +821,7 @@ mod tests {
         app.push_line("api | ok".to_string());
         app.push_line("web | ERROR two".to_string());
         app.filters.text = Some("error".to_string());
+        app.sync_visible_cache();
         app.jump_top();
 
         app.next_search_match();
@@ -790,6 +850,7 @@ mod tests {
         app.push_line("worker | ERROR three".to_string());
         app.push_line("api | ERROR four".to_string());
         app.filters.level = Some(Level::Error);
+        app.sync_visible_cache();
 
         let mut rows = Vec::new();
         app.for_each_visible_event(1, 2, |visible_index, event| {
@@ -802,6 +863,68 @@ mod tests {
                 (1, "worker | ERROR three".to_string()),
                 (2, "api | ERROR four".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn filtered_visible_cache_updates_as_matching_lines_arrive() {
+        let mut app = App::new(10);
+        app.start_prompt(PromptKind::Text);
+        for ch in "error".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        app.push_line("api | INFO one".to_string());
+        app.push_line("api | ERROR two".to_string());
+        app.push_line("api | ERROR three".to_string());
+
+        assert_eq!(app.visible_count(), 2);
+        assert_eq!(app.visible_event_at(0).unwrap().raw, "api | ERROR two");
+        assert_eq!(app.visible_event_at(1).unwrap().raw, "api | ERROR three");
+    }
+
+    #[test]
+    fn filtered_visible_cache_drops_evicted_sequences() {
+        let mut app = App::new(2);
+        app.start_prompt(PromptKind::Text);
+        for ch in "error".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("api | INFO two".to_string());
+        app.push_line("api | ERROR three".to_string());
+
+        assert_eq!(app.visible_count(), 1);
+        assert_eq!(app.visible_event_at(0).unwrap().raw, "api | ERROR three");
+    }
+
+    #[test]
+    fn filtered_visible_cache_refreshes_when_property_block_updates_event() {
+        let mut app = App::new(10);
+        app.start_prompt(PromptKind::IncludeProperty);
+        while !app.prompt().is_empty() {
+            app.pop_prompt_char();
+        }
+        for ch in "tenantId=tenant-1".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        app.push_line("14:06:58.892 INFO request completed".to_string());
+        assert_eq!(app.visible_count(), 0);
+
+        app.push_line("[14:06:58.892] INFO (#1):".to_string());
+        app.push_line("{".to_string());
+        app.push_line("tenantId: \"tenant-1\",".to_string());
+        app.push_line("}".to_string());
+
+        assert_eq!(app.visible_count(), 1);
+        assert_eq!(
+            app.visible_event_at(0).unwrap().message,
+            "request completed"
         );
     }
 
