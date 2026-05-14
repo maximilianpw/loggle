@@ -14,6 +14,8 @@ pub enum CommandAction {
     ExcludeProperty,
     ClearFilters,
     UndoFilterChange,
+    SaveFilterPreset,
+    FilterPresets,
     NextMatch,
     PreviousMatch,
     ToggleFollow,
@@ -114,6 +116,18 @@ pub const COMMANDS: &[Command] = &[
         label: "Undo filter",
         description: "Restore the previous filter state",
         action: CommandAction::UndoFilterChange,
+    },
+    Command {
+        shortcut: "S",
+        label: "Save filter preset",
+        description: "Save the current filters as an in-session preset",
+        action: CommandAction::SaveFilterPreset,
+    },
+    Command {
+        shortcut: "V",
+        label: "Filter presets",
+        description: "Search and restore saved filter presets",
+        action: CommandAction::FilterPresets,
     },
     Command {
         shortcut: "n",

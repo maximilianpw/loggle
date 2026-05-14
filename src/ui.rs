@@ -214,10 +214,12 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
     let title = match kind {
         DialogKind::PropertyFilters => "Property filters",
         DialogKind::MessageFields => "Pinned fields",
+        DialogKind::FilterPresets => "Filter presets",
     };
     let empty_item = empty_dialog_item(kind);
     let property_rows;
     let message_rows;
+    let preset_rows;
     let items;
     let rendered = match kind {
         DialogKind::PropertyFilters => {
@@ -252,6 +254,22 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
                 &items[..]
             }
         }
+        DialogKind::FilterPresets => {
+            preset_rows = app.filter_preset_rows();
+            if preset_rows.is_empty() {
+                std::slice::from_ref(&empty_item)
+            } else {
+                items = preset_rows
+                    .iter()
+                    .map(|row| dialog::SelectableListItem {
+                        shortcut: None,
+                        label: &row.name,
+                        description: &row.summary,
+                    })
+                    .collect::<Vec<_>>();
+                &items[..]
+            }
+        }
     };
 
     dialog::draw_searchable_dialog(
@@ -275,6 +293,11 @@ fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
             shortcut: None,
             label: "No pinned fields",
             description: "Add fields with m from details",
+        },
+        DialogKind::FilterPresets => dialog::SelectableListItem {
+            shortcut: None,
+            label: "No filter presets",
+            description: "Save the current filters with S",
         },
     }
 }

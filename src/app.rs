@@ -21,6 +21,7 @@ pub enum PromptKind {
 pub enum DialogKind {
     PropertyFilters,
     MessageFields,
+    FilterPresets,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,19 @@ pub struct PropertyFilterRow {
     pub id: PropertyFilterId,
     pub kind: &'static str,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterPresetRow {
+    pub index: usize,
+    pub name: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilterPreset {
+    name: String,
+    filters: LogFilter,
 }
 
 #[derive(Debug)]
@@ -56,6 +70,8 @@ pub struct App {
     editing_property_filter: Option<PropertyFilterId>,
     message_field_keys: Vec<String>,
     message_fields: SearchableListState,
+    filter_presets: Vec<FilterPreset>,
+    filter_preset_list: SearchableListState,
 }
 
 impl App {
@@ -82,6 +98,8 @@ impl App {
             editing_property_filter: None,
             message_field_keys: Vec::new(),
             message_fields: SearchableListState::default(),
+            filter_presets: Vec::new(),
+            filter_preset_list: SearchableListState::default(),
         }
     }
 
@@ -164,6 +182,30 @@ impl App {
         self.message_field_rows()
             .get(self.message_fields.selected())
             .copied()
+    }
+
+    pub fn filter_preset_rows(&self) -> Vec<FilterPresetRow> {
+        let query = self.filter_preset_list.query().trim();
+        self.filter_presets
+            .iter()
+            .enumerate()
+            .map(|(index, preset)| FilterPresetRow {
+                index,
+                name: preset.name.clone(),
+                summary: filter_summary(&preset.filters),
+            })
+            .filter(|row| {
+                query.is_empty()
+                    || crate::filter::contains_ignore_ascii_case(&row.name, query)
+                    || crate::filter::contains_ignore_ascii_case(&row.summary, query)
+            })
+            .collect()
+    }
+
+    pub fn selected_filter_preset_row(&self) -> Option<FilterPresetRow> {
+        self.filter_preset_rows()
+            .get(self.filter_preset_list.selected())
+            .cloned()
     }
 
     pub fn filters(&self) -> &LogFilter {
@@ -398,8 +440,10 @@ impl App {
     }
 
     pub fn activate_selected_dialog_row(&mut self, kind: DialogKind) {
-        if kind == DialogKind::PropertyFilters {
-            self.start_property_filter_edit();
+        match kind {
+            DialogKind::PropertyFilters => self.start_property_filter_edit(),
+            DialogKind::MessageFields => {}
+            DialogKind::FilterPresets => self.apply_selected_filter_preset(),
         }
     }
 
@@ -407,6 +451,7 @@ impl App {
         match kind {
             DialogKind::PropertyFilters => self.delete_selected_property_filter(),
             DialogKind::MessageFields => self.delete_selected_message_field(),
+            DialogKind::FilterPresets => self.delete_selected_filter_preset(),
         }
     }
 
@@ -489,6 +534,28 @@ impl App {
         self.sync_visible_cache();
         self.pending_g = false;
         self.sync_selection();
+    }
+
+    pub fn save_filter_preset(&mut self) {
+        self.pending_g = false;
+        if !self.filters.has_active_filters() {
+            return;
+        }
+
+        let preset = FilterPreset {
+            name: format!("Preset {}", self.filter_presets.len() + 1),
+            filters: self.filters.clone(),
+        };
+        if self
+            .filter_presets
+            .iter()
+            .any(|existing| existing.filters == preset.filters)
+        {
+            return;
+        }
+
+        self.filter_presets.push(preset);
+        self.sync_filter_preset_selection();
     }
 
     pub fn undo_filter_change(&mut self) {
@@ -674,6 +741,7 @@ impl App {
         match kind {
             DialogKind::PropertyFilters => &self.property_filters,
             DialogKind::MessageFields => &self.message_fields,
+            DialogKind::FilterPresets => &self.filter_preset_list,
         }
     }
 
@@ -681,6 +749,7 @@ impl App {
         match kind {
             DialogKind::PropertyFilters => &mut self.property_filters,
             DialogKind::MessageFields => &mut self.message_fields,
+            DialogKind::FilterPresets => &mut self.filter_preset_list,
         }
     }
 
@@ -688,6 +757,7 @@ impl App {
         match kind {
             DialogKind::PropertyFilters => self.property_filter_rows().len(),
             DialogKind::MessageFields => self.message_field_rows().len(),
+            DialogKind::FilterPresets => self.filter_preset_rows().len(),
         }
     }
 
@@ -718,6 +788,18 @@ impl App {
                         || crate::filter::contains_ignore_ascii_case(key.as_str(), query)
                 })
                 .count(),
+            DialogKind::FilterPresets => self
+                .filter_presets
+                .iter()
+                .filter(|preset| {
+                    query.is_empty()
+                        || crate::filter::contains_ignore_ascii_case(&preset.name, query)
+                        || crate::filter::contains_ignore_ascii_case(
+                            &filter_summary(&preset.filters),
+                            query,
+                        )
+                })
+                .count(),
         }
     }
 
@@ -736,6 +818,10 @@ impl App {
 
     fn sync_message_field_selection(&mut self) {
         self.sync_dialog_selection(DialogKind::MessageFields);
+    }
+
+    fn sync_filter_preset_selection(&mut self) {
+        self.sync_dialog_selection(DialogKind::FilterPresets);
     }
 
     fn delete_selected_property_filter(&mut self) {
@@ -763,6 +849,33 @@ impl App {
             self.message_field_keys.remove(index);
         }
         self.sync_message_field_selection();
+    }
+
+    fn apply_selected_filter_preset(&mut self) {
+        let Some(row) = self.selected_filter_preset_row() else {
+            return;
+        };
+        let Some(preset) = self.filter_presets.get(row.index) else {
+            self.sync_filter_preset_selection();
+            return;
+        };
+
+        let previous_filters = self.filters.clone();
+        self.filters = preset.filters.clone();
+        self.remember_filter_change(previous_filters);
+        self.sync_visible_cache();
+        self.sync_selection();
+        self.close_dialog();
+    }
+
+    fn delete_selected_filter_preset(&mut self) {
+        let Some(row) = self.selected_filter_preset_row() else {
+            return;
+        };
+        if row.index < self.filter_presets.len() {
+            self.filter_presets.remove(row.index);
+        }
+        self.sync_filter_preset_selection();
     }
 
     fn all_property_filter_rows(&self) -> Vec<PropertyFilterRow> {
@@ -804,6 +917,37 @@ fn property_filter_row_matches(row: &PropertyFilterRow, query: &str) -> bool {
     query.is_empty()
         || crate::filter::contains_ignore_ascii_case(row.kind, query)
         || crate::filter::contains_ignore_ascii_case(&row.summary, query)
+}
+
+fn filter_summary(filters: &LogFilter) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = filters.text.as_ref().filter(|text| !text.is_empty()) {
+        parts.push(format!("search={text}"));
+    }
+    if let Some(source) = filters.source.as_ref().filter(|source| !source.is_empty()) {
+        parts.push(format!("source={source}"));
+    }
+    if let Some(level) = filters.level {
+        parts.push(format!("level={level}"));
+    }
+    parts.extend(
+        filters
+            .property_includes
+            .iter()
+            .map(|predicate| format!("show {}", predicate.summary())),
+    );
+    parts.extend(
+        filters
+            .property_excludes
+            .iter()
+            .map(|predicate| format!("hide {}", predicate.exclude_summary())),
+    );
+
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 #[cfg(test)]
@@ -1035,6 +1179,50 @@ mod tests {
 
         assert_eq!(app.visible_count(), 1);
         assert!(app.filters().property_includes.is_empty());
+    }
+
+    #[test]
+    fn filter_presets_save_search_and_restore_filters() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.start_prompt(PromptKind::Level);
+        for ch in "error".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        app.save_filter_preset();
+        app.clear_filters();
+        assert_eq!(app.visible_count(), 2);
+
+        app.open_dialog(DialogKind::FilterPresets);
+        app.push_dialog_query_char(DialogKind::FilterPresets, 'e');
+        app.push_dialog_query_char(DialogKind::FilterPresets, 'r');
+        let rows = app.filter_preset_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary, "level=error");
+
+        app.activate_selected_dialog_row(DialogKind::FilterPresets);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.filters().level, Some(Level::Error));
+        assert_eq!(app.visible_count(), 1);
+    }
+
+    #[test]
+    fn filter_presets_are_not_duplicated() {
+        let mut app = App::new(10);
+        app.start_prompt(PromptKind::Source);
+        for ch in "api".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        app.save_filter_preset();
+        app.save_filter_preset();
+
+        assert_eq!(app.filter_preset_rows().len(), 1);
     }
 
     #[test]

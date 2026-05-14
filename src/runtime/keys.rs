@@ -57,6 +57,8 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('['), _) => return execute_command(app, CommandAction::PreviousProperty),
         (KeyCode::Char('c'), _) => return execute_command(app, CommandAction::ClearFilters),
         (KeyCode::Char('u'), _) => return execute_command(app, CommandAction::UndoFilterChange),
+        (KeyCode::Char('S'), _) => return execute_command(app, CommandAction::SaveFilterPreset),
+        (KeyCode::Char('V'), _) => return execute_command(app, CommandAction::FilterPresets),
         (KeyCode::Char(' '), _) | (KeyCode::Char('p'), _) => {
             return execute_command(app, CommandAction::ToggleFollow);
         }
@@ -142,6 +144,8 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::ExcludeProperty => app.start_prompt(PromptKind::ExcludeProperty),
         CommandAction::ClearFilters => app.clear_filters(),
         CommandAction::UndoFilterChange => app.undo_filter_change(),
+        CommandAction::SaveFilterPreset => app.save_filter_preset(),
+        CommandAction::FilterPresets => app.open_dialog(DialogKind::FilterPresets),
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
         CommandAction::ToggleFollow => app.toggle_follow(),
@@ -261,6 +265,15 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('M')), 5);
 
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
+    }
+
+    #[test]
+    fn capital_v_opens_filter_presets_dialog() {
+        let mut app = App::new(10);
+
+        handle_key(&mut app, key(KeyCode::Char('V')), 5);
+
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::FilterPresets));
     }
 
     #[test]
