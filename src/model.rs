@@ -376,6 +376,10 @@ pub fn parse_property_object(input: &str) -> Option<Vec<LogProperty>> {
 }
 
 pub fn parse_inline_properties(message: &str) -> Vec<LogProperty> {
+    if let Some(properties) = parse_inline_json_properties(message) {
+        return properties;
+    }
+
     let mut properties = Vec::new();
     let mut index = 0;
 
@@ -418,6 +422,62 @@ pub fn parse_inline_properties(message: &str) -> Vec<LogProperty> {
     }
 
     properties
+}
+
+fn parse_inline_json_properties(message: &str) -> Option<Vec<LogProperty>> {
+    let trimmed = message.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut properties = Vec::new();
+    for entry in split_top_level_commas(inner) {
+        if let Some(property) = parse_property_entry(entry.trim()) {
+            properties.push(property);
+        }
+    }
+
+    Some(properties)
+}
+
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            continue;
+        }
+
+        if ch == ',' {
+            entries.push(&input[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+
+    entries.push(&input[start..]);
+    entries
 }
 
 fn skip_inline_separators(message: &str, mut index: usize) -> usize {
@@ -765,6 +825,48 @@ mod tests {
         assert_eq!(
             event.property("service").map(|property| &property.value),
             Some(&PropertyValue::String("api server".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_single_line_json_properties() {
+        let event = LogEvent::from_line(
+            0,
+            r#"api | {"requestId":"abc-123","statusCode":200,"ok":true}"#.to_string(),
+        );
+
+        assert_eq!(
+            event.property("requestId").map(|property| &property.value),
+            Some(&PropertyValue::String("abc-123".to_string()))
+        );
+        assert_eq!(
+            event.property("statusCode").map(|property| &property.value),
+            Some(&PropertyValue::Number("200".to_string()))
+        );
+        assert_eq!(
+            event.property("ok").map(|property| &property.value),
+            Some(&PropertyValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn parses_logfmt_style_inline_properties() {
+        let event = LogEvent::from_line(
+            0,
+            r#"api | INFO request method=GET path="/api/items" duration_ms=42"#.to_string(),
+        );
+
+        assert_eq!(
+            event.property("method").map(|property| &property.value),
+            Some(&PropertyValue::Text("GET".to_string()))
+        );
+        assert_eq!(
+            event.property("path").map(|property| &property.value),
+            Some(&PropertyValue::String("/api/items".to_string()))
+        );
+        assert_eq!(
+            event.property("duration_ms").map(|property| &property.value),
+            Some(&PropertyValue::Number("42".to_string()))
         );
     }
 

@@ -339,9 +339,10 @@ previous event instead of shown as separate rows:
   }
 ```
 
-Inline `key=value` tokens in the displayed message are also parsed as
-properties. Quoted values such as `service="api server"` are supported for
-filtering and source promotion.
+Inline `key=value` and logfmt-style tokens in the displayed message are also
+parsed as properties. Quoted values such as `service="api server"` are supported
+for filtering and source promotion. Flat single-line JSON objects are parsed as
+properties too.
 
 Property filters support exact values and key existence. Use `key=value` or
 `key` to show matching rows, and `key!=value` or `!key` to hide matching rows.
