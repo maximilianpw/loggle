@@ -242,11 +242,14 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
         DialogKind::PropertyFilters => "Property filters",
         DialogKind::MessageFields => "Pinned fields",
         DialogKind::FilterPresets => "Filter presets",
+        DialogKind::Sources => "Sources",
     };
     let empty_item = empty_dialog_item(kind);
     let property_rows;
     let message_rows;
     let preset_rows;
+    let source_rows;
+    let source_summaries;
     let items;
     let rendered = match kind {
         DialogKind::PropertyFilters => {
@@ -297,6 +300,34 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
                 &items[..]
             }
         }
+        DialogKind::Sources => {
+            source_rows = app.source_status_rows();
+            if source_rows.is_empty() {
+                std::slice::from_ref(&empty_item)
+            } else {
+                source_summaries = source_rows
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{} rows  {} errors  {} warnings  last {} #{}",
+                            row.count, row.errors, row.warnings, row.last_level, row.last_sequence
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                items = source_rows
+                    .iter()
+                    .zip(source_summaries.iter())
+                    .map(|(row, summary)| {
+                        dialog::SelectableListItem {
+                            shortcut: None,
+                            label: &row.source,
+                            description: summary,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                &items[..]
+            }
+        }
     };
 
     dialog::draw_searchable_dialog(
@@ -325,6 +356,11 @@ fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
             shortcut: None,
             label: "No filter presets",
             description: "Save the current filters with S",
+        },
+        DialogKind::Sources => dialog::SelectableListItem {
+            shortcut: None,
+            label: "No sources",
+            description: "Observed sources appear after logs arrive",
         },
     }
 }

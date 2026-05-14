@@ -28,6 +28,7 @@ pub enum DialogKind {
     PropertyFilters,
     MessageFields,
     FilterPresets,
+    Sources,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,16 @@ struct FilterPreset {
     filters: LogFilter,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStatusRow {
+    pub source: String,
+    pub count: usize,
+    pub warnings: usize,
+    pub errors: usize,
+    pub last_level: Level,
+    pub last_sequence: u64,
+}
+
 #[derive(Debug)]
 pub struct App {
     buffer: LogBuffer,
@@ -80,6 +91,7 @@ pub struct App {
     message_fields: SearchableListState,
     filter_presets: Vec<FilterPreset>,
     filter_preset_list: SearchableListState,
+    sources: SearchableListState,
 }
 
 impl App {
@@ -110,6 +122,7 @@ impl App {
             message_fields: SearchableListState::default(),
             filter_presets: Vec::new(),
             filter_preset_list: SearchableListState::default(),
+            sources: SearchableListState::default(),
         }
     }
 
@@ -231,6 +244,50 @@ impl App {
         self.filter_preset_rows()
             .get(self.filter_preset_list.selected())
             .cloned()
+    }
+
+    pub fn source_status_rows(&self) -> Vec<SourceStatusRow> {
+        let query = self.sources.query().trim();
+        self.source_status_rows_for_query(query)
+    }
+
+    fn source_status_rows_for_query(&self, query: &str) -> Vec<SourceStatusRow> {
+        self.all_source_status_rows()
+            .into_iter()
+            .filter(|row| {
+                query.is_empty()
+                    || crate::filter::contains_ignore_ascii_case(&row.source, query)
+                    || crate::filter::contains_ignore_ascii_case(row.last_level.as_str(), query)
+            })
+            .collect()
+    }
+
+    fn all_source_status_rows(&self) -> Vec<SourceStatusRow> {
+        let mut rows = Vec::<SourceStatusRow>::new();
+        for event in self.buffer.events() {
+            if let Some(row) = rows.iter_mut().find(|row| row.source == event.source) {
+                row.count += 1;
+                if event.level == Level::Warn {
+                    row.warnings += 1;
+                }
+                if matches!(event.level, Level::Fatal | Level::Error) {
+                    row.errors += 1;
+                }
+                row.last_level = event.level;
+                row.last_sequence = event.sequence;
+            } else {
+                rows.push(SourceStatusRow {
+                    source: event.source.clone(),
+                    count: 1,
+                    warnings: usize::from(event.level == Level::Warn),
+                    errors: usize::from(matches!(event.level, Level::Fatal | Level::Error)),
+                    last_level: event.level,
+                    last_sequence: event.sequence,
+                });
+            }
+        }
+        rows.sort_by(|left, right| left.source.cmp(&right.source));
+        rows
     }
 
     pub fn filters(&self) -> &LogFilter {
@@ -470,6 +527,7 @@ impl App {
             DialogKind::PropertyFilters => self.start_property_filter_edit(),
             DialogKind::MessageFields => {}
             DialogKind::FilterPresets => self.apply_selected_filter_preset(),
+            DialogKind::Sources => {}
         }
     }
 
@@ -478,6 +536,7 @@ impl App {
             DialogKind::PropertyFilters => self.delete_selected_property_filter(),
             DialogKind::MessageFields => self.delete_selected_message_field(),
             DialogKind::FilterPresets => self.delete_selected_filter_preset(),
+            DialogKind::Sources => {}
         }
     }
 
@@ -824,6 +883,7 @@ impl App {
             DialogKind::PropertyFilters => &self.property_filters,
             DialogKind::MessageFields => &self.message_fields,
             DialogKind::FilterPresets => &self.filter_preset_list,
+            DialogKind::Sources => &self.sources,
         }
     }
 
@@ -832,6 +892,7 @@ impl App {
             DialogKind::PropertyFilters => &mut self.property_filters,
             DialogKind::MessageFields => &mut self.message_fields,
             DialogKind::FilterPresets => &mut self.filter_preset_list,
+            DialogKind::Sources => &mut self.sources,
         }
     }
 
@@ -840,6 +901,7 @@ impl App {
             DialogKind::PropertyFilters => self.property_filter_rows().len(),
             DialogKind::MessageFields => self.message_field_rows().len(),
             DialogKind::FilterPresets => self.filter_preset_rows().len(),
+            DialogKind::Sources => self.source_status_rows().len(),
         }
     }
 
@@ -882,6 +944,7 @@ impl App {
                         )
                 })
                 .count(),
+            DialogKind::Sources => self.source_status_rows_for_query(query).len(),
         }
     }
 
@@ -1366,6 +1429,25 @@ mod tests {
 
         assert_eq!(app.marker_count(), 0);
         assert!(!app.is_marked(sequence));
+    }
+
+    #[test]
+    fn source_status_rows_summarize_observed_sources() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("api | WARN two".to_string());
+        app.push_line("web | INFO three".to_string());
+
+        let rows = app.source_status_rows();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].source, "api");
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].errors, 1);
+        assert_eq!(rows[0].warnings, 1);
+        assert_eq!(rows[0].last_level, Level::Warn);
+        assert_eq!(rows[1].source, "web");
+        assert_eq!(rows[1].count, 1);
     }
 
     #[test]

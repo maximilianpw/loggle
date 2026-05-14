@@ -18,6 +18,7 @@ pub enum CommandAction {
     FilterPresets,
     ExportVisibleLogs,
     ToggleMarker,
+    Sources,
     NextMatch,
     PreviousMatch,
     ToggleFollow,
@@ -142,6 +143,12 @@ pub const COMMANDS: &[Command] = &[
         label: "Toggle marker",
         description: "Mark or unmark the selected log row",
         action: CommandAction::ToggleMarker,
+    },
+    Command {
+        shortcut: "O",
+        label: "Sources",
+        description: "Show observed source counts and recent status",
+        action: CommandAction::Sources,
     },
     Command {
         shortcut: "n",

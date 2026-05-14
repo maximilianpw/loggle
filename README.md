@@ -249,6 +249,7 @@ Press `?` to open the in-app command palette:
 - `V`: open searchable saved filter presets
 - `e`: export the current visible rows to `loggle-export.log`
 - `T`: mark or unmark the selected row
+- `O`: open observed source status counts
 
 ### Details and Properties
 

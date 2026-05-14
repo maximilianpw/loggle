@@ -61,6 +61,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('V'), _) => return execute_command(app, CommandAction::FilterPresets),
         (KeyCode::Char('e'), _) => return execute_command(app, CommandAction::ExportVisibleLogs),
         (KeyCode::Char('T'), _) => return execute_command(app, CommandAction::ToggleMarker),
+        (KeyCode::Char('O'), _) => return execute_command(app, CommandAction::Sources),
         (KeyCode::Char(' '), _) | (KeyCode::Char('p'), _) => {
             return execute_command(app, CommandAction::ToggleFollow);
         }
@@ -152,6 +153,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
             let _ = app.export_visible_logs_default();
         }
         CommandAction::ToggleMarker => app.toggle_selected_marker(),
+        CommandAction::Sources => app.open_dialog(DialogKind::Sources),
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
         CommandAction::ToggleFollow => app.toggle_follow(),
@@ -290,6 +292,15 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('T')), 5);
 
         assert_eq!(app.marker_count(), 1);
+    }
+
+    #[test]
+    fn capital_o_opens_sources_dialog() {
+        let mut app = App::new(10);
+
+        handle_key(&mut app, key(KeyCode::Char('O')), 5);
+
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Sources));
     }
 
     #[test]
