@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::PathBuf,
     process::Child,
     time::{Duration, Instant},
@@ -99,6 +99,7 @@ fn run_app(
             }
 
             if all_exited {
+                flush_recorder(&mut recorder)?;
                 children.clear();
                 return Ok(());
             }
@@ -128,7 +129,10 @@ fn run_app(
 
                     if requested_quit {
                         match shutdown.as_mut() {
-                            _ if children.is_empty() => return Ok(()),
+                            _ if children.is_empty() => {
+                                flush_recorder(&mut recorder)?;
+                                return Ok(());
+                            }
                             None => {
                                 let now = Instant::now();
                                 shutdown = Some(
@@ -159,20 +163,30 @@ fn run_app(
 }
 
 struct SessionRecorder {
-    file: File,
+    writer: BufWriter<File>,
 }
 
 impl SessionRecorder {
     fn create(path: PathBuf) -> io::Result<Self> {
         Ok(Self {
-            file: File::create(path)?,
+            writer: BufWriter::new(File::create(path)?),
         })
     }
 
     fn record_line(&mut self, line: &str) -> io::Result<()> {
-        writeln!(self.file, "{line}")?;
-        self.file.flush()
+        writeln!(self.writer, "{line}")
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+fn flush_recorder(recorder: &mut Option<SessionRecorder>) -> io::Result<()> {
+    if let Some(recorder) = recorder.as_mut() {
+        recorder.flush()?;
+    }
+    Ok(())
 }
 
 fn closing_message(shutdowns: &[ChildShutdown]) -> &'static str {
@@ -204,6 +218,7 @@ mod tests {
             let mut recorder = SessionRecorder::create(path.clone()).unwrap();
             recorder.record_line("api | one").unwrap();
             recorder.record_line("web | two").unwrap();
+            recorder.flush().unwrap();
         }
 
         let output = std::fs::read_to_string(&path).unwrap();

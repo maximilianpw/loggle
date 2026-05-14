@@ -1,6 +1,7 @@
 mod list_state;
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Write},
     path::Path,
@@ -263,31 +264,30 @@ impl App {
     }
 
     fn all_source_status_rows(&self) -> Vec<SourceStatusRow> {
-        let mut rows = Vec::<SourceStatusRow>::new();
+        let mut rows = BTreeMap::<String, SourceStatusRow>::new();
         for event in self.buffer.events() {
-            if let Some(row) = rows.iter_mut().find(|row| row.source == event.source) {
-                row.count += 1;
-                if event.level == Level::Warn {
-                    row.warnings += 1;
-                }
-                if matches!(event.level, Level::Fatal | Level::Error) {
-                    row.errors += 1;
-                }
-                row.last_level = event.level;
-                row.last_sequence = event.sequence;
-            } else {
-                rows.push(SourceStatusRow {
+            let row = rows
+                .entry(event.source.clone())
+                .or_insert_with(|| SourceStatusRow {
                     source: event.source.clone(),
-                    count: 1,
-                    warnings: usize::from(event.level == Level::Warn),
-                    errors: usize::from(matches!(event.level, Level::Fatal | Level::Error)),
+                    count: 0,
+                    warnings: 0,
+                    errors: 0,
                     last_level: event.level,
                     last_sequence: event.sequence,
                 });
+
+            row.count += 1;
+            if event.level == Level::Warn {
+                row.warnings += 1;
             }
+            if matches!(event.level, Level::Fatal | Level::Error) {
+                row.errors += 1;
+            }
+            row.last_level = event.level;
+            row.last_sequence = event.sequence;
         }
-        rows.sort_by(|left, right| left.source.cmp(&right.source));
-        rows
+        rows.into_values().collect()
     }
 
     pub fn filters(&self) -> &LogFilter {
