@@ -60,6 +60,7 @@ pub struct App {
     visible_cache: Vec<u64>,
     selected: usize,
     follow: bool,
+    paused_backlog: usize,
     mode: Mode,
     prompt: String,
     palette: SearchableListState,
@@ -88,6 +89,7 @@ impl App {
             visible_cache: Vec::new(),
             selected: 0,
             follow: true,
+            paused_backlog: 0,
             mode: Mode::Normal,
             prompt: String::new(),
             palette: SearchableListState::default(),
@@ -106,6 +108,9 @@ impl App {
     pub fn push_line(&mut self, line: String) {
         let change = self.buffer.push_line(line);
         self.apply_buffer_change(change);
+        if !self.follow {
+            self.paused_backlog = self.paused_backlog.saturating_add(1);
+        }
         self.sync_selection();
     }
 
@@ -115,6 +120,10 @@ impl App {
 
     pub fn is_following(&self) -> bool {
         self.follow
+    }
+
+    pub fn paused_backlog(&self) -> usize {
+        self.paused_backlog
     }
 
     pub fn selected(&self) -> usize {
@@ -317,6 +326,7 @@ impl App {
 
     pub fn jump_bottom(&mut self) {
         self.follow = true;
+        self.paused_backlog = 0;
         self.pending_g = false;
         self.sync_selection();
     }
@@ -976,6 +986,25 @@ mod tests {
 
         assert!(!app.is_following());
         assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn paused_backlog_counts_lines_until_follow_resumes() {
+        let mut app = App::new(10);
+        app.push_line("api | one".to_string());
+        app.push_line("api | two".to_string());
+
+        app.move_up(1);
+        app.push_line("api | three".to_string());
+        app.push_line("api | four".to_string());
+
+        assert!(!app.is_following());
+        assert_eq!(app.paused_backlog(), 2);
+
+        app.jump_bottom();
+
+        assert!(app.is_following());
+        assert_eq!(app.paused_backlog(), 0);
     }
 
     #[test]

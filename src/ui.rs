@@ -84,6 +84,19 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, visible_count: usiz
             Style::default().fg(THEME.text).bg(THEME.panel_alt),
         ),
     ]);
+    let header = if app.paused_backlog() == 0 {
+        header
+    } else {
+        let mut spans = header.spans;
+        spans.extend([
+            Span::styled("  new ", style),
+            Span::styled(
+                app.paused_backlog().to_string(),
+                Style::default().fg(THEME.text).bg(THEME.panel_alt),
+            ),
+        ]);
+        Line::from(spans)
+    };
 
     frame.render_widget(Paragraph::new(header).style(style), area);
 }
