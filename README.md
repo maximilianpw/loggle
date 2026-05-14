@@ -42,8 +42,8 @@ Loggle turns noisy multi-process output into a scannable live log view:
 - Live tail with pause/resume, scrollback, search, and jump-to-match navigation
 - Source, level, text, and structured property filters for narrowing dense logs
 - Details pane for inspecting parsed timestamps, levels, messages, and properties
-- Inline message fields for adding selected properties such as `requestId` or
-  `durationMs` to every matching row
+- Pinned field columns for keeping selected properties such as `requestId` or
+  `durationMs` aligned across every matching row
 - Command palette and searchable managers for discovering and pruning active
   filters/fields
 - Graceful shutdown for launched commands: quit behaves like interrupting the
@@ -250,11 +250,11 @@ Press `?` to open the in-app command palette:
 - `Enter`: toggle selected log details
 - `[` / `]`: move through properties in the details pane
 - `f`: show only rows with the selected property value
-- `m`: append the selected property key to displayed log-row messages
+- `m`: pin the selected property key as a displayed log-row column
 
 ### Dialogs
 
-- `M`: open searchable message field manager
+- `M`: open searchable pinned field manager
 - `P`: open searchable property filter manager
 - `?`: open/close the command palette
 - Message field manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Backspace` or `Delete` removes when search is empty; `Esc` closes
@@ -341,9 +341,9 @@ Property filters support exact values and key existence. Use `key=value` or
 `key` to show matching rows, and `key!=value` or `!key` to hide matching rows.
 The details pane can prefill these filters from the selected event property.
 
-Message fields are session-local property keys appended to log rows after the
-parsed message as `key=value`. Rows that do not have a selected property omit
-that field.
+Pinned fields are session-local property keys rendered as stable columns before
+the parsed message. Rows that do not have a selected property show `-` in that
+column.
 
 ## Development
 

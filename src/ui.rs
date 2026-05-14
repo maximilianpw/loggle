@@ -213,7 +213,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
     let title = match kind {
         DialogKind::PropertyFilters => "Property filters",
-        DialogKind::MessageFields => "Message fields",
+        DialogKind::MessageFields => "Pinned fields",
     };
     let empty_item = empty_dialog_item(kind);
     let property_rows;
@@ -273,7 +273,7 @@ fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
         },
         DialogKind::MessageFields => dialog::SelectableListItem {
             shortcut: None,
-            label: "No message fields",
+            label: "No pinned fields",
             description: "Add fields with m from details",
         },
     }

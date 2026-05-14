@@ -74,14 +74,14 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         shortcut: "m",
-        label: "Add message field",
-        description: "Append selected property values to log-row messages",
+        label: "Pin field column",
+        description: "Pin the selected property as a stable log-row column",
         action: CommandAction::AddMessageField,
     },
     Command {
         shortcut: "M",
-        label: "Message fields",
-        description: "View, search, and remove displayed message fields",
+        label: "Pinned fields",
+        description: "View, search, and remove pinned field columns",
         action: CommandAction::MessageFields,
     },
     Command {

@@ -54,23 +54,33 @@ pub(super) fn render_event<'a>(
         Span::styled(format!("{:<7}", event.level.as_str()), level_style),
         Span::styled(" ", row_style),
     ];
+
+    for key in message_field_keys {
+        spans.push(Span::styled(
+            format!("{:<20} ", pinned_field_text(event, key)),
+            row_style,
+        ));
+    }
+
     spans.extend(message_spans(
         compact_whitespace(&event.message),
         row_style,
         highlight_values,
     ));
 
-    for key in message_field_keys {
-        if let Some(property) = event.property(key) {
-            spans.push(Span::styled(" ", row_style));
-            spans.push(Span::styled(
-                format!("{}={}", property.key, property.value),
-                row_style,
-            ));
-        }
-    }
-
     Line::from(spans)
+}
+
+fn pinned_field_text(event: &LogEvent, key: &str) -> String {
+    let Some(property) = event.property(key) else {
+        return "-".to_string();
+    };
+
+    truncate_tail(
+        &format!("{}={}", property.key, property.value.as_display_str()),
+        20,
+    )
+    .into_owned()
 }
 
 fn message_spans<'a>(
@@ -207,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_message_fields_append_key_value_segments() {
+    fn selected_message_fields_render_stable_columns_before_message() {
         let mut event = LogEvent::from_line(1, "api | INFO request completed".to_string());
         event.set_properties(vec![
             LogProperty {
@@ -224,7 +234,8 @@ mod tests {
         let row = render_event(&event, false, false, &message_fields, &[]);
         let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
 
-        assert!(text.ends_with("request completed tenantId=tenant-1"));
+        assert!(text.contains("tenantId=tenant-1"));
+        assert!(text.contains("-                    request completed"));
         assert!(!text.contains("missing="));
     }
 
