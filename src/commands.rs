@@ -16,6 +16,7 @@ pub enum CommandAction {
     UndoFilterChange,
     SaveFilterPreset,
     FilterPresets,
+    ExportVisibleLogs,
     NextMatch,
     PreviousMatch,
     ToggleFollow,
@@ -128,6 +129,12 @@ pub const COMMANDS: &[Command] = &[
         label: "Filter presets",
         description: "Search and restore saved filter presets",
         action: CommandAction::FilterPresets,
+    },
+    Command {
+        shortcut: "e",
+        label: "Export visible logs",
+        description: "Write the current visible log rows to loggle-export.log",
+        action: CommandAction::ExportVisibleLogs,
     },
     Command {
         shortcut: "n",

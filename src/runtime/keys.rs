@@ -59,6 +59,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('u'), _) => return execute_command(app, CommandAction::UndoFilterChange),
         (KeyCode::Char('S'), _) => return execute_command(app, CommandAction::SaveFilterPreset),
         (KeyCode::Char('V'), _) => return execute_command(app, CommandAction::FilterPresets),
+        (KeyCode::Char('e'), _) => return execute_command(app, CommandAction::ExportVisibleLogs),
         (KeyCode::Char(' '), _) | (KeyCode::Char('p'), _) => {
             return execute_command(app, CommandAction::ToggleFollow);
         }
@@ -146,6 +147,9 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::UndoFilterChange => app.undo_filter_change(),
         CommandAction::SaveFilterPreset => app.save_filter_preset(),
         CommandAction::FilterPresets => app.open_dialog(DialogKind::FilterPresets),
+        CommandAction::ExportVisibleLogs => {
+            let _ = app.export_visible_logs_default();
+        }
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
         CommandAction::ToggleFollow => app.toggle_follow(),

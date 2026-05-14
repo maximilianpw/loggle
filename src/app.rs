@@ -1,5 +1,11 @@
 mod list_state;
 
+use std::{
+    fs::File,
+    io::{self, Write},
+    path::Path,
+};
+
 use crate::buffer::{BufferChange, LogBuffer};
 use crate::commands::{Command, COMMANDS};
 use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate};
@@ -566,6 +572,31 @@ impl App {
 
         self.filter_presets.push(preset);
         self.sync_filter_preset_selection();
+    }
+
+    pub fn export_visible_logs(&self, path: &Path) -> io::Result<usize> {
+        let mut file = File::create(path)?;
+        let mut count = 0;
+        let mut write_error = None;
+        self.for_each_visible_event(0, self.visible_count(), |_, event| {
+            if write_error.is_some() {
+                return;
+            }
+            if let Err(error) = writeln!(file, "{}", event.raw) {
+                write_error = Some(error);
+            } else {
+                count += 1;
+            }
+        });
+        if let Some(error) = write_error {
+            return Err(error);
+        }
+        file.flush()?;
+        Ok(count)
+    }
+
+    pub fn export_visible_logs_default(&self) -> io::Result<usize> {
+        self.export_visible_logs(Path::new("loggle-export.log"))
     }
 
     pub fn undo_filter_change(&mut self) {
@@ -1252,6 +1283,30 @@ mod tests {
         app.save_filter_preset();
 
         assert_eq!(app.filter_preset_rows().len(), 1);
+    }
+
+    #[test]
+    fn export_visible_logs_writes_filtered_rows() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("api | ERROR three".to_string());
+        app.start_prompt(PromptKind::Level);
+        for ch in "error".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        let path = std::env::temp_dir().join(format!(
+            "loggle-export-test-{}.log",
+            std::process::id()
+        ));
+        let count = app.export_visible_logs(&path).unwrap();
+        let output = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(count, 2);
+        assert_eq!(output, "api | ERROR one\napi | ERROR three\n");
     }
 
     #[test]
