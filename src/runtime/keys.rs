@@ -60,6 +60,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('S'), _) => return execute_command(app, CommandAction::SaveFilterPreset),
         (KeyCode::Char('V'), _) => return execute_command(app, CommandAction::FilterPresets),
         (KeyCode::Char('e'), _) => return execute_command(app, CommandAction::ExportVisibleLogs),
+        (KeyCode::Char('T'), _) => return execute_command(app, CommandAction::ToggleMarker),
         (KeyCode::Char(' '), _) | (KeyCode::Char('p'), _) => {
             return execute_command(app, CommandAction::ToggleFollow);
         }
@@ -150,6 +151,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::ExportVisibleLogs => {
             let _ = app.export_visible_logs_default();
         }
+        CommandAction::ToggleMarker => app.toggle_selected_marker(),
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
         CommandAction::ToggleFollow => app.toggle_follow(),
@@ -278,6 +280,16 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('V')), 5);
 
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::FilterPresets));
+    }
+
+    #[test]
+    fn capital_t_toggles_selected_marker() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+
+        handle_key(&mut app, key(KeyCode::Char('T')), 5);
+
+        assert_eq!(app.marker_count(), 1);
     }
 
     #[test]

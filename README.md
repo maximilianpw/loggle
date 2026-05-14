@@ -248,6 +248,7 @@ Press `?` to open the in-app command palette:
 - `S`: save the current filters as an in-session preset
 - `V`: open searchable saved filter presets
 - `e`: export the current visible rows to `loggle-export.log`
+- `T`: mark or unmark the selected row
 
 ### Details and Properties
 

@@ -67,6 +67,7 @@ pub struct App {
     selected: usize,
     follow: bool,
     paused_backlog: usize,
+    marked_sequences: Vec<u64>,
     mode: Mode,
     prompt: String,
     palette: SearchableListState,
@@ -96,6 +97,7 @@ impl App {
             selected: 0,
             follow: true,
             paused_backlog: 0,
+            marked_sequences: Vec::new(),
             mode: Mode::Normal,
             prompt: String::new(),
             palette: SearchableListState::default(),
@@ -130,6 +132,14 @@ impl App {
 
     pub fn paused_backlog(&self) -> usize {
         self.paused_backlog
+    }
+
+    pub fn marker_count(&self) -> usize {
+        self.marked_sequences.len()
+    }
+
+    pub fn is_marked(&self, sequence: u64) -> bool {
+        self.marked_sequences.contains(&sequence)
     }
 
     pub fn selected(&self) -> usize {
@@ -574,6 +584,23 @@ impl App {
         self.sync_filter_preset_selection();
     }
 
+    pub fn toggle_selected_marker(&mut self) {
+        self.pending_g = false;
+        let Some(sequence) = self.selected_event().map(|event| event.sequence) else {
+            return;
+        };
+        if let Some(index) = self
+            .marked_sequences
+            .iter()
+            .position(|marked| *marked == sequence)
+        {
+            self.marked_sequences.remove(index);
+        } else {
+            self.marked_sequences.push(sequence);
+            self.marked_sequences.sort_unstable();
+        }
+    }
+
     pub fn export_visible_logs(&self, path: &Path) -> io::Result<usize> {
         let mut file = File::create(path)?;
         let mut count = 0;
@@ -701,13 +728,17 @@ impl App {
     }
 
     fn apply_buffer_change(&mut self, change: BufferChange) {
+        for sequence in change.removed {
+            self.remove_marker(sequence);
+            if !self.filters.has_active_filters() {
+                continue;
+            }
+            self.remove_visible_sequence(sequence);
+        }
+
         if !self.filters.has_active_filters() {
             self.visible_cache.clear();
             return;
-        }
-
-        for sequence in change.removed {
-            self.remove_visible_sequence(sequence);
         }
 
         if let Some(sequence) = change.appended {
@@ -756,6 +787,16 @@ impl App {
             .position(|cached_sequence| *cached_sequence == sequence)
         {
             self.visible_cache.remove(index);
+        }
+    }
+
+    fn remove_marker(&mut self, sequence: u64) {
+        if let Some(index) = self
+            .marked_sequences
+            .iter()
+            .position(|marked| *marked == sequence)
+        {
+            self.marked_sequences.remove(index);
         }
     }
 
@@ -1307,6 +1348,36 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(output, "api | ERROR one\napi | ERROR three\n");
+    }
+
+    #[test]
+    fn toggling_selected_marker_tracks_selected_event() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("api | INFO two".to_string());
+
+        let sequence = app.selected_event().unwrap().sequence;
+        app.toggle_selected_marker();
+
+        assert_eq!(app.marker_count(), 1);
+        assert!(app.is_marked(sequence));
+
+        app.toggle_selected_marker();
+
+        assert_eq!(app.marker_count(), 0);
+        assert!(!app.is_marked(sequence));
+    }
+
+    #[test]
+    fn markers_are_removed_when_events_are_evicted() {
+        let mut app = App::new(1);
+        app.push_line("api | INFO one".to_string());
+        app.toggle_selected_marker();
+        assert_eq!(app.marker_count(), 1);
+
+        app.push_line("api | INFO two".to_string());
+
+        assert_eq!(app.marker_count(), 0);
     }
 
     #[test]

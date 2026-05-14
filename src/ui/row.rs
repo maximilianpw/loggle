@@ -16,6 +16,7 @@ pub(super) fn render_event<'a>(
     event: &'a LogEvent,
     color_enabled: bool,
     selected: bool,
+    marked: bool,
     message_field_keys: &'a [String],
     highlight_values: &[&str],
 ) -> Line<'a> {
@@ -47,7 +48,7 @@ pub(super) fn render_event<'a>(
     };
 
     let mut spans = vec![
-        Span::styled(" ", rail_style),
+        Span::styled(if marked { "*" } else { " " }, rail_style),
         sequence,
         Span::styled(format!("{:<14}", truncate_tail(&event.source, 14)), source_style),
         Span::styled(" ", row_style),
@@ -209,7 +210,7 @@ mod tests {
             value: PropertyValue::String("tenant-1".to_string()),
         }]);
 
-        let row = render_event(&event, false, false, &[], &[]);
+        let row = render_event(&event, false, false, false, &[], &[]);
         let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
 
         assert!(text.ends_with("request completed"));
@@ -231,7 +232,7 @@ mod tests {
         ]);
 
         let message_fields = ["tenantId".to_string(), "missing".to_string()];
-        let row = render_event(&event, false, false, &message_fields, &[]);
+        let row = render_event(&event, false, false, false, &message_fields, &[]);
         let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
 
         assert!(text.contains("tenantId=tenant-1"));
@@ -246,7 +247,7 @@ mod tests {
             "api | INFO request tenant-1 completed for abc".to_string(),
         );
 
-        let row = render_event(&event, false, false, &[], &["tenant-1"]);
+        let row = render_event(&event, false, false, false, &[], &["tenant-1"]);
         let highlighted = row
             .spans
             .into_iter()
@@ -264,7 +265,7 @@ mod tests {
             "api | INFO request tenant-1 completed for abc".to_string(),
         );
 
-        let row = render_event(&event, false, false, &[], &["tenant-1", "abc"]);
+        let row = render_event(&event, false, false, false, &[], &["tenant-1", "abc"]);
         let highlighted = row
             .spans
             .into_iter()
@@ -279,7 +280,7 @@ mod tests {
     fn punctuation_highlight_values_do_not_match_inside_alphanumeric_tokens() {
         let event = LogEvent::from_line(1, "api | INFO range 0-0 done".to_string());
 
-        let row = render_event(&event, false, false, &[], &["-"]);
+        let row = render_event(&event, false, false, false, &[], &["-"]);
 
         assert!(row
             .spans
@@ -291,7 +292,7 @@ mod tests {
     fn punctuation_highlight_values_still_match_standalone_tokens() {
         let event = LogEvent::from_line(1, "api | INFO empty - done".to_string());
 
-        let row = render_event(&event, false, false, &[], &["-"]);
+        let row = render_event(&event, false, false, false, &[], &["-"]);
         let highlighted = row
             .spans
             .into_iter()
@@ -306,11 +307,20 @@ mod tests {
     fn empty_highlight_values_do_not_change_message_styling() {
         let event = LogEvent::from_line(1, "api | INFO request completed".to_string());
 
-        let row = render_event(&event, false, false, &[], &[]);
+        let row = render_event(&event, false, false, false, &[], &[]);
 
         assert!(row
             .spans
             .into_iter()
             .all(|span| span.style.bg != Some(THEME.highlight)));
+    }
+
+    #[test]
+    fn marked_rows_render_marker_in_rail() {
+        let event = LogEvent::from_line(1, "api | INFO request completed".to_string());
+
+        let row = render_event(&event, false, false, true, &[], &[]);
+
+        assert_eq!(row.spans[0].content, "*");
     }
 }

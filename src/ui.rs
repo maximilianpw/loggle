@@ -83,6 +83,11 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, visible_count: usiz
             visible_count.to_string(),
             Style::default().fg(THEME.text).bg(THEME.panel_alt),
         ),
+        Span::styled("  markers ", style),
+        Span::styled(
+            app.marker_count().to_string(),
+            Style::default().fg(THEME.text).bg(THEME.panel_alt),
+        ),
     ]);
     let header = if app.paused_backlog() == 0 {
         header
@@ -146,6 +151,7 @@ fn draw_logs(
             event,
             color_enabled,
             visible_index == selected,
+            app.is_marked(event.sequence),
             app.message_field_keys(),
             &highlight_values,
         )));

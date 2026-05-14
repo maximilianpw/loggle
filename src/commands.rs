@@ -17,6 +17,7 @@ pub enum CommandAction {
     SaveFilterPreset,
     FilterPresets,
     ExportVisibleLogs,
+    ToggleMarker,
     NextMatch,
     PreviousMatch,
     ToggleFollow,
@@ -135,6 +136,12 @@ pub const COMMANDS: &[Command] = &[
         label: "Export visible logs",
         description: "Write the current visible log rows to loggle-export.log",
         action: CommandAction::ExportVisibleLogs,
+    },
+    Command {
+        shortcut: "T",
+        label: "Toggle marker",
+        description: "Mark or unmark the selected log row",
+        action: CommandAction::ToggleMarker,
     },
     Command {
         shortcut: "n",
