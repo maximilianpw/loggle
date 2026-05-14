@@ -3,6 +3,14 @@ name = "loggle"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+perf-harness = []
+
+[[bin]]
+name = "loggle-bench"
+path = "src/bin/loggle-bench.rs"
+required-features = ["perf-harness"]
+
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
 crossterm = { version = "0.28.1", features = ["use-dev-tty"] }

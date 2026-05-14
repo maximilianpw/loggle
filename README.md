@@ -211,6 +211,16 @@ loggle start libre
 - `start [NAME]`: launches commands from `.loggle.toml` in the current
   directory, or from a named config in the Loggle user config directory
 
+## Performance Harness
+
+Run synthetic ingestion, filtering, viewport iteration, and draw timings with:
+
+```sh
+cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000 --filter text
+```
+
+`--filter` accepts `none`, `text`, `source`, `level`, or `property`.
+
 ## Controls
 
 Press `?` to open the in-app command palette:
