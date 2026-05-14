@@ -87,7 +87,7 @@ fn draw_selectable_dialog(
         let query_width = content.width.saturating_sub(9) as usize;
         let query_line = Line::from(vec![
             Span::styled(" search ", muted),
-            Span::styled(truncate_tail(query, query_width), base),
+            Span::styled(truncate_tail(query, query_width).into_owned(), base),
         ]);
         frame.render_widget(Paragraph::new(query_line).style(base), content);
 
@@ -189,7 +189,7 @@ fn render_selectable_rows(
                 Span::styled(label_text, row_style),
                 Span::styled("  ", row_style),
                 Span::styled(
-                    truncate_tail(item.description, description_width),
+                    truncate_tail(item.description, description_width).into_owned(),
                     muted_style,
                 ),
             ])

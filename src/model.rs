@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -13,22 +13,28 @@ pub enum Level {
 
 impl Level {
     pub fn parse(input: &str) -> Option<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
-            "fatal" => Some(Self::Fatal),
-            "error" | "err" => Some(Self::Error),
-            "warn" | "warning" => Some(Self::Warn),
-            "info" | "log" => Some(Self::Info),
-            "debug" => Some(Self::Debug),
-            "trace" | "verbose" => Some(Self::Trace),
-            "unknown" => Some(Self::Unknown),
-            _ => None,
+        let input = input.trim();
+        if input.eq_ignore_ascii_case("fatal") {
+            Some(Self::Fatal)
+        } else if input.eq_ignore_ascii_case("error") || input.eq_ignore_ascii_case("err") {
+            Some(Self::Error)
+        } else if input.eq_ignore_ascii_case("warn") || input.eq_ignore_ascii_case("warning") {
+            Some(Self::Warn)
+        } else if input.eq_ignore_ascii_case("info") || input.eq_ignore_ascii_case("log") {
+            Some(Self::Info)
+        } else if input.eq_ignore_ascii_case("debug") {
+            Some(Self::Debug)
+        } else if input.eq_ignore_ascii_case("trace") || input.eq_ignore_ascii_case("verbose") {
+            Some(Self::Trace)
+        } else if input.eq_ignore_ascii_case("unknown") {
+            Some(Self::Unknown)
+        } else {
+            None
         }
     }
-}
 
-impl fmt::Display for Level {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
+    pub fn as_str(self) -> &'static str {
+        match self {
             Self::Fatal => "fatal",
             Self::Error => "error",
             Self::Warn => "warn",
@@ -36,8 +42,13 @@ impl fmt::Display for Level {
             Self::Debug => "debug",
             Self::Trace => "trace",
             Self::Unknown => "unknown",
-        };
-        f.write_str(label)
+        }
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -50,13 +61,20 @@ pub enum PropertyValue {
     Text(String),
 }
 
+impl PropertyValue {
+    pub(crate) fn as_display_str(&self) -> Cow<'_, str> {
+        match self {
+            Self::String(value) | Self::Number(value) | Self::Text(value) => Cow::Borrowed(value),
+            Self::Bool(true) => Cow::Borrowed("true"),
+            Self::Bool(false) => Cow::Borrowed("false"),
+            Self::Null => Cow::Borrowed("null"),
+        }
+    }
+}
+
 impl fmt::Display for PropertyValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::String(value) | Self::Number(value) | Self::Text(value) => f.write_str(value),
-            Self::Bool(value) => write!(f, "{value}"),
-            Self::Null => f.write_str("null"),
-        }
+        f.write_str(self.as_display_str().as_ref())
     }
 }
 
@@ -631,25 +649,32 @@ fn strip_control_chars(input: &str) -> String {
 }
 
 pub fn infer_level(message: &str) -> Level {
-    let tokens = message
+    let mut inferred = Level::Unknown;
+    for level in message
         .split(|value: char| !value.is_ascii_alphanumeric())
         .filter_map(Level::parse)
-        .collect::<Vec<_>>();
+    {
+        if level == Level::Fatal {
+            return Level::Fatal;
+        }
 
-    if tokens.contains(&Level::Fatal) {
-        Level::Fatal
-    } else if tokens.contains(&Level::Error) {
-        Level::Error
-    } else if tokens.contains(&Level::Warn) {
-        Level::Warn
-    } else if tokens.contains(&Level::Info) {
-        Level::Info
-    } else if tokens.contains(&Level::Debug) {
-        Level::Debug
-    } else if tokens.contains(&Level::Trace) {
-        Level::Trace
-    } else {
-        Level::Unknown
+        if level_priority(level) > level_priority(inferred) {
+            inferred = level;
+        }
+    }
+
+    inferred
+}
+
+fn level_priority(level: Level) -> u8 {
+    match level {
+        Level::Fatal => 6,
+        Level::Error => 5,
+        Level::Warn => 4,
+        Level::Info => 3,
+        Level::Debug => 2,
+        Level::Trace => 1,
+        Level::Unknown => 0,
     }
 }
 

@@ -1,21 +1,59 @@
-pub(super) fn compact_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+use std::borrow::Cow;
+
+pub(super) fn compact_whitespace(value: &str) -> Cow<'_, str> {
+    if is_compact_whitespace(value) {
+        return Cow::Borrowed(value);
+    }
+
+    let mut output = String::with_capacity(value.len());
+    for part in value.split_whitespace() {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(part);
+    }
+
+    Cow::Owned(output)
 }
 
-pub(super) fn truncate_tail(value: &str, max: usize) -> String {
+pub(super) fn truncate_tail(value: &str, max: usize) -> Cow<'_, str> {
     if max == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
 
     if value.chars().count() <= max {
-        return value.to_string();
+        return Cow::Borrowed(value);
     }
 
     if max == 1 {
-        return "~".to_string();
+        return Cow::Borrowed("~");
     }
 
-    value.chars().take(max - 1).collect::<String>() + "~"
+    let mut output = value.chars().take(max - 1).collect::<String>();
+    output.push('~');
+    Cow::Owned(output)
+}
+
+fn is_compact_whitespace(value: &str) -> bool {
+    if value.chars().next().is_some_and(char::is_whitespace)
+        || value.chars().next_back().is_some_and(char::is_whitespace)
+    {
+        return false;
+    }
+
+    let mut previous_whitespace = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if previous_whitespace || ch != ' ' {
+                return false;
+            }
+            previous_whitespace = true;
+        } else {
+            previous_whitespace = false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]

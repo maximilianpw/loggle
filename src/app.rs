@@ -203,11 +203,11 @@ impl App {
             .and_then(|sequence| self.buffer.event_by_sequence(*sequence))
     }
 
-    pub fn for_each_visible_event(
-        &self,
+    pub fn for_each_visible_event<'a>(
+        &'a self,
         start: usize,
         limit: usize,
-        mut visit: impl FnMut(usize, &LogEvent),
+        mut visit: impl FnMut(usize, &'a LogEvent),
     ) {
         if limit == 0 {
             return;
@@ -508,7 +508,8 @@ impl App {
         let Some(property) = self.selected_property() else {
             return;
         };
-        let predicate = PropertyPredicate::exact(&property.key, property.value.to_string());
+        let predicate =
+            PropertyPredicate::exact(&property.key, property.value.as_display_str().into_owned());
         self.filters.add_property_filter(PropertyFilterUpdate {
             exclude: false,
             predicate,

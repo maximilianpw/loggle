@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -10,13 +12,13 @@ use super::{
     theme::THEME,
 };
 
-pub(super) fn render_event(
-    event: &LogEvent,
+pub(super) fn render_event<'a>(
+    event: &'a LogEvent,
     color_enabled: bool,
     selected: bool,
-    message_field_keys: &[String],
+    message_field_keys: &'a [String],
     highlight_values: &[&str],
-) -> Line<'static> {
+) -> Line<'a> {
     let row_bg = if selected {
         THEME.panel_alt
     } else {
@@ -49,11 +51,11 @@ pub(super) fn render_event(
         sequence,
         Span::styled(format!("{:<14}", truncate_tail(&event.source, 14)), source_style),
         Span::styled(" ", row_style),
-        Span::styled(format!("{:<7}", event.level.to_string()), level_style),
+        Span::styled(format!("{:<7}", event.level.as_str()), level_style),
         Span::styled(" ", row_style),
     ];
     spans.extend(message_spans(
-        &compact_whitespace(&event.message),
+        compact_whitespace(&event.message),
         row_style,
         highlight_values,
     ));
@@ -71,12 +73,21 @@ pub(super) fn render_event(
     Line::from(spans)
 }
 
-fn message_spans(message: &str, row_style: Style, highlight_values: &[&str]) -> Vec<Span<'static>> {
+fn message_spans<'a>(
+    message: Cow<'a, str>,
+    row_style: Style,
+    highlight_values: &[&str],
+) -> Vec<Span<'a>> {
+    if highlight_values.iter().all(|value| value.is_empty()) {
+        return vec![Span::styled(message, row_style)];
+    }
+
     let highlight_style = row_style
         .fg(THEME.background)
         .bg(THEME.highlight)
         .add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
+    let message = message.as_ref();
     let mut remaining = message;
 
     while !remaining.is_empty() {
@@ -209,13 +220,8 @@ mod tests {
             },
         ]);
 
-        let row = render_event(
-            &event,
-            false,
-            false,
-            &["tenantId".to_string(), "missing".to_string()],
-            &[],
-        );
+        let message_fields = ["tenantId".to_string(), "missing".to_string()];
+        let row = render_event(&event, false, false, &message_fields, &[]);
         let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
 
         assert!(text.ends_with("request completed tenantId=tenant-1"));

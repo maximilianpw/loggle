@@ -57,8 +57,8 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
     let source = filters.source.as_deref().unwrap_or("-");
     let level = filters
         .level
-        .map(|level| level.to_string())
-        .unwrap_or_else(|| "-".to_string());
+        .map(|level| level.as_str())
+        .unwrap_or("-");
     let properties = property_filters_summary(filters);
     let help = help_variant(width);
     let (source_limit, level_limit, text_limit, property_limit) = value_limits(width, help);
@@ -68,7 +68,7 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
         base("source="),
         value(truncate_tail(source, source_limit)),
         base("  level="),
-        value(truncate_tail(&level, level_limit)),
+        value(truncate_tail(level, level_limit)),
         base("  search="),
         value(truncate_tail(text, text_limit)),
         base("  props="),

@@ -153,7 +153,7 @@ impl PropertyPredicate {
         event.property(&self.key).is_some_and(|property| {
             self.value
                 .as_ref()
-                .is_none_or(|value| property.value.to_string() == *value)
+                .is_none_or(|value| property.value.as_display_str().as_ref() == value.as_str())
         })
     }
 
@@ -234,9 +234,15 @@ fn normalize_filter_value(value: &str) -> String {
 }
 
 pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+
     haystack
-        .to_ascii_lowercase()
-        .contains(&needle.to_ascii_lowercase())
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| bytes_eq_ignore_ascii_case(window, needle))
 }
 
 pub fn event_contains(event: &LogEvent, query: &str) -> bool {
@@ -245,8 +251,16 @@ pub fn event_contains(event: &LogEvent, query: &str) -> bool {
         || contains_ignore_ascii_case(&event.source, query)
         || event.properties.iter().any(|property| {
             contains_ignore_ascii_case(&property.key, query)
-                || contains_ignore_ascii_case(&property.value.to_string(), query)
+                || contains_ignore_ascii_case(property.value.as_display_str().as_ref(), query)
         })
+}
+
+fn bytes_eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 #[cfg(test)]

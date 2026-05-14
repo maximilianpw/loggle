@@ -163,7 +163,7 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("source=", muted),
             Span::styled(text::truncate_tail(&event.source, 18), base),
             Span::styled(" level=", muted),
-            Span::styled(event.level.to_string(), base),
+            Span::styled(event.level.as_str(), base),
             Span::styled(" time=", muted),
             Span::styled(event.timestamp.as_deref().unwrap_or("-").to_string(), base),
         ]),
@@ -189,12 +189,12 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 base
             };
             let marker = if property_index == selected { ">" } else { " " };
-            let value = property.value.to_string();
+            let value = property.value.as_display_str();
             let text = format!(
                 "{} {} = {}",
                 marker,
                 text::truncate_tail(&property.key, 24),
-                text::truncate_tail(&value, width.saturating_sub(31))
+                text::truncate_tail(value.as_ref(), width.saturating_sub(31))
             );
             lines.push(Line::from(Span::styled(text, row_style)));
         }

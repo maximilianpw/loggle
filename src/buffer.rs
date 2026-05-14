@@ -234,7 +234,9 @@ impl LogBuffer {
         }
 
         for field in source_config.fields() {
-            let Some(source) = event.property(field).map(|property| property.value.to_string())
+            let Some(source) = event
+                .property(field)
+                .map(|property| property.value.as_display_str())
             else {
                 continue;
             };
