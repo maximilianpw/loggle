@@ -244,6 +244,7 @@ Press `?` to open the in-app command palette:
 - `+`: add a show property filter
 - `-`: add a hide property filter
 - `c`: clear filters
+- `u`: undo the previous filter change
 
 ### Details and Properties
 

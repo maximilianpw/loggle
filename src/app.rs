@@ -42,6 +42,7 @@ pub struct PropertyFilterRow {
 pub struct App {
     buffer: LogBuffer,
     filters: LogFilter,
+    filter_history: Vec<LogFilter>,
     visible_cache: Vec<u64>,
     selected: usize,
     follow: bool,
@@ -67,6 +68,7 @@ impl App {
         Self {
             buffer: LogBuffer::with_source_config(buffer_lines, source_config),
             filters: LogFilter::default(),
+            filter_history: Vec::new(),
             visible_cache: Vec::new(),
             selected: 0,
             follow: true,
@@ -166,6 +168,11 @@ impl App {
 
     pub fn filters(&self) -> &LogFilter {
         &self.filters
+    }
+
+    #[cfg(test)]
+    pub fn filter_history_len(&self) -> usize {
+        self.filter_history.len()
     }
 
     pub fn details_open(&self) -> bool {
@@ -432,6 +439,7 @@ impl App {
         };
 
         let value = self.prompt.trim().to_string();
+        let previous_filters = self.filters.clone();
         match kind {
             PromptKind::Text => self.filters.text = (!value.is_empty()).then_some(value),
             PromptKind::Source => self.filters.source = (!value.is_empty()).then_some(value),
@@ -461,6 +469,7 @@ impl App {
             }
         }
 
+        self.remember_filter_change(previous_filters);
         self.sync_visible_cache();
         self.mode = if matches!(kind, PromptKind::EditPropertyFilter) {
             Mode::Dialog(DialogKind::PropertyFilters)
@@ -474,7 +483,21 @@ impl App {
     }
 
     pub fn clear_filters(&mut self) {
+        let previous_filters = self.filters.clone();
         self.filters.clear();
+        self.remember_filter_change(previous_filters);
+        self.sync_visible_cache();
+        self.pending_g = false;
+        self.sync_selection();
+    }
+
+    pub fn undo_filter_change(&mut self) {
+        let Some(filters) = self.filter_history.pop() else {
+            self.pending_g = false;
+            return;
+        };
+
+        self.filters = filters;
         self.sync_visible_cache();
         self.pending_g = false;
         self.sync_selection();
@@ -508,12 +531,14 @@ impl App {
         let Some(property) = self.selected_property() else {
             return;
         };
+        let previous_filters = self.filters.clone();
         let predicate =
             PropertyPredicate::exact(&property.key, property.value.as_display_str().into_owned());
         self.filters.add_property_filter(PropertyFilterUpdate {
             exclude: false,
             predicate,
         });
+        self.remember_filter_change(previous_filters);
         self.sync_visible_cache();
         self.sync_selection();
     }
@@ -639,6 +664,12 @@ impl App {
         }
     }
 
+    fn remember_filter_change(&mut self, previous_filters: LogFilter) {
+        if previous_filters != self.filters {
+            self.filter_history.push(previous_filters);
+        }
+    }
+
     fn dialog_state(&self, kind: DialogKind) -> &SearchableListState {
         match kind {
             DialogKind::PropertyFilters => &self.property_filters,
@@ -712,7 +743,9 @@ impl App {
             return;
         };
 
+        let previous_filters = self.filters.clone();
         self.filters.remove_property_filter(row.id);
+        self.remember_filter_change(previous_filters);
         self.sync_visible_cache();
         self.sync_property_filter_selection();
         self.sync_selection();
@@ -961,6 +994,47 @@ mod tests {
             app.filters.property_includes,
             vec![PropertyPredicate::exact("tenantId", "tenant-1")]
         );
+    }
+
+    #[test]
+    fn undo_filter_change_restores_previous_filters() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("web | INFO two".to_string());
+
+        app.start_prompt(PromptKind::Level);
+        for ch in "error".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        assert_eq!(app.visible_count(), 1);
+        assert_eq!(app.filter_history_len(), 1);
+
+        app.undo_filter_change();
+
+        assert_eq!(app.visible_count(), 2);
+        assert_eq!(app.filters().level, None);
+        assert_eq!(app.filter_history_len(), 0);
+    }
+
+    #[test]
+    fn undo_filter_change_restores_property_isolation() {
+        let mut app = App::new(10);
+        app.push_line("14:06:58.892 INFO request completed".to_string());
+        app.push_line("[14:06:58.892] INFO (#1):".to_string());
+        app.push_line("{".to_string());
+        app.push_line("tenantId: \"tenant-1\",".to_string());
+        app.push_line("}".to_string());
+
+        app.follow_selected_property();
+        assert_eq!(app.visible_count(), 1);
+        assert_eq!(app.filters().property_includes.len(), 1);
+
+        app.undo_filter_change();
+
+        assert_eq!(app.visible_count(), 1);
+        assert!(app.filters().property_includes.is_empty());
     }
 
     #[test]

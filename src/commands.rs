@@ -13,6 +13,7 @@ pub enum CommandAction {
     IncludeProperty,
     ExcludeProperty,
     ClearFilters,
+    UndoFilterChange,
     NextMatch,
     PreviousMatch,
     ToggleFollow,
@@ -107,6 +108,12 @@ pub const COMMANDS: &[Command] = &[
         label: "Clear filters",
         description: "Remove search, source, level, and property filters",
         action: CommandAction::ClearFilters,
+    },
+    Command {
+        shortcut: "u",
+        label: "Undo filter",
+        description: "Restore the previous filter state",
+        action: CommandAction::UndoFilterChange,
     },
     Command {
         shortcut: "n",

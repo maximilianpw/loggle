@@ -56,6 +56,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char(']'), _) => return execute_command(app, CommandAction::NextProperty),
         (KeyCode::Char('['), _) => return execute_command(app, CommandAction::PreviousProperty),
         (KeyCode::Char('c'), _) => return execute_command(app, CommandAction::ClearFilters),
+        (KeyCode::Char('u'), _) => return execute_command(app, CommandAction::UndoFilterChange),
         (KeyCode::Char(' '), _) | (KeyCode::Char('p'), _) => {
             return execute_command(app, CommandAction::ToggleFollow);
         }
@@ -140,6 +141,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::IncludeProperty => app.start_prompt(PromptKind::IncludeProperty),
         CommandAction::ExcludeProperty => app.start_prompt(PromptKind::ExcludeProperty),
         CommandAction::ClearFilters => app.clear_filters(),
+        CommandAction::UndoFilterChange => app.undo_filter_change(),
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
         CommandAction::ToggleFollow => app.toggle_follow(),
@@ -216,6 +218,22 @@ mod tests {
 
         assert_eq!(app.mode(), &Mode::Normal);
         assert_eq!(app.filters().text, None);
+    }
+
+    #[test]
+    fn normal_mode_u_restores_previous_filter_state() {
+        let mut app = App::new(10);
+        handle_key(&mut app, key(KeyCode::Char('l')), 5);
+        for value in "error".chars() {
+            handle_key(&mut app, key(KeyCode::Char(value)), 5);
+        }
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+
+        assert_eq!(app.filters().level, Some(Level::Error));
+
+        handle_key(&mut app, key(KeyCode::Char('u')), 5);
+
+        assert_eq!(app.filters().level, None);
     }
 
     #[test]
