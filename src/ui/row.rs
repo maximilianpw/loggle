@@ -259,6 +259,21 @@ mod tests {
     }
 
     #[test]
+    fn search_values_are_highlighted_inside_message_text() {
+        let event = LogEvent::from_line(1, "api | INFO request completed".to_string());
+
+        let row = render_event(&event, false, false, false, &[], &["request"]);
+        let highlighted = row
+            .spans
+            .into_iter()
+            .filter(|span| span.style.bg == Some(THEME.highlight))
+            .map(|span| span.content)
+            .collect::<String>();
+
+        assert_eq!(highlighted, "request");
+    }
+
+    #[test]
     fn multiple_property_values_are_highlighted_inside_message_text() {
         let event = LogEvent::from_line(
             1,

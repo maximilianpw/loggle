@@ -345,6 +345,7 @@ filtering and source promotion.
 Property filters support exact values and key existence. Use `key=value` or
 `key` to show matching rows, and `key!=value` or `!key` to hide matching rows.
 The details pane can prefill these filters from the selected event property.
+The active text search is highlighted in visible log-row messages.
 
 Pinned fields are session-local property keys rendered as stable columns before
 the parsed message. Rows that do not have a selected property show `-` in that

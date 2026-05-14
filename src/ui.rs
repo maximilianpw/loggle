@@ -139,7 +139,15 @@ fn draw_logs(
         area,
     );
 
-    let highlight_values = app.filters().property_highlight_values();
+    let mut highlight_values = app.filters().property_highlight_values();
+    if let Some(query) = app
+        .filters()
+        .text
+        .as_deref()
+        .filter(|query| !query.is_empty())
+    {
+        highlight_values.push(query);
+    }
     let viewport_height = area.height as usize;
     let selected = app.selected();
     let start = selected.saturating_sub(viewport_height.saturating_sub(1));
