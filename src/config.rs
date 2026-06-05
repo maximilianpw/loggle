@@ -7,7 +7,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::runtime::{ReadySpec, StartCommand};
+use crate::runtime::{ReadySpec, StartCommand, StartPlan};
 
 const PROJECT_CONFIG_FILE: &str = ".loggle.toml";
 const CONFIG_DIR_NAME: &str = "loggle";
@@ -212,7 +212,7 @@ fn validate_config(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    validate_dependency_graph(&commands, path.clone())?;
+    StartPlan::new(&commands).map_err(|error| validation_error(path.clone(), error.to_string()))?;
 
     Ok(StartConfig {
         root,
@@ -423,106 +423,6 @@ fn merged_env(
     let mut env = config_env.clone();
     env.extend(command_env);
     env
-}
-
-fn validate_dependency_graph(
-    commands: &[StartCommand],
-    path: Option<PathBuf>,
-) -> Result<(), ConfigError> {
-    let command_indexes = commands
-        .iter()
-        .enumerate()
-        .map(|(index, command)| (command.name.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
-
-    for command in commands {
-        for dependency in &command.wait_for {
-            if !command_indexes.contains_key(dependency.as_str()) {
-                return Err(validation_error(
-                    path,
-                    format!(
-                        "command '{}' waits for unknown command '{}'",
-                        command.name, dependency
-                    ),
-                ));
-            }
-        }
-    }
-
-    let mut states = vec![VisitState::Unvisited; commands.len()];
-    let mut stack = Vec::new();
-    for index in 0..commands.len() {
-        visit_dependencies(
-            index,
-            commands,
-            &command_indexes,
-            &mut states,
-            &mut stack,
-            path.clone(),
-        )?;
-    }
-
-    Ok(())
-}
-
-fn visit_dependencies(
-    index: usize,
-    commands: &[StartCommand],
-    command_indexes: &BTreeMap<&str, usize>,
-    states: &mut [VisitState],
-    stack: &mut Vec<usize>,
-    path: Option<PathBuf>,
-) -> Result<(), ConfigError> {
-    match states[index] {
-        VisitState::Visited => return Ok(()),
-        VisitState::Visiting => {
-            return Err(validation_error(
-                path,
-                format_cycle(commands, stack, index),
-            ));
-        }
-        VisitState::Unvisited => {}
-    }
-
-    states[index] = VisitState::Visiting;
-    stack.push(index);
-
-    for dependency in &commands[index].wait_for {
-        let dependency_index = command_indexes[dependency.as_str()];
-        visit_dependencies(
-            dependency_index,
-            commands,
-            command_indexes,
-            states,
-            stack,
-            path.clone(),
-        )?;
-    }
-
-    stack.pop();
-    states[index] = VisitState::Visited;
-    Ok(())
-}
-
-fn format_cycle(commands: &[StartCommand], stack: &[usize], repeated_index: usize) -> String {
-    let start = stack
-        .iter()
-        .position(|index| *index == repeated_index)
-        .unwrap_or(0);
-    let mut names = stack[start..]
-        .iter()
-        .map(|index| commands[*index].name.as_str())
-        .collect::<Vec<_>>();
-    names.push(commands[repeated_index].name.as_str());
-
-    format!("command dependency cycle detected: {}", names.join(" -> "))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VisitState {
-    Unvisited,
-    Visiting,
-    Visited,
 }
 
 fn validate_config_name(name: &str) -> Result<&str, ConfigError> {

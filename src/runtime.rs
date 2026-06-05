@@ -1,6 +1,7 @@
 mod clipboard;
 mod input;
 mod keys;
+mod start_plan;
 mod terminal;
 
 use std::{collections::BTreeMap, fmt, io, path::PathBuf, process::Child, time::Duration};
@@ -8,6 +9,8 @@ use std::{collections::BTreeMap, fmt, io, path::PathBuf, process::Child, time::D
 use tokio::sync::mpsc;
 
 use crate::model::SourceConfig;
+
+pub(crate) use start_plan::StartPlan;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

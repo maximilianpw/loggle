@@ -13,7 +13,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use super::{NamedCommand, ReadySpec, StartCommand};
+use super::{NamedCommand, ReadySpec, StartCommand, StartPlan};
 
 pub(super) const LINE_CHANNEL_CAPACITY: usize = 1024;
 
@@ -59,7 +59,8 @@ pub(super) fn spawn_start_commands(
     commands: &[StartCommand],
     tx: mpsc::Sender<String>,
 ) -> io::Result<Vec<Child>> {
-    StartScheduler::new(commands, tx).run()
+    let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
+    StartScheduler::new(plan, tx).run()
 }
 
 fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
@@ -238,9 +239,8 @@ struct SpawnedStartCommand {
 }
 
 struct StartScheduler<'a> {
-    commands: &'a [StartCommand],
+    plan: StartPlan<'a>,
     tx: mpsc::Sender<String>,
-    command_indexes: BTreeMap<&'a str, usize>,
     states: Vec<StartState>,
     children: Vec<Option<Child>>,
     line_ready: Vec<Option<std_mpsc::Receiver<()>>>,
@@ -248,18 +248,12 @@ struct StartScheduler<'a> {
 }
 
 impl<'a> StartScheduler<'a> {
-    fn new(commands: &'a [StartCommand], tx: mpsc::Sender<String>) -> Self {
-        let command_indexes = commands
-            .iter()
-            .enumerate()
-            .map(|(index, command)| (command.name.as_str(), index))
-            .collect::<BTreeMap<_, _>>();
-        let len = commands.len();
+    fn new(plan: StartPlan<'a>, tx: mpsc::Sender<String>) -> Self {
+        let len = plan.len();
 
         Self {
-            commands,
+            plan,
             tx,
-            command_indexes,
             states: vec![StartState::Pending; len],
             children: (0..len).map(|_| None).collect(),
             line_ready: (0..len).map(|_| None).collect(),
@@ -303,7 +297,7 @@ impl<'a> StartScheduler<'a> {
 
     fn spawn_unblocked(&mut self, now: Instant) -> io::Result<bool> {
         let mut progressed = false;
-        for index in 0..self.commands.len() {
+        for index in 0..self.plan.len() {
             if self.states[index] != StartState::Pending || !self.dependencies_ready(index) {
                 continue;
             }
@@ -316,14 +310,13 @@ impl<'a> StartScheduler<'a> {
     }
 
     fn dependencies_ready(&self, index: usize) -> bool {
-        self.commands[index].wait_for.iter().all(|dependency| {
-            let dependency_index = self.command_indexes[dependency.as_str()];
-            self.states[dependency_index] == StartState::Ready
-        })
+        self.plan
+            .dependency_indexes(index)
+            .all(|dependency_index| self.states[dependency_index] == StartState::Ready)
     }
 
     fn spawn_command(&mut self, index: usize, now: Instant) -> io::Result<()> {
-        let command = &self.commands[index];
+        let command = self.plan.command(index);
         let spawned = spawn_start_command(command, self.tx.clone())?;
 
         self.children[index] = Some(spawned.child);
@@ -357,10 +350,12 @@ impl<'a> StartScheduler<'a> {
     fn check_readiness(&mut self, now: Instant) -> io::Result<bool> {
         let mut progressed = false;
 
-        for index in 0..self.commands.len() {
+        for index in 0..self.plan.len() {
             if self.states[index] != StartState::Started {
                 continue;
             }
+
+            let command = self.plan.command(index);
 
             if self.line_ready[index]
                 .as_ref()
@@ -374,11 +369,7 @@ impl<'a> StartScheduler<'a> {
             if let Some(command_ready) = self.command_ready[index].as_mut() {
                 if command_ready.is_command_probe_due(now) {
                     let probe_outcome =
-                        command_ready.run_probe(
-                            self.commands[index].cwd.as_deref(),
-                            &self.commands[index].env,
-                            now,
-                        );
+                        command_ready.run_probe(command.cwd.as_deref(), &command.env, now);
                     let probe_outcome = match probe_outcome {
                         Ok(outcome) => outcome,
                         Err(error) => return Err(error),
@@ -395,7 +386,7 @@ impl<'a> StartScheduler<'a> {
                 }
 
                 if now >= command_ready.deadline {
-                    return Err(command_ready.timeout_error(&self.commands[index].name));
+                    return Err(command_ready.timeout_error(&command.name));
                 }
             }
 
@@ -405,7 +396,7 @@ impl<'a> StartScheduler<'a> {
                     self.children[index] = None;
                     let message = format!(
                         "command '{}' exited before readiness{}",
-                        self.commands[index].name,
+                        command.name,
                         status
                             .code()
                             .map(|code| format!(" with status {code}"))
