@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::{app::App, model::SourceConfig, ui};
 
 use super::{
+    clipboard,
     input::{self, ChildShutdown, ShutdownSignal, ShutdownStatus},
     keys::{self, KeyOutcome},
 };
@@ -124,7 +125,14 @@ fn run_app(
                         matches!(key.code, KeyCode::Char('q'))
                     } else {
                         let half_page = (terminal.size()?.height as usize / 2).max(1);
-                        keys::handle_key(&mut app, key, half_page) == KeyOutcome::Quit
+                        match keys::handle_key(&mut app, key, half_page) {
+                            KeyOutcome::Continue => false,
+                            KeyOutcome::Quit => true,
+                            KeyOutcome::Copy { text, line_count } => {
+                                copy_to_clipboard(&mut app, &text, line_count);
+                                false
+                            }
+                        }
                     };
 
                     if requested_quit {
@@ -187,6 +195,21 @@ fn flush_recorder(recorder: &mut Option<SessionRecorder>) -> io::Result<()> {
         recorder.flush()?;
     }
     Ok(())
+}
+
+fn copy_to_clipboard(app: &mut App, text: &str, line_count: usize) {
+    match clipboard::write(text) {
+        Ok(()) => app.set_notice(format!("copied {}", line_count_label(line_count))),
+        Err(error) => app.set_notice(format!("copy failed: {error}")),
+    }
+}
+
+fn line_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{count} lines")
+    }
 }
 
 fn closing_message(shutdowns: &[ChildShutdown]) -> &'static str {

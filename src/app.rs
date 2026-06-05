@@ -70,6 +70,12 @@ pub struct SourceStatusRow {
     pub last_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YankedLines {
+    pub text: String,
+    pub line_count: usize,
+}
+
 #[derive(Debug)]
 pub struct App {
     buffer: LogBuffer,
@@ -81,6 +87,7 @@ pub struct App {
     paused_backlog: usize,
     marked_sequences: Vec<u64>,
     mode: Mode,
+    notice: Option<String>,
     prompt: String,
     palette: SearchableListState,
     pending_g: bool,
@@ -112,6 +119,7 @@ impl App {
             paused_backlog: 0,
             marked_sequences: Vec::new(),
             mode: Mode::Normal,
+            notice: None,
             prompt: String::new(),
             palette: SearchableListState::default(),
             pending_g: false,
@@ -162,6 +170,18 @@ impl App {
 
     pub fn mode(&self) -> &Mode {
         &self.mode
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
     }
 
     pub fn prompt(&self) -> &str {
@@ -561,6 +581,13 @@ impl App {
 
     pub fn clear_transient(&mut self) {
         self.pending_g = false;
+    }
+
+    pub fn yank_selected_line(&self) -> Option<YankedLines> {
+        self.selected_event().map(|event| YankedLines {
+            text: event.raw.clone(),
+            line_count: 1,
+        })
     }
 
     pub fn apply_prompt(&mut self) {
@@ -1411,6 +1438,18 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(output, "api | ERROR one\napi | ERROR three\n");
+    }
+
+    #[test]
+    fn yanking_selected_line_returns_raw_log_text() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | WARN two".to_string());
+
+        let yanked = app.yank_selected_line().unwrap();
+
+        assert_eq!(yanked.text, "web | WARN two");
+        assert_eq!(yanked.line_count, 1);
     }
 
     #[test]

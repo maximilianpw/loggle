@@ -1,15 +1,18 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, DialogKind, Mode, PromptKind};
+use crate::app::{App, DialogKind, Mode, PromptKind, YankedLines};
 use crate::commands::CommandAction;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum KeyOutcome {
     Continue,
+    Copy { text: String, line_count: usize },
     Quit,
 }
 
 pub(super) fn handle_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
+    app.clear_notice();
+
     match app.mode() {
         Mode::Prompt(_) => handle_prompt_key(app, key),
         Mode::Palette => handle_palette_key(app, key, half_page),
@@ -44,6 +47,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('g'), _) => app.handle_g(),
         (KeyCode::Char('G'), _) => return execute_command(app, CommandAction::JumpBottom),
         (KeyCode::Enter, _) => return execute_command(app, CommandAction::ToggleDetails),
+        (KeyCode::Char('y'), _) => return execute_command(app, CommandAction::CopySelectedLine),
         (KeyCode::Char('/'), _) => return execute_command(app, CommandAction::Search),
         (KeyCode::Char('s'), _) => return execute_command(app, CommandAction::SourceFilter),
         (KeyCode::Char('l'), _) => return execute_command(app, CommandAction::LevelFilter),
@@ -137,6 +141,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::SourceFilter => app.start_prompt(PromptKind::Source),
         CommandAction::LevelFilter => app.start_prompt(PromptKind::Level),
         CommandAction::ToggleDetails => app.toggle_details(),
+        CommandAction::CopySelectedLine => return copy_outcome(app.yank_selected_line()),
         CommandAction::PreviousProperty => app.previous_property(),
         CommandAction::NextProperty => app.next_property(),
         CommandAction::FollowProperty => app.follow_selected_property(),
@@ -163,6 +168,17 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
     }
 
     KeyOutcome::Continue
+}
+
+fn copy_outcome(yanked: Option<YankedLines>) -> KeyOutcome {
+    if let Some(yanked) = yanked {
+        KeyOutcome::Copy {
+            text: yanked.text,
+            line_count: yanked.line_count,
+        }
+    } else {
+        KeyOutcome::Continue
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +317,24 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('O')), 5);
 
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Sources));
+    }
+
+    #[test]
+    fn normal_mode_y_copies_selected_line() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | WARN two".to_string());
+
+        let outcome = handle_key(&mut app, key(KeyCode::Char('y')), 5);
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::Copy {
+                text: "web | WARN two".to_string(),
+                line_count: 1
+            }
+        );
+        assert_eq!(app.mode(), &Mode::Normal);
     }
 
     #[test]

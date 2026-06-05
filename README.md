@@ -243,6 +243,7 @@ Press `?` to open the in-app command palette:
 - `G`: jump to bottom and resume following
 - `n` / `N`: next/previous search match
 - `Space` or `p`: pause/resume following
+- `y`: copy the selected raw log line to the clipboard
 
 ### Filtering
 

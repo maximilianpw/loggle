@@ -4,6 +4,7 @@ pub enum CommandAction {
     SourceFilter,
     LevelFilter,
     ToggleDetails,
+    CopySelectedLine,
     PreviousProperty,
     NextProperty,
     FollowProperty,
@@ -59,6 +60,12 @@ pub const COMMANDS: &[Command] = &[
         label: "Details",
         description: "Open or close details for the selected row",
         action: CommandAction::ToggleDetails,
+    },
+    Command {
+        shortcut: "y",
+        label: "Copy line",
+        description: "Copy the selected raw log line to the clipboard",
+        action: CommandAction::CopySelectedLine,
     },
     Command {
         shortcut: "[",

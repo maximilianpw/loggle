@@ -37,7 +37,7 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let base = Style::default().fg(THEME.muted).bg(THEME.panel_alt);
     let value = Style::default().fg(THEME.text).bg(THEME.panel_alt);
     let key = Style::default().fg(THEME.accent).bg(THEME.panel_alt);
-    let spans = status_segments(app.filters(), area.width)
+    let spans = app_status_segments(app, area.width)
         .into_iter()
         .map(|segment| {
             let style = match segment.role {
@@ -50,6 +50,18 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>();
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
+}
+
+fn app_status_segments(app: &App, width: u16) -> Vec<StatusSegment> {
+    if let Some(notice) = app.notice() {
+        return notice_segments(notice, width);
+    }
+
+    status_segments(app.filters(), width)
+}
+
+fn notice_segments(notice: &str, width: u16) -> Vec<StatusSegment> {
+    vec![base(" "), value(truncate_tail(notice, width as usize))]
 }
 
 fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
