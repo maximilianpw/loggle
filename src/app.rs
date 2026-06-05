@@ -1,4 +1,5 @@
 mod list_state;
+mod visible;
 
 use std::{
     collections::BTreeMap,
@@ -13,6 +14,7 @@ use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyP
 use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
 
 use list_state::SearchableListState;
+use visible::VisibleLogView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -82,12 +84,8 @@ pub struct App {
     buffer: LogBuffer,
     filters: LogFilter,
     filter_history: Vec<LogFilter>,
-    visible_cache: Vec<u64>,
-    selected: usize,
-    log_viewport_start: usize,
+    visible: VisibleLogView,
     visual_anchor: Option<usize>,
-    follow: bool,
-    paused_backlog: usize,
     marked_sequences: Vec<u64>,
     mode: Mode,
     notice: Option<String>,
@@ -116,12 +114,8 @@ impl App {
             buffer: LogBuffer::with_source_config(buffer_lines, source_config),
             filters: LogFilter::default(),
             filter_history: Vec::new(),
-            visible_cache: Vec::new(),
-            selected: 0,
-            log_viewport_start: 0,
+            visible: VisibleLogView::new(),
             visual_anchor: None,
-            follow: true,
-            paused_backlog: 0,
             marked_sequences: Vec::new(),
             mode: Mode::Normal,
             notice: None,
@@ -143,9 +137,6 @@ impl App {
     pub fn push_line(&mut self, line: String) {
         let change = self.buffer.push_line(line);
         self.apply_buffer_change(change);
-        if !self.follow {
-            self.paused_backlog = self.paused_backlog.saturating_add(1);
-        }
         self.sync_selection();
     }
 
@@ -154,11 +145,11 @@ impl App {
     }
 
     pub fn is_following(&self) -> bool {
-        self.follow
+        self.visible.is_following()
     }
 
     pub fn paused_backlog(&self) -> usize {
-        self.paused_backlog
+        self.visible.paused_backlog()
     }
 
     pub fn marker_count(&self) -> usize {
@@ -170,11 +161,11 @@ impl App {
     }
 
     pub fn selected(&self) -> usize {
-        self.selected
+        self.visible.selected()
     }
 
     pub fn log_viewport_start(&self) -> usize {
-        self.log_viewport_start
+        self.visible.viewport_start()
     }
 
     pub fn mode(&self) -> &Mode {
@@ -337,7 +328,7 @@ impl App {
     }
 
     pub fn selected_event(&self) -> Option<&LogEvent> {
-        self.visible_event_at(self.selected)
+        self.visible.selected_event(&self.buffer, &self.filters)
     }
 
     pub fn visual_selection_range(&self) -> Option<(usize, usize)> {
@@ -346,7 +337,7 @@ impl App {
         }
 
         let anchor = self.visual_anchor?;
-        let selected = self.selected.min(self.visible_count() - 1);
+        let selected = self.selected().min(self.visible_count() - 1);
         Some(if anchor <= selected {
             (anchor, selected)
         } else {
@@ -366,53 +357,22 @@ impl App {
     }
 
     pub fn visible_count(&self) -> usize {
-        if !self.filters.has_active_filters() {
-            return self.buffer.len();
-        }
-
-        self.visible_cache.len()
+        self.visible.visible_count(&self.buffer, &self.filters)
     }
 
     pub fn visible_event_at(&self, visible_index: usize) -> Option<&LogEvent> {
-        if !self.filters.has_active_filters() {
-            return self.buffer.events().get(visible_index);
-        }
-
-        self.visible_cache
-            .get(visible_index)
-            .and_then(|sequence| self.buffer.event_by_sequence(*sequence))
+        self.visible
+            .event_at(&self.buffer, &self.filters, visible_index)
     }
 
     pub fn for_each_visible_event<'a>(
         &'a self,
         start: usize,
         limit: usize,
-        mut visit: impl FnMut(usize, &'a LogEvent),
+        visit: impl FnMut(usize, &'a LogEvent),
     ) {
-        if limit == 0 {
-            return;
-        }
-
-        if !self.filters.has_active_filters() {
-            let end = start.saturating_add(limit).min(self.buffer.len());
-            for visible_index in start..end {
-                if let Some(event) = self.buffer.events().get(visible_index) {
-                    visit(visible_index, event);
-                }
-            }
-            return;
-        }
-
-        let end = start.saturating_add(limit).min(self.visible_cache.len());
-        for visible_index in start..end {
-            if let Some(event) = self
-                .visible_cache
-                .get(visible_index)
-                .and_then(|sequence| self.buffer.event_by_sequence(*sequence))
-            {
-                visit(visible_index, event);
-            }
-        }
+        self.visible
+            .for_each_visible_event(&self.buffer, &self.filters, start, limit, visit);
     }
 
     #[cfg(test)]
@@ -421,77 +381,43 @@ impl App {
     }
 
     pub fn sync_log_viewport(&mut self, viewport_height: usize) {
-        let visible_len = self.visible_count();
-        if viewport_height == 0 || visible_len == 0 {
-            self.log_viewport_start = 0;
-            return;
-        }
-
-        let max_start = visible_len.saturating_sub(viewport_height);
-        if self.follow {
-            self.log_viewport_start = max_start;
-            return;
-        }
-
-        let selected = self.selected.min(visible_len - 1);
-        self.log_viewport_start = self.log_viewport_start.min(max_start);
-
-        if selected < self.log_viewport_start {
-            self.log_viewport_start = selected;
-        } else if selected >= self.log_viewport_start.saturating_add(viewport_height) {
-            self.log_viewport_start = selected.saturating_sub(viewport_height - 1);
-        }
-
-        self.log_viewport_start = self.log_viewport_start.min(max_start);
+        self.visible
+            .sync_viewport(&self.buffer, &self.filters, viewport_height);
     }
 
     pub fn move_down(&mut self, amount: usize) {
-        self.follow = false;
+        self.visible.move_down(&self.buffer, &self.filters, amount);
         self.pending_g = false;
-        let visible_len = self.visible_count();
-        if visible_len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = (self.selected + amount).min(visible_len - 1);
-        }
         self.sync_selected_property();
     }
 
     pub fn move_up(&mut self, amount: usize) {
-        self.follow = false;
+        self.visible.move_up(amount);
         self.pending_g = false;
-        self.selected = self.selected.saturating_sub(amount);
         self.sync_selected_property();
     }
 
     pub fn jump_top(&mut self) {
-        self.follow = false;
+        self.visible.jump_top();
         self.pending_g = false;
-        self.selected = 0;
         self.sync_selected_property();
     }
 
     pub fn move_to_last_visible(&mut self) {
-        self.follow = false;
+        self.visible.move_to_last_visible(&self.buffer, &self.filters);
         self.pending_g = false;
-        self.selected = self.visible_count().saturating_sub(1);
         self.sync_selected_property();
     }
 
     pub fn jump_bottom(&mut self) {
-        self.follow = true;
-        self.paused_backlog = 0;
+        self.visible.jump_bottom(&self.buffer, &self.filters);
         self.pending_g = false;
         self.sync_selection();
     }
 
     pub fn toggle_follow(&mut self) {
         self.pending_g = false;
-        if self.follow {
-            self.follow = false;
-        } else {
-            self.jump_bottom();
-        }
+        self.visible.toggle_follow(&self.buffer, &self.filters);
     }
 
     pub fn start_prompt(&mut self, kind: PromptKind) {
@@ -649,17 +575,17 @@ impl App {
     }
 
     pub fn start_visual_selection(&mut self) {
-        let visible_len = self.visible_count();
-        if visible_len == 0 {
+        let Some(anchor) = self
+            .visible
+            .start_visual_selection(&self.buffer, &self.filters)
+        else {
             self.visual_anchor = None;
             self.pending_g = false;
             return;
-        }
+        };
 
-        self.follow = false;
         self.pending_g = false;
-        self.selected = self.selected.min(visible_len - 1);
-        self.visual_anchor = Some(self.selected);
+        self.visual_anchor = Some(anchor);
         self.mode = Mode::Visual;
     }
 
@@ -876,106 +802,34 @@ impl App {
 
     fn move_to_search_match(&mut self, forward: bool) {
         self.pending_g = false;
-        let Some(_) = self.filters.text.as_ref().filter(|query| !query.is_empty()) else {
-            return;
-        };
-        self.follow = false;
-
-        let visible_len = self.visible_count();
-        if visible_len == 0 {
-            return;
-        }
-
-        let selected = self.selected.min(visible_len - 1);
-        self.selected = if forward {
-            (selected + 1) % visible_len
-        } else {
-            (selected + visible_len - 1) % visible_len
-        };
+        self.visible
+            .move_to_search_match(&self.buffer, &self.filters, forward);
         self.sync_selected_property();
     }
 
     fn sync_selection(&mut self) {
-        let visible_len = self.visible_count();
-        if visible_len == 0 {
-            self.selected = 0;
-        } else if self.follow {
-            self.selected = visible_len - 1;
-        } else {
-            self.selected = self.selected.min(visible_len - 1);
-        }
+        self.visible.sync_selection(&self.buffer, &self.filters);
         self.sync_selected_property();
         self.sync_visual_anchor();
     }
 
     fn apply_buffer_change(&mut self, change: BufferChange) {
-        for sequence in change.removed {
+        for sequence in &change.removed {
             self.remove_marker(sequence);
-            if !self.filters.has_active_filters() {
-                continue;
-            }
-            self.remove_visible_sequence(sequence);
         }
-
-        if !self.filters.has_active_filters() {
-            self.visible_cache.clear();
-            return;
-        }
-
-        if let Some(sequence) = change.appended {
-            self.refresh_visible_sequence(sequence);
-        }
-
-        for sequence in change.updated {
-            self.refresh_visible_sequence(sequence);
-        }
+        self.visible
+            .on_line_received(&change, &self.buffer, &self.filters);
     }
 
     fn sync_visible_cache(&mut self) {
-        self.visible_cache.clear();
-        if !self.filters.has_active_filters() {
-            return;
-        }
-
-        self.visible_cache.extend(
-            self.buffer
-                .events()
-                .iter()
-                .filter(|event| self.filters.matches(event))
-                .map(|event| event.sequence),
-        );
+        self.visible.on_filters_changed(&self.buffer, &self.filters);
     }
 
-    fn refresh_visible_sequence(&mut self, sequence: u64) {
-        self.remove_visible_sequence(sequence);
-        let Some(event) = self.buffer.event_by_sequence(sequence) else {
-            return;
-        };
-        if !self.filters.matches(event) {
-            return;
-        }
-
-        let index = self
-            .visible_cache
-            .partition_point(|cached_sequence| *cached_sequence < sequence);
-        self.visible_cache.insert(index, sequence);
-    }
-
-    fn remove_visible_sequence(&mut self, sequence: u64) {
-        if let Some(index) = self
-            .visible_cache
-            .iter()
-            .position(|cached_sequence| *cached_sequence == sequence)
-        {
-            self.visible_cache.remove(index);
-        }
-    }
-
-    fn remove_marker(&mut self, sequence: u64) {
+    fn remove_marker(&mut self, sequence: &u64) {
         if let Some(index) = self
             .marked_sequences
             .iter()
-            .position(|marked| *marked == sequence)
+            .position(|marked| marked == sequence)
         {
             self.marked_sequences.remove(index);
         }
@@ -1003,11 +857,10 @@ impl App {
         let visible_len = self.visible_count();
         if visible_len == 0 {
             self.visual_anchor = None;
-            self.selected = 0;
         } else if let Some(anchor) = self.visual_anchor.as_mut() {
             *anchor = (*anchor).min(visible_len - 1);
         } else {
-            self.visual_anchor = Some(self.selected.min(visible_len - 1));
+            self.visual_anchor = Some(self.selected().min(visible_len - 1));
         }
     }
 
