@@ -110,7 +110,7 @@ fn run_app(
             terminal.draw(|frame| {
                 ui::draw(
                     frame,
-                    &app,
+                    &mut app,
                     color_enabled,
                     shutdown.as_deref().map(closing_message),
                 )

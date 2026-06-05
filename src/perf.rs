@@ -112,7 +112,7 @@ pub fn run_benchmark(config: &BenchConfig) -> BenchReport {
     let started = Instant::now();
     for _ in 0..config.iterations {
         terminal
-            .draw(|frame| ui::draw(frame, &app, true, None))
+            .draw(|frame| ui::draw(frame, &mut app, true, None))
             .expect("test backend draw should succeed");
     }
     let draw = started.elapsed();

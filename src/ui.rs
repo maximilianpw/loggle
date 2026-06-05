@@ -16,7 +16,7 @@ use crate::app::{App, DialogKind, Mode, PromptKind};
 
 use theme::THEME;
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, color_enabled: bool, closing: Option<&str>) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App, color_enabled: bool, closing: Option<&str>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -109,7 +109,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, visible_count: usiz
 fn draw_body(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     color_enabled: bool,
     visible_count: usize,
 ) {
@@ -130,7 +130,7 @@ fn draw_body(
 fn draw_logs(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     color_enabled: bool,
     visible_count: usize,
 ) {
@@ -138,6 +138,9 @@ fn draw_logs(
         Block::default().style(Style::default().bg(THEME.background)),
         area,
     );
+
+    let viewport_height = area.height as usize;
+    app.sync_log_viewport(viewport_height);
 
     let mut highlight_values = app.filters().property_highlight_values();
     if let Some(query) = app
@@ -148,10 +151,9 @@ fn draw_logs(
     {
         highlight_values.push(query);
     }
-    let viewport_height = area.height as usize;
     let selected = app.selected();
     let visual_range = app.visual_selection_range();
-    let start = selected.saturating_sub(viewport_height.saturating_sub(1));
+    let start = app.log_viewport_start();
     let end = start.saturating_add(viewport_height).min(visible_count);
 
     let mut items = Vec::with_capacity(end.saturating_sub(start));

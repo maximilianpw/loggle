@@ -84,6 +84,7 @@ pub struct App {
     filter_history: Vec<LogFilter>,
     visible_cache: Vec<u64>,
     selected: usize,
+    log_viewport_start: usize,
     visual_anchor: Option<usize>,
     follow: bool,
     paused_backlog: usize,
@@ -117,6 +118,7 @@ impl App {
             filter_history: Vec::new(),
             visible_cache: Vec::new(),
             selected: 0,
+            log_viewport_start: 0,
             visual_anchor: None,
             follow: true,
             paused_backlog: 0,
@@ -169,6 +171,10 @@ impl App {
 
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    pub fn log_viewport_start(&self) -> usize {
+        self.log_viewport_start
     }
 
     pub fn mode(&self) -> &Mode {
@@ -412,6 +418,31 @@ impl App {
     #[cfg(test)]
     pub fn event_at_visible(&self, visible_index: usize) -> Option<&LogEvent> {
         self.visible_event_at(visible_index)
+    }
+
+    pub fn sync_log_viewport(&mut self, viewport_height: usize) {
+        let visible_len = self.visible_count();
+        if viewport_height == 0 || visible_len == 0 {
+            self.log_viewport_start = 0;
+            return;
+        }
+
+        let max_start = visible_len.saturating_sub(viewport_height);
+        if self.follow {
+            self.log_viewport_start = max_start;
+            return;
+        }
+
+        let selected = self.selected.min(visible_len - 1);
+        self.log_viewport_start = self.log_viewport_start.min(max_start);
+
+        if selected < self.log_viewport_start {
+            self.log_viewport_start = selected;
+        } else if selected >= self.log_viewport_start.saturating_add(viewport_height) {
+            self.log_viewport_start = selected.saturating_sub(viewport_height - 1);
+        }
+
+        self.log_viewport_start = self.log_viewport_start.min(max_start);
     }
 
     pub fn move_down(&mut self, amount: usize) {
@@ -1274,6 +1305,57 @@ mod tests {
 
         assert!(app.is_following());
         assert_eq!(app.selected(), 2);
+    }
+
+    #[test]
+    fn moving_up_walks_selection_through_current_log_viewport_first() {
+        let mut app = App::new(10);
+        for index in 0..8 {
+            app.push_line(format!("api | {index}"));
+        }
+
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 7);
+        assert_eq!(app.log_viewport_start(), 4);
+
+        app.move_up(1);
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 6);
+        assert_eq!(app.log_viewport_start(), 4);
+
+        app.move_up(2);
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 4);
+        assert_eq!(app.log_viewport_start(), 4);
+
+        app.move_up(1);
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 3);
+        assert_eq!(app.log_viewport_start(), 3);
+    }
+
+    #[test]
+    fn moving_down_walks_selection_through_current_log_viewport_first() {
+        let mut app = App::new(10);
+        for index in 0..8 {
+            app.push_line(format!("api | {index}"));
+        }
+
+        app.sync_log_viewport(4);
+        app.move_up(3);
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 4);
+        assert_eq!(app.log_viewport_start(), 4);
+
+        app.move_down(2);
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 6);
+        assert_eq!(app.log_viewport_start(), 4);
+
+        app.move_down(1);
+        app.sync_log_viewport(4);
+        assert_eq!(app.selected(), 7);
+        assert_eq!(app.log_viewport_start(), 4);
     }
 
     #[test]
