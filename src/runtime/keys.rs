@@ -17,6 +17,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyO
         Mode::Prompt(_) => handle_prompt_key(app, key),
         Mode::Palette => handle_palette_key(app, key, half_page),
         Mode::Dialog(kind) => handle_dialog_key(app, *kind, key, half_page),
+        Mode::Visual => handle_visual_key(app, key, half_page),
         Mode::Normal => handle_normal_key(app, key, half_page),
     }
 }
@@ -48,6 +49,9 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('G'), _) => return execute_command(app, CommandAction::JumpBottom),
         (KeyCode::Enter, _) => return execute_command(app, CommandAction::ToggleDetails),
         (KeyCode::Char('y'), _) => return execute_command(app, CommandAction::CopySelectedLine),
+        (KeyCode::Char('v'), _) => {
+            return execute_command(app, CommandAction::StartVisualSelection);
+        }
         (KeyCode::Char('/'), _) => return execute_command(app, CommandAction::Search),
         (KeyCode::Char('s'), _) => return execute_command(app, CommandAction::SourceFilter),
         (KeyCode::Char('l'), _) => return execute_command(app, CommandAction::LevelFilter),
@@ -73,6 +77,22 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('N'), _) => return execute_command(app, CommandAction::PreviousMatch),
         (KeyCode::Char('?'), _) => app.toggle_palette(),
         (KeyCode::Esc, _) => app.clear_transient(),
+        _ => app.clear_transient(),
+    }
+
+    KeyOutcome::Continue
+}
+
+fn handle_visual_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), _) => return copy_outcome(app.yank_visual_selection()),
+        (KeyCode::Esc, _) | (KeyCode::Char('v'), _) => app.cancel_visual_selection(),
+        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_down(1),
+        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_up(1),
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.move_down(half_page),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.move_up(half_page),
+        (KeyCode::Char('g'), _) => app.handle_g(),
+        (KeyCode::Char('G'), _) => app.move_to_last_visible(),
         _ => app.clear_transient(),
     }
 
@@ -142,6 +162,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::LevelFilter => app.start_prompt(PromptKind::Level),
         CommandAction::ToggleDetails => app.toggle_details(),
         CommandAction::CopySelectedLine => return copy_outcome(app.yank_selected_line()),
+        CommandAction::StartVisualSelection => app.start_visual_selection(),
         CommandAction::PreviousProperty => app.previous_property(),
         CommandAction::NextProperty => app.next_property(),
         CommandAction::FollowProperty => app.follow_selected_property(),
@@ -335,6 +356,52 @@ mod tests {
             }
         );
         assert_eq!(app.mode(), &Mode::Normal);
+    }
+
+    #[test]
+    fn normal_mode_v_starts_visual_selection() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+
+        handle_key(&mut app, key(KeyCode::Char('v')), 5);
+
+        assert_eq!(app.mode(), &Mode::Visual);
+        assert_eq!(app.visual_selection_range(), Some((0, 0)));
+    }
+
+    #[test]
+    fn visual_mode_y_copies_range_and_returns_to_normal() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("worker | INFO three".to_string());
+        app.jump_top();
+        app.start_visual_selection();
+
+        handle_key(&mut app, key(KeyCode::Char('j')), 5);
+        let outcome = handle_key(&mut app, key(KeyCode::Char('y')), 5);
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::Copy {
+                text: "api | INFO one\nweb | INFO two".to_string(),
+                line_count: 2
+            }
+        );
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.visual_selection_range(), None);
+    }
+
+    #[test]
+    fn visual_mode_escape_cancels_selection() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.start_visual_selection();
+
+        handle_key(&mut app, key(KeyCode::Esc), 5);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.visual_selection_range(), None);
     }
 
     #[test]

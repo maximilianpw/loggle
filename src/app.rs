@@ -35,6 +35,7 @@ pub enum DialogKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    Visual,
     Prompt(PromptKind),
     Palette,
     Dialog(DialogKind),
@@ -83,6 +84,7 @@ pub struct App {
     filter_history: Vec<LogFilter>,
     visible_cache: Vec<u64>,
     selected: usize,
+    visual_anchor: Option<usize>,
     follow: bool,
     paused_backlog: usize,
     marked_sequences: Vec<u64>,
@@ -115,6 +117,7 @@ impl App {
             filter_history: Vec::new(),
             visible_cache: Vec::new(),
             selected: 0,
+            visual_anchor: None,
             follow: true,
             paused_backlog: 0,
             marked_sequences: Vec::new(),
@@ -331,6 +334,26 @@ impl App {
         self.visible_event_at(self.selected)
     }
 
+    pub fn visual_selection_range(&self) -> Option<(usize, usize)> {
+        if self.mode != Mode::Visual || self.visible_count() == 0 {
+            return None;
+        }
+
+        let anchor = self.visual_anchor?;
+        let selected = self.selected.min(self.visible_count() - 1);
+        Some(if anchor <= selected {
+            (anchor, selected)
+        } else {
+            (selected, anchor)
+        })
+    }
+
+    pub fn visual_selected_count(&self) -> usize {
+        self.visual_selection_range()
+            .map(|(start, end)| end - start + 1)
+            .unwrap_or_default()
+    }
+
     pub fn selected_property(&self) -> Option<&LogProperty> {
         self.selected_event()
             .and_then(|event| event.properties.get(self.selected_property))
@@ -417,6 +440,13 @@ impl App {
         self.sync_selected_property();
     }
 
+    pub fn move_to_last_visible(&mut self) {
+        self.follow = false;
+        self.pending_g = false;
+        self.selected = self.visible_count().saturating_sub(1);
+        self.sync_selected_property();
+    }
+
     pub fn jump_bottom(&mut self) {
         self.follow = true;
         self.paused_backlog = 0;
@@ -450,6 +480,7 @@ impl App {
             PromptKind::EditPropertyFilter => String::new(),
         };
         self.editing_property_filter = None;
+        self.visual_anchor = None;
         self.mode = Mode::Prompt(kind);
     }
 
@@ -464,6 +495,7 @@ impl App {
 
         self.prompt = predicate.summary_for(row.id.exclude);
         self.editing_property_filter = Some(row.id);
+        self.visual_anchor = None;
         self.mode = Mode::Prompt(PromptKind::EditPropertyFilter);
         self.pending_g = false;
     }
@@ -472,6 +504,7 @@ impl App {
         self.mode = Mode::Palette;
         self.prompt.clear();
         self.pending_g = false;
+        self.visual_anchor = None;
         self.sync_palette_selection();
     }
 
@@ -500,6 +533,7 @@ impl App {
         self.mode = Mode::Dialog(kind);
         self.prompt.clear();
         self.pending_g = false;
+        self.visual_anchor = None;
         if kind == DialogKind::PropertyFilters {
             self.editing_property_filter = None;
         }
@@ -583,11 +617,40 @@ impl App {
         self.pending_g = false;
     }
 
+    pub fn start_visual_selection(&mut self) {
+        let visible_len = self.visible_count();
+        if visible_len == 0 {
+            self.visual_anchor = None;
+            self.pending_g = false;
+            return;
+        }
+
+        self.follow = false;
+        self.pending_g = false;
+        self.selected = self.selected.min(visible_len - 1);
+        self.visual_anchor = Some(self.selected);
+        self.mode = Mode::Visual;
+    }
+
+    pub fn cancel_visual_selection(&mut self) {
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+        self.pending_g = false;
+    }
+
     pub fn yank_selected_line(&self) -> Option<YankedLines> {
         self.selected_event().map(|event| YankedLines {
             text: event.raw.clone(),
             line_count: 1,
         })
+    }
+
+    pub fn yank_visual_selection(&mut self) -> Option<YankedLines> {
+        let yanked = self
+            .visual_selection_range()
+            .and_then(|(start, end)| self.yank_visible_range(start, end));
+        self.cancel_visual_selection();
+        yanked
     }
 
     pub fn apply_prompt(&mut self) {
@@ -811,6 +874,7 @@ impl App {
             self.selected = self.selected.min(visible_len - 1);
         }
         self.sync_selected_property();
+        self.sync_visual_anchor();
     }
 
     fn apply_buffer_change(&mut self, change: BufferChange) {
@@ -897,6 +961,35 @@ impl App {
         } else {
             self.selected_property = self.selected_property.min(property_len - 1);
         }
+    }
+
+    fn sync_visual_anchor(&mut self) {
+        if self.mode != Mode::Visual {
+            self.visual_anchor = None;
+            return;
+        }
+
+        let visible_len = self.visible_count();
+        if visible_len == 0 {
+            self.visual_anchor = None;
+            self.selected = 0;
+        } else if let Some(anchor) = self.visual_anchor.as_mut() {
+            *anchor = (*anchor).min(visible_len - 1);
+        } else {
+            self.visual_anchor = Some(self.selected.min(visible_len - 1));
+        }
+    }
+
+    fn yank_visible_range(&self, start: usize, end: usize) -> Option<YankedLines> {
+        let lines = (start..=end)
+            .filter_map(|visible_index| self.visible_event_at(visible_index))
+            .map(|event| event.raw.as_str())
+            .collect::<Vec<_>>();
+
+        (!lines.is_empty()).then(|| YankedLines {
+            text: lines.join("\n"),
+            line_count: lines.len(),
+        })
     }
 
     fn remember_filter_change(&mut self, previous_filters: LogFilter) {
@@ -1450,6 +1543,72 @@ mod tests {
 
         assert_eq!(yanked.text, "web | WARN two");
         assert_eq!(yanked.line_count, 1);
+    }
+
+    #[test]
+    fn visual_selection_yanks_selected_visible_range() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("worker | INFO three".to_string());
+        app.jump_top();
+
+        app.start_visual_selection();
+        app.move_down(2);
+        let yanked = app.yank_visual_selection().unwrap();
+
+        assert_eq!(
+            yanked.text,
+            "api | INFO one\nweb | INFO two\nworker | INFO three"
+        );
+        assert_eq!(yanked.line_count, 3);
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.visual_selection_range(), None);
+    }
+
+    #[test]
+    fn visual_selection_range_handles_upward_selection() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("worker | INFO three".to_string());
+
+        app.start_visual_selection();
+        app.move_up(2);
+
+        assert_eq!(app.visual_selection_range(), Some((0, 2)));
+        assert_eq!(app.visual_selected_count(), 3);
+    }
+
+    #[test]
+    fn visual_selection_yanks_filtered_visible_rows_only() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("api | ERROR three".to_string());
+        app.start_prompt(PromptKind::Level);
+        for ch in "error".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+        app.jump_top();
+
+        app.start_visual_selection();
+        app.move_down(1);
+        let yanked = app.yank_visual_selection().unwrap();
+
+        assert_eq!(yanked.text, "api | ERROR one\napi | ERROR three");
+        assert_eq!(yanked.line_count, 2);
+    }
+
+    #[test]
+    fn visual_selection_does_not_start_without_visible_rows() {
+        let mut app = App::new(10);
+
+        app.start_visual_selection();
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.yank_selected_line(), None);
     }
 
     #[test]

@@ -244,6 +244,7 @@ Press `?` to open the in-app command palette:
 - `n` / `N`: next/previous search match
 - `Space` or `p`: pause/resume following
 - `y`: copy the selected raw log line to the clipboard
+- `v`: start visual-line selection; move with `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u`, `gg`, or `G`; `y` copies the selected lines and `Esc` cancels
 
 ### Filtering
 

@@ -150,15 +150,18 @@ fn draw_logs(
     }
     let viewport_height = area.height as usize;
     let selected = app.selected();
+    let visual_range = app.visual_selection_range();
     let start = selected.saturating_sub(viewport_height.saturating_sub(1));
     let end = start.saturating_add(viewport_height).min(visible_count);
 
     let mut items = Vec::with_capacity(end.saturating_sub(start));
     app.for_each_visible_event(start, end.saturating_sub(start), |visible_index, event| {
+        let in_visual_range =
+            visual_range.is_some_and(|(start, end)| (start..=end).contains(&visible_index));
         items.push(ListItem::new(row::render_event(
             event,
             color_enabled,
-            visible_index == selected,
+            visible_index == selected || in_visual_range,
             app.is_marked(event.sequence),
             app.message_field_keys(),
             &highlight_values,
@@ -233,7 +236,9 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.mode() {
         Mode::Prompt(_) => draw_prompt(frame, area, app),
-        Mode::Normal | Mode::Palette | Mode::Dialog(_) => status::draw_status(frame, area, app),
+        Mode::Normal | Mode::Visual | Mode::Palette | Mode::Dialog(_) => {
+            status::draw_status(frame, area, app)
+        }
     }
 }
 
@@ -408,7 +413,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Prompt(PromptKind::IncludeProperty) => "show prop: ",
         Mode::Prompt(PromptKind::ExcludeProperty) => "hide prop: ",
         Mode::Prompt(PromptKind::EditPropertyFilter) => "edit prop: ",
-        Mode::Normal | Mode::Palette | Mode::Dialog(_) => "",
+        Mode::Normal | Mode::Visual | Mode::Palette | Mode::Dialog(_) => "",
     };
     let base = Style::default().fg(THEME.text).bg(THEME.panel_alt);
     let prompt = Line::from(vec![

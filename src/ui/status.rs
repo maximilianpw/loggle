@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::App,
+    app::{App, Mode},
     filter::LogFilter,
 };
 
@@ -57,11 +57,28 @@ fn app_status_segments(app: &App, width: u16) -> Vec<StatusSegment> {
         return notice_segments(notice, width);
     }
 
+    if app.mode() == &Mode::Visual {
+        return visual_segments(app);
+    }
+
     status_segments(app.filters(), width)
 }
 
 fn notice_segments(notice: &str, width: u16) -> Vec<StatusSegment> {
     vec![base(" "), value(truncate_tail(notice, width as usize))]
+}
+
+fn visual_segments(app: &App) -> Vec<StatusSegment> {
+    let count = app.visual_selected_count();
+    vec![
+        base(" visual "),
+        value(line_count_label(count)),
+        base("  "),
+        key("y"),
+        base(" copy  "),
+        key("Esc"),
+        base(" cancel"),
+    ]
 }
 
 fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
@@ -89,6 +106,14 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
 
     append_help(&mut segments, help);
     segments
+}
+
+fn line_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{count} lines")
+    }
 }
 
 fn value_limits(width: u16, help: HelpVariant) -> (usize, usize, usize, usize) {

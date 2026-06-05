@@ -5,6 +5,7 @@ pub enum CommandAction {
     LevelFilter,
     ToggleDetails,
     CopySelectedLine,
+    StartVisualSelection,
     PreviousProperty,
     NextProperty,
     FollowProperty,
@@ -66,6 +67,12 @@ pub const COMMANDS: &[Command] = &[
         label: "Copy line",
         description: "Copy the selected raw log line to the clipboard",
         action: CommandAction::CopySelectedLine,
+    },
+    Command {
+        shortcut: "v",
+        label: "Visual copy",
+        description: "Select visible log lines; press y to copy the range",
+        action: CommandAction::StartVisualSelection,
     },
     Command {
         shortcut: "[",
