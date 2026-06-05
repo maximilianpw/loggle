@@ -1,6 +1,10 @@
+mod interpret;
+
 use std::{borrow::Cow, fmt};
 
 use serde_json::{Map, Value};
+
+pub(crate) use interpret::LogInterpreter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {

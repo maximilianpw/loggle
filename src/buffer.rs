@@ -1,9 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::model::{
-    LogEvent, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig,
-    message_without_source_prefix, parse_compose_line, parse_property_block_header,
-    parse_property_object,
+    LogEvent, LogInterpreter, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig,
 };
 
 #[derive(Debug)]
@@ -15,6 +13,7 @@ pub struct LogBuffer {
     completed_property_blocks: VecDeque<CompletedPropertyBlock>,
     active_source: Option<String>,
     source_config: SourceConfig,
+    interpreter: LogInterpreter,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -55,6 +54,7 @@ impl LogBuffer {
             completed_property_blocks: VecDeque::new(),
             active_source: None,
             source_config,
+            interpreter: LogInterpreter,
         }
     }
 
@@ -64,7 +64,7 @@ impl LogBuffer {
             return change;
         }
 
-        if let Some(header) = parse_property_block_header(&line) {
+        if let Some(header) = self.interpreter.property_block_header(&line) {
             if let Some(target_sequence) = self.property_target_sequence(&header) {
                 self.pending_properties = Some(PendingPropertyBlock::new(target_sequence, None));
                 return change;
@@ -84,7 +84,7 @@ impl LogBuffer {
     }
 
     fn push_event(&mut self, line: String, change: &mut BufferChange) -> Option<u64> {
-        let mut parsed = parse_compose_line(&line);
+        let mut parsed = self.interpreter.parse_source_line(&line);
         self.apply_source_context(&mut parsed);
 
         if self.capacity == 0 {
@@ -99,8 +99,12 @@ impl LogBuffer {
         }
 
         let sequence = self.next_sequence;
-        let mut event = LogEvent::from_parsed_line(self.next_sequence, line, parsed);
-        Self::promote_source(&self.source_config, &mut event);
+        let event = self.interpreter.event_from_source_line(
+            self.next_sequence,
+            line,
+            parsed,
+            &self.source_config,
+        );
         self.next_sequence += 1;
         self.events.push_back(event);
         change.appended = Some(sequence);
@@ -153,18 +157,17 @@ impl LogBuffer {
         pending: PendingPropertyBlock,
         change: &mut BufferChange,
     ) {
-        let Some(properties) = parse_property_object(&pending.lines.join("\n")) else {
+        let Some(properties) = self.interpreter.property_object(&pending.lines.join("\n")) else {
             return;
         };
 
-        let source_config = self.source_config.clone();
         if let Some(event) = self
             .events
             .iter_mut()
             .find(|event| event.sequence == pending.target_sequence)
         {
-            event.set_properties(properties.clone());
-            Self::promote_source(&source_config, event);
+            self.interpreter
+                .apply_properties(event, properties.clone(), &self.source_config);
             change.updated.push(pending.target_sequence);
         }
 
@@ -199,15 +202,14 @@ impl LogBuffer {
             return;
         };
         let target_sequence = event.sequence;
-        let source_config = self.source_config.clone();
 
         if let Some(event) = self
             .events
             .iter_mut()
             .find(|event| event.sequence == target_sequence)
         {
-            event.set_properties(block.properties);
-            Self::promote_source(&source_config, event);
+            self.interpreter
+                .apply_properties(event, block.properties, &self.source_config);
             change.updated.push(target_sequence);
         }
 
@@ -225,27 +227,6 @@ impl LogBuffer {
     fn trim_completed_property_blocks(&mut self) {
         while self.completed_property_blocks.len() > self.capacity {
             self.completed_property_blocks.pop_front();
-        }
-    }
-
-    fn promote_source(source_config: &SourceConfig, event: &mut LogEvent) {
-        if event.source != "unknown" {
-            return;
-        }
-
-        for field in source_config.fields() {
-            let Some(source) = event
-                .property(field)
-                .map(|property| property.value.as_display_str())
-            else {
-                continue;
-            };
-
-            let source = source.trim();
-            if !source.is_empty() {
-                event.source = source.to_string();
-                return;
-            }
         }
     }
 
@@ -343,7 +324,7 @@ impl PendingPropertyBlock {
     }
 
     fn push_line(&mut self, line: &str) -> bool {
-        let line = message_without_source_prefix(line);
+        let line = LogInterpreter.message_without_source_prefix(line);
         let trimmed = line.trim();
         if !self.saw_open && !trimmed.is_empty() && !trimmed.starts_with('{') {
             return false;
