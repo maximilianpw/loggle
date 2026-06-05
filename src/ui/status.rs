@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Mode},
+    commands::{status_help_items, CommandHelpItem, CommandHelpLevel},
     filter::LogFilter,
 };
 
@@ -151,41 +152,30 @@ fn help_variant(width: u16) -> HelpVariant {
 
 fn append_help(segments: &mut Vec<StatusSegment>, help: HelpVariant) {
     match help {
-        HelpVariant::Full => {
-            segments.extend([
-                base("   "),
-                key("q"),
-                base(" quit  "),
-                key("/"),
-                base(" search  "),
-                key("s"),
-                base(" source  "),
-                key("l"),
-                base(" level  "),
-                key("Enter"),
-                base(" details  "),
-                key("P"),
-                base(" props  "),
-                key("c"),
-                base(" clear  "),
-                key("?"),
-                base(" commands"),
-            ]);
-        }
+        HelpVariant::Full => append_help_items(segments, status_help_items(CommandHelpLevel::Full)),
         HelpVariant::Compact => {
-            segments.extend([
-                base("   "),
-                key("q"),
-                base(" quit  "),
-                key("/"),
-                base(" search  "),
-                key("c"),
-                base(" clear  "),
-                key("?"),
-                base(" commands"),
-            ]);
+            append_help_items(segments, status_help_items(CommandHelpLevel::Compact));
         }
         HelpVariant::None => {}
+    }
+}
+
+fn append_help_items(
+    segments: &mut Vec<StatusSegment>,
+    items: impl IntoIterator<Item = CommandHelpItem>,
+) {
+    let mut items = items.into_iter().peekable();
+    if items.peek().is_none() {
+        return;
+    }
+
+    segments.push(base("   "));
+    for (index, item) in items.enumerate() {
+        if index > 0 {
+            segments.push(base("  "));
+        }
+        segments.push(key(item.shortcut));
+        segments.push(base(format!(" {}", item.label)));
     }
 }
 

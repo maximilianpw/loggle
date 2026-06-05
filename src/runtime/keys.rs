@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{App, DialogKind, Mode, PromptKind, YankedLines};
-use crate::commands::CommandAction;
+use crate::commands::{normal_action_for_key, CommandAction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum KeyOutcome {
@@ -40,44 +40,19 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) -> KeyOutcome {
 
 fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) => return execute_command(app, CommandAction::Quit),
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_down(1),
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_up(1),
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.move_down(half_page),
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.move_up(half_page),
         (KeyCode::Char('g'), _) => app.handle_g(),
-        (KeyCode::Char('G'), _) => return execute_command(app, CommandAction::JumpBottom),
-        (KeyCode::Enter, _) => return execute_command(app, CommandAction::ToggleDetails),
-        (KeyCode::Char('y'), _) => return execute_command(app, CommandAction::CopySelectedLine),
-        (KeyCode::Char('v'), _) => {
-            return execute_command(app, CommandAction::StartVisualSelection);
-        }
-        (KeyCode::Char('/'), _) => return execute_command(app, CommandAction::Search),
-        (KeyCode::Char('s'), _) => return execute_command(app, CommandAction::SourceFilter),
-        (KeyCode::Char('l'), _) => return execute_command(app, CommandAction::LevelFilter),
-        (KeyCode::Char('+'), _) => return execute_command(app, CommandAction::IncludeProperty),
-        (KeyCode::Char('-'), _) => return execute_command(app, CommandAction::ExcludeProperty),
-        (KeyCode::Char('f'), _) => return execute_command(app, CommandAction::FollowProperty),
-        (KeyCode::Char('m'), _) => return execute_command(app, CommandAction::AddMessageField),
-        (KeyCode::Char('M'), _) => return execute_command(app, CommandAction::MessageFields),
-        (KeyCode::Char('P'), _) => return execute_command(app, CommandAction::PropertyFilters),
-        (KeyCode::Char(']'), _) => return execute_command(app, CommandAction::NextProperty),
-        (KeyCode::Char('['), _) => return execute_command(app, CommandAction::PreviousProperty),
-        (KeyCode::Char('c'), _) => return execute_command(app, CommandAction::ClearFilters),
-        (KeyCode::Char('u'), _) => return execute_command(app, CommandAction::UndoFilterChange),
-        (KeyCode::Char('S'), _) => return execute_command(app, CommandAction::SaveFilterPreset),
-        (KeyCode::Char('V'), _) => return execute_command(app, CommandAction::FilterPresets),
-        (KeyCode::Char('e'), _) => return execute_command(app, CommandAction::ExportVisibleLogs),
-        (KeyCode::Char('T'), _) => return execute_command(app, CommandAction::ToggleMarker),
-        (KeyCode::Char('O'), _) => return execute_command(app, CommandAction::Sources),
-        (KeyCode::Char(' '), _) | (KeyCode::Char('p'), _) => {
-            return execute_command(app, CommandAction::ToggleFollow);
-        }
-        (KeyCode::Char('n'), _) => return execute_command(app, CommandAction::NextMatch),
-        (KeyCode::Char('N'), _) => return execute_command(app, CommandAction::PreviousMatch),
         (KeyCode::Char('?'), _) => app.toggle_palette(),
         (KeyCode::Esc, _) => app.clear_transient(),
-        _ => app.clear_transient(),
+        _ => {
+            if let Some(action) = normal_action_for_key(key) {
+                return execute_command(app, action);
+            }
+            app.clear_transient();
+        }
     }
 
     KeyOutcome::Continue
