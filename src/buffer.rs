@@ -492,6 +492,31 @@ mod tests {
     }
 
     #[test]
+    fn promotes_source_field_from_json_properties() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line(
+            r#"{"level":"info","message":"ready","service":"vev-mcp","module":"Function"}"#
+                .to_string(),
+        );
+
+        assert_eq!(sources(&buffer), vec!["vev-mcp"]);
+        assert_eq!(buffer.events()[0].message, "ready");
+    }
+
+    #[test]
+    fn promotes_source_field_from_embedded_json_log_properties() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line(
+            r#"{"log":"{\"level\":\"info\",\"message\":\"ready\",\"service\":\"vev-mcp\"}\n","stream":"stdout","time":"2026-06-04T13:00:20Z"}"#.to_string(),
+        );
+
+        assert_eq!(sources(&buffer), vec!["vev-mcp"]);
+        assert_eq!(buffer.events()[0].message, "ready");
+    }
+
+    #[test]
     fn promotes_configured_source_fields_before_default_fields() {
         let mut buffer = LogBuffer::with_source_config(10, source_config(&["logger", "service"]));
 
