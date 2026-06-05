@@ -10,7 +10,9 @@ use std::{
 
 use crate::buffer::{BufferChange, LogBuffer};
 use crate::commands::{Command, COMMANDS};
-use crate::filter::{LogFilter, PropertyFilterId, PropertyFilterUpdate, PropertyPredicate};
+use crate::filter::{
+    FilterEdit, FilterPresetRow, FilterWorkflow, LogFilter, PropertyFilterId, PropertyFilterRow,
+};
 use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
 
 use list_state::SearchableListState;
@@ -44,26 +46,6 @@ pub enum Mode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PropertyFilterRow {
-    pub id: PropertyFilterId,
-    pub kind: &'static str,
-    pub summary: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterPresetRow {
-    pub index: usize,
-    pub name: String,
-    pub summary: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FilterPreset {
-    name: String,
-    filters: LogFilter,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceStatusRow {
     pub source: String,
     pub count: usize,
@@ -82,8 +64,7 @@ pub struct YankedLines {
 #[derive(Debug)]
 pub struct App {
     buffer: LogBuffer,
-    filters: LogFilter,
-    filter_history: Vec<LogFilter>,
+    filter_workflow: FilterWorkflow,
     visible: VisibleLogView,
     visual_anchor: Option<usize>,
     marked_sequences: Vec<u64>,
@@ -98,7 +79,6 @@ pub struct App {
     editing_property_filter: Option<PropertyFilterId>,
     message_field_keys: Vec<String>,
     message_fields: SearchableListState,
-    filter_presets: Vec<FilterPreset>,
     filter_preset_list: SearchableListState,
     sources: SearchableListState,
 }
@@ -112,8 +92,7 @@ impl App {
     pub fn with_source_config(buffer_lines: usize, source_config: SourceConfig) -> Self {
         Self {
             buffer: LogBuffer::with_source_config(buffer_lines, source_config),
-            filters: LogFilter::default(),
-            filter_history: Vec::new(),
+            filter_workflow: FilterWorkflow::default(),
             visible: VisibleLogView::new(),
             visual_anchor: None,
             marked_sequences: Vec::new(),
@@ -128,7 +107,6 @@ impl App {
             editing_property_filter: None,
             message_field_keys: Vec::new(),
             message_fields: SearchableListState::default(),
-            filter_presets: Vec::new(),
             filter_preset_list: SearchableListState::default(),
             sources: SearchableListState::default(),
         }
@@ -210,10 +188,7 @@ impl App {
 
     pub fn property_filter_rows(&self) -> Vec<PropertyFilterRow> {
         let query = self.property_filters.query().trim();
-        self.all_property_filter_rows()
-            .into_iter()
-            .filter(|row| property_filter_row_matches(row, query))
-            .collect()
+        self.filter_workflow.property_filter_rows(query)
     }
 
     pub fn selected_property_filter_row(&self) -> Option<PropertyFilterRow> {
@@ -245,20 +220,7 @@ impl App {
 
     pub fn filter_preset_rows(&self) -> Vec<FilterPresetRow> {
         let query = self.filter_preset_list.query().trim();
-        self.filter_presets
-            .iter()
-            .enumerate()
-            .map(|(index, preset)| FilterPresetRow {
-                index,
-                name: preset.name.clone(),
-                summary: filter_summary(&preset.filters),
-            })
-            .filter(|row| {
-                query.is_empty()
-                    || crate::filter::contains_ignore_ascii_case(&row.name, query)
-                    || crate::filter::contains_ignore_ascii_case(&row.summary, query)
-            })
-            .collect()
+        self.filter_workflow.filter_preset_rows(query)
     }
 
     pub fn selected_filter_preset_row(&self) -> Option<FilterPresetRow> {
@@ -311,12 +273,17 @@ impl App {
     }
 
     pub fn filters(&self) -> &LogFilter {
-        &self.filters
+        self.filter_workflow.filters()
     }
 
     #[cfg(test)]
     pub fn filter_history_len(&self) -> usize {
-        self.filter_history.len()
+        self.filter_workflow.history_len()
+    }
+
+    #[cfg(test)]
+    fn filters_mut(&mut self) -> &mut LogFilter {
+        self.filter_workflow.filters_mut()
     }
 
     pub fn details_open(&self) -> bool {
@@ -328,7 +295,8 @@ impl App {
     }
 
     pub fn selected_event(&self) -> Option<&LogEvent> {
-        self.visible.selected_event(&self.buffer, &self.filters)
+        self.visible
+            .selected_event(&self.buffer, self.filter_workflow.filters())
     }
 
     pub fn visual_selection_range(&self) -> Option<(usize, usize)> {
@@ -357,12 +325,13 @@ impl App {
     }
 
     pub fn visible_count(&self) -> usize {
-        self.visible.visible_count(&self.buffer, &self.filters)
+        self.visible
+            .visible_count(&self.buffer, self.filter_workflow.filters())
     }
 
     pub fn visible_event_at(&self, visible_index: usize) -> Option<&LogEvent> {
         self.visible
-            .event_at(&self.buffer, &self.filters, visible_index)
+            .event_at(&self.buffer, self.filter_workflow.filters(), visible_index)
     }
 
     pub fn for_each_visible_event<'a>(
@@ -371,8 +340,13 @@ impl App {
         limit: usize,
         visit: impl FnMut(usize, &'a LogEvent),
     ) {
-        self.visible
-            .for_each_visible_event(&self.buffer, &self.filters, start, limit, visit);
+        self.visible.for_each_visible_event(
+            &self.buffer,
+            self.filter_workflow.filters(),
+            start,
+            limit,
+            visit,
+        );
     }
 
     #[cfg(test)]
@@ -382,11 +356,12 @@ impl App {
 
     pub fn sync_log_viewport(&mut self, viewport_height: usize) {
         self.visible
-            .sync_viewport(&self.buffer, &self.filters, viewport_height);
+            .sync_viewport(&self.buffer, self.filter_workflow.filters(), viewport_height);
     }
 
     pub fn move_down(&mut self, amount: usize) {
-        self.visible.move_down(&self.buffer, &self.filters, amount);
+        self.visible
+            .move_down(&self.buffer, self.filter_workflow.filters(), amount);
         self.pending_g = false;
         self.sync_selected_property();
     }
@@ -404,38 +379,31 @@ impl App {
     }
 
     pub fn move_to_last_visible(&mut self) {
-        self.visible.move_to_last_visible(&self.buffer, &self.filters);
+        self.visible
+            .move_to_last_visible(&self.buffer, self.filter_workflow.filters());
         self.pending_g = false;
         self.sync_selected_property();
     }
 
     pub fn jump_bottom(&mut self) {
-        self.visible.jump_bottom(&self.buffer, &self.filters);
+        self.visible
+            .jump_bottom(&self.buffer, self.filter_workflow.filters());
         self.pending_g = false;
         self.sync_selection();
     }
 
     pub fn toggle_follow(&mut self) {
         self.pending_g = false;
-        self.visible.toggle_follow(&self.buffer, &self.filters);
+        self.visible
+            .toggle_follow(&self.buffer, self.filter_workflow.filters());
     }
 
     pub fn start_prompt(&mut self, kind: PromptKind) {
         self.pending_g = false;
-        self.prompt = match kind {
-            PromptKind::Text => self.filters.text.clone().unwrap_or_default(),
-            PromptKind::Source => self.filters.source.clone().unwrap_or_default(),
-            PromptKind::Level => self
-                .filters
-                .level
-                .map(|level| level.to_string())
-                .unwrap_or_default(),
-            PromptKind::IncludeProperty | PromptKind::ExcludeProperty => self
-                .selected_property()
-                .map(property_prompt_value)
-                .unwrap_or_default(),
-            PromptKind::EditPropertyFilter => String::new(),
-        };
+        let property = self.selected_property().cloned();
+        self.prompt = self
+            .filter_workflow
+            .prompt_value(filter_edit(kind), property.as_ref());
         self.editing_property_filter = None;
         self.visual_anchor = None;
         self.mode = Mode::Prompt(kind);
@@ -445,7 +413,7 @@ impl App {
         let Some(row) = self.selected_property_filter_row() else {
             return;
         };
-        let Some(predicate) = self.filters.property_filter(row.id) else {
+        let Some(predicate) = self.filter_workflow.property_filter(row.id) else {
             self.sync_property_filter_selection();
             return;
         };
@@ -577,7 +545,7 @@ impl App {
     pub fn start_visual_selection(&mut self) {
         let Some(anchor) = self
             .visible
-            .start_visual_selection(&self.buffer, &self.filters)
+            .start_visual_selection(&self.buffer, self.filter_workflow.filters())
         else {
             self.visual_anchor = None;
             self.pending_g = false;
@@ -615,38 +583,11 @@ impl App {
             return;
         };
 
-        let value = self.prompt.trim().to_string();
-        let previous_filters = self.filters.clone();
-        match kind {
-            PromptKind::Text => self.filters.text = (!value.is_empty()).then_some(value),
-            PromptKind::Source => self.filters.source = (!value.is_empty()).then_some(value),
-            PromptKind::Level => {
-                self.filters.level = if value.is_empty() {
-                    None
-                } else {
-                    Level::parse(&value)
-                };
-            }
-            PromptKind::IncludeProperty => {
-                if let Some(update) = PropertyFilterUpdate::parse(&value, false) {
-                    self.filters.add_property_filter(update);
-                }
-            }
-            PromptKind::ExcludeProperty => {
-                if let Some(update) = PropertyFilterUpdate::parse(&value, true) {
-                    self.filters.add_property_filter(update);
-                }
-            }
-            PromptKind::EditPropertyFilter => {
-                if let Some(update) = PropertyFilterUpdate::parse(&value, false) {
-                    if let Some(id) = self.editing_property_filter {
-                        self.filters.replace_property_filter(id, update);
-                    }
-                }
-            }
-        }
-
-        self.remember_filter_change(previous_filters);
+        self.filter_workflow.apply_prompt(
+            filter_edit(kind),
+            &self.prompt,
+            self.editing_property_filter,
+        );
         self.sync_visible_cache();
         self.mode = if matches!(kind, PromptKind::EditPropertyFilter) {
             Mode::Dialog(DialogKind::PropertyFilters)
@@ -660,9 +601,7 @@ impl App {
     }
 
     pub fn clear_filters(&mut self) {
-        let previous_filters = self.filters.clone();
-        self.filters.clear();
-        self.remember_filter_change(previous_filters);
+        self.filter_workflow.clear();
         self.sync_visible_cache();
         self.pending_g = false;
         self.sync_selection();
@@ -670,23 +609,7 @@ impl App {
 
     pub fn save_filter_preset(&mut self) {
         self.pending_g = false;
-        if !self.filters.has_active_filters() {
-            return;
-        }
-
-        let preset = FilterPreset {
-            name: format!("Preset {}", self.filter_presets.len() + 1),
-            filters: self.filters.clone(),
-        };
-        if self
-            .filter_presets
-            .iter()
-            .any(|existing| existing.filters == preset.filters)
-        {
-            return;
-        }
-
-        self.filter_presets.push(preset);
+        self.filter_workflow.save_preset();
         self.sync_filter_preset_selection();
     }
 
@@ -733,12 +656,11 @@ impl App {
     }
 
     pub fn undo_filter_change(&mut self) {
-        let Some(filters) = self.filter_history.pop() else {
+        if !self.filter_workflow.undo() {
             self.pending_g = false;
             return;
-        };
+        }
 
-        self.filters = filters;
         self.sync_visible_cache();
         self.pending_g = false;
         self.sync_selection();
@@ -769,17 +691,10 @@ impl App {
 
     pub fn follow_selected_property(&mut self) {
         self.pending_g = false;
-        let Some(property) = self.selected_property() else {
+        let Some(property) = self.selected_property().cloned() else {
             return;
         };
-        let previous_filters = self.filters.clone();
-        let predicate =
-            PropertyPredicate::exact(&property.key, property.value.as_display_str().into_owned());
-        self.filters.add_property_filter(PropertyFilterUpdate {
-            exclude: false,
-            predicate,
-        });
-        self.remember_filter_change(previous_filters);
+        self.filter_workflow.follow_property(&property);
         self.sync_visible_cache();
         self.sync_selection();
     }
@@ -802,13 +717,17 @@ impl App {
 
     fn move_to_search_match(&mut self, forward: bool) {
         self.pending_g = false;
-        self.visible
-            .move_to_search_match(&self.buffer, &self.filters, forward);
+        self.visible.move_to_search_match(
+            &self.buffer,
+            self.filter_workflow.filters(),
+            forward,
+        );
         self.sync_selected_property();
     }
 
     fn sync_selection(&mut self) {
-        self.visible.sync_selection(&self.buffer, &self.filters);
+        self.visible
+            .sync_selection(&self.buffer, self.filter_workflow.filters());
         self.sync_selected_property();
         self.sync_visual_anchor();
     }
@@ -817,12 +736,16 @@ impl App {
         for sequence in &change.removed {
             self.remove_marker(sequence);
         }
-        self.visible
-            .on_line_received(&change, &self.buffer, &self.filters);
+        self.visible.on_line_received(
+            &change,
+            &self.buffer,
+            self.filter_workflow.filters(),
+        );
     }
 
     fn sync_visible_cache(&mut self) {
-        self.visible.on_filters_changed(&self.buffer, &self.filters);
+        self.visible
+            .on_filters_changed(&self.buffer, self.filter_workflow.filters());
     }
 
     fn remove_marker(&mut self, sequence: &u64) {
@@ -876,12 +799,6 @@ impl App {
         })
     }
 
-    fn remember_filter_change(&mut self, previous_filters: LogFilter) {
-        if previous_filters != self.filters {
-            self.filter_history.push(previous_filters);
-        }
-    }
-
     fn dialog_state(&self, kind: DialogKind) -> &SearchableListState {
         match kind {
             DialogKind::PropertyFilters => &self.property_filters,
@@ -923,11 +840,7 @@ impl App {
 
     fn dialog_len_for_query(&self, kind: DialogKind, query: &str) -> usize {
         match kind {
-            DialogKind::PropertyFilters => self
-                .all_property_filter_rows()
-                .into_iter()
-                .filter(|row| property_filter_row_matches(row, query))
-                .count(),
+            DialogKind::PropertyFilters => self.filter_workflow.property_filter_row_count(query),
             DialogKind::MessageFields => self
                 .message_field_keys
                 .iter()
@@ -936,18 +849,7 @@ impl App {
                         || crate::filter::contains_ignore_ascii_case(key.as_str(), query)
                 })
                 .count(),
-            DialogKind::FilterPresets => self
-                .filter_presets
-                .iter()
-                .filter(|preset| {
-                    query.is_empty()
-                        || crate::filter::contains_ignore_ascii_case(&preset.name, query)
-                        || crate::filter::contains_ignore_ascii_case(
-                            &filter_summary(&preset.filters),
-                            query,
-                        )
-                })
-                .count(),
+            DialogKind::FilterPresets => self.filter_workflow.filter_preset_row_count(query),
             DialogKind::Sources => self.source_status_rows_for_query(query).len(),
         }
     }
@@ -978,9 +880,7 @@ impl App {
             return;
         };
 
-        let previous_filters = self.filters.clone();
-        self.filters.remove_property_filter(row.id);
-        self.remember_filter_change(previous_filters);
+        self.filter_workflow.remove_property_filter(row.id);
         self.sync_visible_cache();
         self.sync_property_filter_selection();
         self.sync_selection();
@@ -1004,14 +904,11 @@ impl App {
         let Some(row) = self.selected_filter_preset_row() else {
             return;
         };
-        let Some(preset) = self.filter_presets.get(row.index) else {
+        if !self.filter_workflow.apply_preset(row.index) {
             self.sync_filter_preset_selection();
             return;
-        };
+        }
 
-        let previous_filters = self.filters.clone();
-        self.filters = preset.filters.clone();
-        self.remember_filter_change(previous_filters);
         self.sync_visible_cache();
         self.sync_selection();
         self.close_dialog();
@@ -1021,87 +918,26 @@ impl App {
         let Some(row) = self.selected_filter_preset_row() else {
             return;
         };
-        if row.index < self.filter_presets.len() {
-            self.filter_presets.remove(row.index);
-        }
+        self.filter_workflow.delete_preset(row.index);
         self.sync_filter_preset_selection();
     }
-
-    fn all_property_filter_rows(&self) -> Vec<PropertyFilterRow> {
-        self.filters
-            .property_includes
-            .iter()
-            .enumerate()
-            .map(|(index, predicate)| PropertyFilterRow {
-                id: PropertyFilterId {
-                    exclude: false,
-                    index,
-                },
-                kind: "show",
-                summary: predicate.summary_for(false),
-            })
-            .chain(
-                self.filters
-                    .property_excludes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, predicate)| PropertyFilterRow {
-                        id: PropertyFilterId {
-                            exclude: true,
-                            index,
-                        },
-                        kind: "ignore",
-                        summary: predicate.summary_for(true),
-                    }),
-            )
-            .collect()
-    }
 }
 
-fn property_prompt_value(property: &LogProperty) -> String {
-    format!("{}={}", property.key, property.value)
-}
-
-fn property_filter_row_matches(row: &PropertyFilterRow, query: &str) -> bool {
-    query.is_empty()
-        || crate::filter::contains_ignore_ascii_case(row.kind, query)
-        || crate::filter::contains_ignore_ascii_case(&row.summary, query)
-}
-
-fn filter_summary(filters: &LogFilter) -> String {
-    let mut parts = Vec::new();
-    if let Some(text) = filters.text.as_ref().filter(|text| !text.is_empty()) {
-        parts.push(format!("search={text}"));
-    }
-    if let Some(source) = filters.source.as_ref().filter(|source| !source.is_empty()) {
-        parts.push(format!("source={source}"));
-    }
-    if let Some(level) = filters.level {
-        parts.push(format!("level={level}"));
-    }
-    parts.extend(
-        filters
-            .property_includes
-            .iter()
-            .map(|predicate| format!("show {}", predicate.summary())),
-    );
-    parts.extend(
-        filters
-            .property_excludes
-            .iter()
-            .map(|predicate| format!("hide {}", predicate.exclude_summary())),
-    );
-
-    if parts.is_empty() {
-        "-".to_string()
-    } else {
-        parts.join(", ")
+fn filter_edit(kind: PromptKind) -> FilterEdit {
+    match kind {
+        PromptKind::Text => FilterEdit::Text,
+        PromptKind::Source => FilterEdit::Source,
+        PromptKind::Level => FilterEdit::Level,
+        PromptKind::IncludeProperty => FilterEdit::IncludeProperty,
+        PromptKind::ExcludeProperty => FilterEdit::ExcludeProperty,
+        PromptKind::EditPropertyFilter => FilterEdit::EditPropertyFilter,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::{PropertyFilterUpdate, PropertyPredicate};
 
     #[test]
     fn follow_mode_tracks_bottom_as_lines_arrive() {
@@ -1217,7 +1053,7 @@ mod tests {
         app.push_line("api | ERROR one".to_string());
         app.push_line("api | ok".to_string());
         app.push_line("web | ERROR two".to_string());
-        app.filters.text = Some("error".to_string());
+        app.filters_mut().text = Some("error".to_string());
         app.sync_visible_cache();
         app.jump_top();
 
@@ -1246,7 +1082,7 @@ mod tests {
         app.push_line("web | INFO two".to_string());
         app.push_line("worker | ERROR three".to_string());
         app.push_line("api | ERROR four".to_string());
-        app.filters.level = Some(Level::Error);
+        app.filters_mut().level = Some(Level::Error);
         app.sync_visible_cache();
 
         let mut rows = Vec::new();
@@ -1354,7 +1190,7 @@ mod tests {
         app.follow_selected_property();
 
         assert_eq!(
-            app.filters.property_includes,
+            app.filters().property_includes,
             vec![PropertyPredicate::exact("tenantId", "tenant-1")]
         );
     }
@@ -1683,11 +1519,11 @@ mod tests {
     #[test]
     fn property_filter_dialog_searches_active_filters() {
         let mut app = App::new(10);
-        app.filters.add_property_filter(PropertyFilterUpdate {
+        app.filters_mut().add_property_filter(PropertyFilterUpdate {
             exclude: false,
             predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
         });
-        app.filters.add_property_filter(PropertyFilterUpdate {
+        app.filters_mut().add_property_filter(PropertyFilterUpdate {
             exclude: true,
             predicate: PropertyPredicate::exists("debug"),
         });
@@ -1706,11 +1542,11 @@ mod tests {
     #[test]
     fn deleting_selected_property_filter_removes_it() {
         let mut app = App::new(10);
-        app.filters.add_property_filter(PropertyFilterUpdate {
+        app.filters_mut().add_property_filter(PropertyFilterUpdate {
             exclude: false,
             predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
         });
-        app.filters.add_property_filter(PropertyFilterUpdate {
+        app.filters_mut().add_property_filter(PropertyFilterUpdate {
             exclude: true,
             predicate: PropertyPredicate::exists("debug"),
         });
@@ -1720,10 +1556,10 @@ mod tests {
         app.delete_selected_dialog_row(DialogKind::PropertyFilters);
 
         assert_eq!(
-            app.filters.property_includes,
+            app.filters().property_includes,
             vec![PropertyPredicate::exact("tenantId", "tenant-1")]
         );
-        assert!(app.filters.property_excludes.is_empty());
+        assert!(app.filters().property_excludes.is_empty());
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
         assert_eq!(app.selected_dialog_index(DialogKind::PropertyFilters), 0);
     }
@@ -1731,7 +1567,7 @@ mod tests {
     #[test]
     fn editing_property_filter_replaces_existing_filter() {
         let mut app = App::new(10);
-        app.filters.add_property_filter(PropertyFilterUpdate {
+        app.filters_mut().add_property_filter(PropertyFilterUpdate {
             exclude: false,
             predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
         });
@@ -1749,9 +1585,9 @@ mod tests {
         app.apply_prompt();
 
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
-        assert!(app.filters.property_includes.is_empty());
+        assert!(app.filters().property_includes.is_empty());
         assert_eq!(
-            app.filters.property_excludes,
+            app.filters().property_excludes,
             vec![PropertyPredicate::exact("tenantId", "tenant-2")]
         );
     }

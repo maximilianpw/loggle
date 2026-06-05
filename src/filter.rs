@@ -1,4 +1,8 @@
+mod workflow;
+
 use crate::model::{Level, LogEvent};
+
+pub use workflow::{FilterEdit, FilterPresetRow, FilterWorkflow, PropertyFilterRow};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogFilter {
