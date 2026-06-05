@@ -223,6 +223,12 @@ cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000
 
 `--filter` accepts `none`, `text`, `source`, `level`, or `property`.
 
+Add `--json` to emit machine-readable results with timings in microseconds:
+
+```sh
+cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000 --filter property --json
+```
+
 ## Controls
 
 Press `?` to open the in-app command palette:
