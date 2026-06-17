@@ -12,11 +12,17 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 
-use crate::app::{App, DialogKind, Mode, PromptKind};
+use crate::{LogPageId, app::{App, DialogKind, Mode, PromptKind}};
 
 use theme::THEME;
 
-pub fn draw(frame: &mut Frame<'_>, app: &mut App, color_enabled: bool, closing: Option<&str>) {
+pub fn draw(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    color_enabled: bool,
+    closing: Option<&str>,
+    page_id: Option<&LogPageId>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -33,7 +39,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, color_enabled: bool, closing: 
 
     let visible_count = app.visible_count();
 
-    draw_header(frame, chunks[0], app, visible_count);
+    draw_header(frame, chunks[0], app, visible_count, page_id);
     draw_body(frame, chunks[1], app, color_enabled, visible_count);
     draw_footer(frame, chunks[2], app);
 
@@ -55,7 +61,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, color_enabled: bool, closing: 
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, visible_count: usize) {
+fn draw_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    visible_count: usize,
+    page_id: Option<&LogPageId>,
+) {
     let follow = if app.is_following() {
         "follow"
     } else {
@@ -104,6 +116,35 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, visible_count: usiz
     };
 
     frame.render_widget(Paragraph::new(header).style(style), area);
+
+    if let Some(page_id) = page_id {
+        draw_page_id(frame, area, page_id, style);
+    }
+}
+
+fn draw_page_id(frame: &mut Frame<'_>, area: Rect, page_id: &LogPageId, style: Style) {
+    if area.width < 8 {
+        return;
+    }
+
+    let available = area.width.saturating_sub(5) as usize;
+    let value = text::truncate_tail(page_id.as_str(), available);
+    let label = format!(" id={value} ");
+    let width = (label.len() as u16).min(area.width);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width),
+        y: area.y,
+        width,
+        height: area.height,
+    };
+    let line = Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(THEME.accent)
+            .bg(THEME.panel_alt)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(line).style(style), rect);
 }
 
 fn draw_body(

@@ -10,12 +10,17 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
-use crate::{app::App, model::SourceConfig, ui};
+use crate::{
+    app::App,
+    model::SourceConfig,
+    page_log::{claim_active_log_page, ActiveLogPageRegistration, LogPageId, PageLogRecorder},
+    ui,
+};
 
 use super::{
     clipboard,
@@ -29,6 +34,9 @@ pub(super) fn run(
     color_enabled: bool,
     source_config: SourceConfig,
     record_path: Option<PathBuf>,
+    page_id: Option<LogPageId>,
+    page_command: String,
+    page_logging: bool,
     mut children: Vec<Child>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
@@ -44,6 +52,9 @@ pub(super) fn run(
         color_enabled,
         source_config,
         record_path,
+        page_id,
+        page_command,
+        page_logging,
         &mut children,
     );
 
@@ -67,20 +78,58 @@ fn run_app(
     color_enabled: bool,
     source_config: SourceConfig,
     record_path: Option<PathBuf>,
+    page_id: Option<LogPageId>,
+    page_command: String,
+    page_logging: bool,
     children: &mut Vec<Child>,
 ) -> io::Result<()> {
     let mut app = App::with_source_config(buffer_lines, source_config);
     let mut shutdown: Option<Vec<ChildShutdown>> = None;
     let mut dirty = true;
     let mut recorder = record_path.map(SessionRecorder::create).transpose()?;
+    // The page log is an auxiliary, always-on feature; failures disable it with
+    // a notice rather than tearing down the viewer the user actually asked for.
+    let mut page_recorder = None;
+    let mut page_id_for_header = None;
+    let mut active_page = None;
+    if page_logging {
+        match start_page_log(page_id, &page_command, buffer_lines) {
+            Ok((id, recorder, registration)) => {
+                page_id_for_header = Some(id);
+                page_recorder = Some(recorder);
+                active_page = Some(registration);
+            }
+            Err(error) => app.set_notice(format!("page log disabled: {error}")),
+        }
+    }
+    let _active_page = active_page;
 
     loop {
+        let mut received = false;
         while let Ok(line) = rx.try_recv() {
             if let Some(recorder) = recorder.as_mut() {
                 recorder.record_line(&line)?;
             }
+            if let Some(active_recorder) = page_recorder.as_mut() {
+                if let Err(error) = active_recorder.record_line(&line) {
+                    app.set_notice(format!("page log disabled: {error}"));
+                    page_recorder = None;
+                }
+            }
             app.push_line(line);
+            received = true;
             dirty = true;
+        }
+
+        // Flush once per drain instead of per line, so the read command sees
+        // fresh data without a syscall on every ingested line.
+        if received {
+            if let Some(active_recorder) = page_recorder.as_mut() {
+                if let Err(error) = active_recorder.flush() {
+                    app.set_notice(format!("page log disabled: {error}"));
+                    page_recorder = None;
+                }
+            }
         }
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
@@ -100,7 +149,7 @@ fn run_app(
             }
 
             if all_exited {
-                flush_recorder(&mut recorder)?;
+                flush_recorders(&mut recorder, &mut page_recorder)?;
                 children.clear();
                 return Ok(());
             }
@@ -113,6 +162,7 @@ fn run_app(
                     &mut app,
                     color_enabled,
                     shutdown.as_deref().map(closing_message),
+                    page_id_for_header.as_ref(),
                 )
             })?;
             dirty = false;
@@ -138,7 +188,7 @@ fn run_app(
                     if requested_quit {
                         match shutdown.as_mut() {
                             _ if children.is_empty() => {
-                                flush_recorder(&mut recorder)?;
+                                flush_recorders(&mut recorder, &mut page_recorder)?;
                                 return Ok(());
                             }
                             None => {
@@ -190,9 +240,28 @@ impl SessionRecorder {
     }
 }
 
-fn flush_recorder(recorder: &mut Option<SessionRecorder>) -> io::Result<()> {
+fn start_page_log(
+    page_id: Option<LogPageId>,
+    page_command: &str,
+    buffer_lines: usize,
+) -> io::Result<(LogPageId, PageLogRecorder, ActiveLogPageRegistration)> {
+    let (id, registration) =
+        claim_active_log_page(page_id, page_command).map_err(io::Error::other)?;
+    let recorder = PageLogRecorder::create(&id, buffer_lines).map_err(io::Error::other)?;
+    Ok((id, recorder, registration))
+}
+
+fn flush_recorders(
+    recorder: &mut Option<SessionRecorder>,
+    page_recorder: &mut Option<PageLogRecorder>,
+) -> io::Result<()> {
     if let Some(recorder) = recorder.as_mut() {
         recorder.flush()?;
+    }
+    // Best-effort: a failure flushing the auxiliary page log must not fail the
+    // session's clean shutdown.
+    if let Some(page_recorder) = page_recorder.as_mut() {
+        let _ = page_recorder.flush();
     }
     Ok(())
 }
@@ -233,10 +302,8 @@ mod tests {
 
     #[test]
     fn session_recorder_writes_raw_lines() {
-        let path = std::env::temp_dir().join(format!(
-            "loggle-record-test-{}.log",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("loggle-record-test-{}.log", std::process::id()));
         {
             let mut recorder = SessionRecorder::create(path.clone()).unwrap();
             recorder.record_line("api | one").unwrap();

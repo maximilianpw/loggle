@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, fmt, io, path::PathBuf, process::Child, time::D
 
 use tokio::sync::mpsc;
 
-use crate::model::SourceConfig;
+use crate::{model::SourceConfig, page_log::LogPageId};
 
 pub(crate) use start_plan::StartPlan;
 
@@ -19,6 +19,9 @@ pub struct RuntimeConfig {
     pub source_config: SourceConfig,
     pub input: RuntimeInput,
     pub record_path: Option<PathBuf>,
+    pub page_id: Option<LogPageId>,
+    pub page_command: String,
+    pub page_logging: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +72,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingInput => f.write_str(
-                "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle run --name api -- pnpm start --name web -- pnpm dev\n  loggle start [name]",
+                "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --property tenantId=tenant-1\n  loggle run --name api -- pnpm start --name web -- pnpm dev\n  loggle start [name]",
             ),
             Self::Io(error) => write!(f, "{error}"),
         }
@@ -101,6 +104,9 @@ pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
         config.color_enabled,
         config.source_config,
         config.record_path,
+        config.page_id,
+        config.page_command,
+        config.page_logging,
         children,
     )
     .map_err(RuntimeError::from)

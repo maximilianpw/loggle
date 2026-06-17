@@ -46,10 +46,20 @@ impl LogBuffer {
     }
 
     pub fn with_source_config(capacity: usize, source_config: SourceConfig) -> Self {
+        Self::build(capacity, VecDeque::with_capacity(capacity), source_config)
+    }
+
+    pub(crate) fn unbounded_with_source_config(source_config: SourceConfig) -> Self {
+        // `VecDeque::with_capacity(usize::MAX)` would abort, so the unbounded
+        // buffer starts empty and grows on demand.
+        Self::build(usize::MAX, VecDeque::new(), source_config)
+    }
+
+    fn build(capacity: usize, events: VecDeque<LogEvent>, source_config: SourceConfig) -> Self {
         Self {
             capacity,
             next_sequence: 0,
-            events: VecDeque::with_capacity(capacity),
+            events,
             pending_properties: None,
             completed_property_blocks: VecDeque::new(),
             active_source: None,

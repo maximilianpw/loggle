@@ -91,6 +91,11 @@ Then run it from any Compose project:
 ```sh
 loggle dc
 loggle -- docker compose up
+loggle pages
+loggle log -i 1 -n 5
+loggle log -i 1 -n 5 --service api
+loggle log -i 1 -n 5 --property requestId=716d1e62
+loggle --id api -- docker compose up
 loggle start
 loggle start libre
 ```
@@ -110,6 +115,61 @@ docker compose up 2>&1 | loggle
 ```
 
 When using pipe mode, include `2>&1`; otherwise stderr can bypass Loggle.
+
+### Agent Log Access
+
+Every running Loggle page gets an ID automatically:
+
+```sh
+loggle -- docker compose up
+```
+
+The ID is shown in the top-right corner of the Loggle header while the page is
+running. You can also list active pages from another terminal:
+
+```sh
+loggle pages
+```
+
+Example output:
+
+```text
+ID	PID	AGE	COMMAND
+1	48291	3m	docker compose up
+```
+
+Another terminal or AI agent can then fetch recent raw lines from that page:
+
+```sh
+loggle log -i 1 -n 5
+```
+
+Use `--id` when you want to choose a stable human-readable ID yourself:
+
+```sh
+loggle --id api -- docker compose up
+```
+
+Filter the tail to a service/source or parsed property:
+
+```sh
+loggle log -i 1 -n 5 --service api
+loggle log -i 1 -n 5 --source worker --property tenantId=tenant-1
+loggle log -i 1 -n 5 --property requestId
+```
+
+Property filters use the same syntax as the TUI property prompt: `key`,
+`key=value`, `key!=value`, and `!key`. A filtered tail returns whole matching
+records — the header line plus any folded multi-line property block — and `-n`
+counts matching records rather than individual lines.
+
+Page logs are stored in Loggle's local state directory and flushed as input is
+drained, so the read command can inspect a live session without taking over the
+TUI. Each log retains roughly the same window as the in-memory buffer
+(`--buffer-lines`), and a page's log is removed once its session ends and is
+reaped. The page log is best-effort: if it cannot be written, the viewer keeps
+running and shows a notice instead of exiting. Pass `--no-page-log` to opt out
+of writing logs to disk entirely.
 
 ### Start Configs
 
@@ -194,6 +254,10 @@ Config `source_fields` extend source promotion for that session. CLI
 loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
 loggle --record session.log -- docker compose up
+loggle pages
+loggle log -i 1 -n 5
+loggle log -i 1 -n 5 --service api --property tenantId=tenant-1
+loggle --id api -- docker compose up
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
 loggle start
@@ -203,9 +267,17 @@ loggle start libre
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
 - `--no-color`: disables Loggle's source and severity coloring
 - `--record <PATH>`: writes every raw incoming line to a session log file
+- `--id <ID>` / `-i <ID>`: uses this page ID instead of an auto-generated ID
+- `--no-page-log`: disables the per-session page log used by `loggle log`/`pages`
+- `pages`: lists active Loggle pages with ID, PID, age, and command
 - `--source-field <FIELD>`: promotes matching parsed properties to the source
   column when no explicit prefix exists. Repeat it or pass comma-separated
   fields, e.g. `--source-field service,app`
+- `log -i <ID> -n <N>`: prints the last `N` raw lines from a tagged Loggle page
+- `log --source <SOURCE>` / `log --service <SERVICE>`: limits page output to a
+  parsed source/service
+- `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
+  properties. Repeat for multiple required predicates
 - `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,

@@ -1,16 +1,23 @@
-use std::{error::Error, path::Path};
+use std::{
+    error::Error,
+    io::{self, Write},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use clap::Parser;
 use loggle::{
-    ConfigEnv, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
-    load_named_config, load_project_config, run,
+    active_log_pages, load_named_config, load_project_config, print_log_page_tail_with_options,
+    run, ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
+    RuntimeError, RuntimeInput, SourceConfig,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "loggle",
     about = "A terminal log viewer for piped Docker Compose-style logs.",
-    dont_delimit_trailing_values = true
+    dont_delimit_trailing_values = true,
+    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --property tenantId=tenant-1"
 )]
 struct Cli {
     #[arg(long, default_value_t = 100_000, value_parser = parse_buffer_lines)]
@@ -22,6 +29,21 @@ struct Cli {
     #[arg(long)]
     record: Option<std::path::PathBuf>,
 
+    #[arg(
+        short = 'i',
+        long = "id",
+        visible_alias = "page-id",
+        value_name = "ID",
+        help = "Use this log page ID instead of an auto-generated ID"
+    )]
+    page_id: Option<LogPageId>,
+
+    #[arg(
+        long = "no-page-log",
+        help = "Disables the per-session page log used by loggle log/pages"
+    )]
+    no_page_log: bool,
+
     #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
     source_fields: Vec<String>,
 
@@ -32,6 +54,40 @@ struct Cli {
     )]
     command: Vec<String>,
 }
+
+#[derive(Debug, Parser)]
+#[command(name = "loggle log", about = "Print logs from a tagged Loggle page.")]
+struct LogCli {
+    #[arg(short = 'i', long = "id", value_name = "ID")]
+    id: LogPageId,
+
+    #[arg(short = 'n', long = "lines", default_value_t = 100, value_parser = parse_tail_lines)]
+    lines: usize,
+
+    #[arg(
+        short = 's',
+        long = "source",
+        visible_alias = "service",
+        value_name = "SOURCE",
+        value_parser = parse_source_filter
+    )]
+    source: Option<String>,
+
+    #[arg(
+        short = 'p',
+        long = "property",
+        value_name = "FILTER",
+        value_parser = parse_property_filter
+    )]
+    property_filters: Vec<String>,
+
+    #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
+    source_fields: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "loggle pages", about = "List active tagged Loggle pages.")]
+struct PagesCli {}
 
 fn parse_buffer_lines(input: &str) -> Result<usize, String> {
     let value = input
@@ -45,20 +101,54 @@ fn parse_buffer_lines(input: &str) -> Result<usize, String> {
     }
 }
 
-fn parse_source_field(input: &str) -> Result<String, String> {
+fn parse_tail_lines(input: &str) -> Result<usize, String> {
+    let value = input
+        .parse::<usize>()
+        .map_err(|error| format!("invalid line count: {error}"))?;
+
+    Ok(value)
+}
+
+fn parse_non_empty(input: &str, label: &str) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
-        Err("source field must not be empty".to_string())
+        Err(format!("{label} must not be empty"))
     } else {
         Ok(input.to_string())
     }
 }
 
+fn parse_source_field(input: &str) -> Result<String, String> {
+    parse_non_empty(input, "source field")
+}
+
+fn parse_source_filter(input: &str) -> Result<String, String> {
+    parse_non_empty(input, "source filter")
+}
+
+fn parse_property_filter(input: &str) -> Result<String, String> {
+    parse_non_empty(input, "property filter")
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if raw_args.first().is_some_and(|arg| arg == "log") {
+        let cli = LogCli::parse_from(
+            std::iter::once("loggle log".to_string()).chain(raw_args.iter().skip(1).cloned()),
+        );
+        return report_command(run_log_command(cli));
+    }
+    if raw_args.first().is_some_and(|arg| arg == "pages") {
+        let cli = PagesCli::parse_from(
+            std::iter::once("loggle pages".to_string()).chain(raw_args.iter().skip(1).cloned()),
+        );
+        return report_command(run_pages_command(cli));
+    }
+
     let cli = Cli::parse();
-    let command_tail = command_tail_from_args(&raw_args, &cli.command);
-    let resolved_input = match runtime_input_for_command(command_tail) {
+    // clap captures the trailing command verbatim (trailing_var_arg), so it is
+    // the single source of truth for what to run — no hand-rolled arg skipping.
+    let resolved_input = match runtime_input_for_command(cli.command) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("error: {error}");
@@ -71,8 +161,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         buffer_lines: cli.buffer_lines,
         color_enabled: !cli.no_color,
         source_config: SourceConfig::with_fields(source_fields),
+        page_command: runtime_input_summary(&resolved_input.input),
         input: resolved_input.input,
         record_path: cli.record,
+        page_id: cli.page_id,
+        page_logging: !cli.no_page_log,
     }) {
         Ok(()) => Ok(()),
         Err(RuntimeError::MissingInput) => {
@@ -83,35 +176,92 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn command_tail_from_args(raw_args: &[String], clap_command: &[String]) -> Vec<String> {
-    let mut index = 0;
-    while index < raw_args.len() {
-        let value = raw_args[index].as_str();
-        match value {
-            "--" => return raw_args[index + 1..].to_vec(),
-            "--buffer-lines" | "--source-field" | "--record" => {
-                index += 2;
-            }
-            "--no-color" => {
-                index += 1;
-            }
-            value if value.starts_with("--buffer-lines=") => {
-                index += 1;
-            }
-            value if value.starts_with("--source-field=") => {
-                index += 1;
-            }
-            value if value.starts_with("--record=") => {
-                index += 1;
-            }
-            value if value.starts_with('-') => {
-                return clap_command.to_vec();
-            }
-            _ => return raw_args[index..].to_vec(),
-        }
+fn report_command(result: Result<(), LogPageError>) -> Result<(), Box<dyn Error>> {
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+        std::process::exit(1);
     }
 
-    clap_command.to_vec()
+    Ok(())
+}
+
+fn run_log_command(cli: LogCli) -> Result<(), LogPageError> {
+    let options = LogPageTailOptions {
+        line_count: cli.lines,
+        source: cli.source,
+        property_filters: cli.property_filters,
+        source_config: SourceConfig::with_fields(cli.source_fields),
+    };
+
+    let mut stdout = io::stdout().lock();
+    print_log_page_tail_with_options(&cli.id, &options, &mut stdout)
+}
+
+fn run_pages_command(_cli: PagesCli) -> Result<(), LogPageError> {
+    let pages = active_log_pages()?;
+    let mut stdout = io::stdout().lock();
+    if pages.is_empty() {
+        writeln!(stdout, "no active loggle pages").map_err(LogPageError::Output)?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "ID\tPID\tAGE\tCOMMAND").map_err(LogPageError::Output)?;
+    let now = current_unix_seconds();
+    for page in pages {
+        writeln!(
+            stdout,
+            "{}\t{}\t{}\t{}",
+            page.id,
+            page.pid,
+            format_age(page.started_unix_seconds, now),
+            page.command
+        )
+        .map_err(LogPageError::Output)?;
+    }
+
+    Ok(())
+}
+
+fn runtime_input_summary(input: &RuntimeInput) -> String {
+    match input {
+        RuntimeInput::Stdin => "stdin".to_string(),
+        RuntimeInput::Command(command) => command.join(" "),
+        RuntimeInput::Commands(commands) => {
+            command_names_summary("run", commands.iter().map(|c| &c.name))
+        }
+        RuntimeInput::StartCommands(commands) => {
+            command_names_summary("start", commands.iter().map(|c| &c.name))
+        }
+    }
+}
+
+fn command_names_summary<'a>(prefix: &str, names: impl Iterator<Item = &'a String>) -> String {
+    let names = names.map(String::as_str).collect::<Vec<_>>().join(", ");
+    if names.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix} {names}")
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn format_age(started_unix_seconds: u64, now_unix_seconds: u64) -> String {
+    let seconds = now_unix_seconds.saturating_sub(started_unix_seconds);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 60 * 60 * 24 {
+        format!("{}h", seconds / 60 / 60)
+    } else {
+        format!("{}d", seconds / 60 / 60 / 24)
+    }
 }
 
 fn merged_source_fields(
@@ -273,10 +423,8 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "loggle-cli-test-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("loggle-cli-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
@@ -336,18 +484,19 @@ api = ["pnpm", "start"]
         );
     }
 
+    fn parse_cli(raw_args: &[String]) -> Cli {
+        Cli::try_parse_from(std::iter::once("loggle".to_string()).chain(raw_args.iter().cloned()))
+            .unwrap()
+    }
+
     #[test]
     fn runner_cli_parses_two_named_commands() {
-        let raw_args = command(&[
+        let cli = parse_cli(&command(&[
             "run", "--name", "api", "--", "pnpm", "start", "--name", "web", "--", "pnpm", "dev",
-        ]);
-        let cli = Cli::try_parse_from(
-            std::iter::once("loggle".to_string()).chain(raw_args.iter().cloned()),
-        )
-        .unwrap();
+        ]));
 
         assert_eq!(
-            runtime_input(command_tail_from_args(&raw_args, &cli.command)),
+            runtime_input(cli.command),
             RuntimeInput::Commands(vec![
                 named_command("api", &["pnpm", "start"]),
                 named_command("web", &["pnpm", "dev"]),
@@ -357,37 +506,115 @@ api = ["pnpm", "start"]
 
     #[test]
     fn runner_cli_preserves_command_arguments_after_top_level_separator() {
-        let raw_args = command(&["--", "docker", "compose", "up", "--watch"]);
-        let cli = Cli::try_parse_from(
-            std::iter::once("loggle".to_string()).chain(raw_args.iter().cloned()),
-        )
-        .unwrap();
+        let cli = parse_cli(&command(&["--", "docker", "compose", "up", "--watch"]));
 
         assert_eq!(
-            runtime_input(command_tail_from_args(&raw_args, &cli.command)),
+            runtime_input(cli.command),
             RuntimeInput::Command(command(&["docker", "compose", "up", "--watch"]))
         );
     }
 
     #[test]
     fn record_option_does_not_consume_runtime_command() {
-        let raw_args = command(&["--record", "session.log", "docker", "compose", "up"]);
-        let cli = Cli::try_parse_from(
-            std::iter::once("loggle".to_string()).chain(raw_args.iter().cloned()),
-        )
-        .unwrap();
+        let cli = parse_cli(&command(&["--record", "session.log", "docker", "compose", "up"]));
 
         assert_eq!(
-            runtime_input(command_tail_from_args(&raw_args, &cli.command)),
+            runtime_input(cli.command),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
 
     #[test]
+    fn page_id_option_does_not_consume_runtime_command() {
+        let cli = parse_cli(&command(&["--id", "1", "docker", "compose", "up"]));
+
+        assert_eq!(cli.page_id.as_ref().unwrap().as_str(), "1");
+        assert_eq!(
+            runtime_input(cli.command),
+            RuntimeInput::Command(command(&["docker", "compose", "up"]))
+        );
+    }
+
+    #[test]
+    fn short_page_id_option_does_not_consume_runtime_command() {
+        let cli = parse_cli(&command(&["-i", "1", "docker", "compose", "up"]));
+
+        assert_eq!(cli.page_id.as_ref().unwrap().as_str(), "1");
+        assert_eq!(
+            runtime_input(cli.command),
+            RuntimeInput::Command(command(&["docker", "compose", "up"]))
+        );
+    }
+
+    #[test]
+    fn no_page_log_flag_does_not_consume_runtime_command() {
+        let cli = parse_cli(&command(&["--no-page-log", "docker", "compose", "up"]));
+
+        assert!(cli.no_page_log);
+        assert_eq!(
+            runtime_input(cli.command),
+            RuntimeInput::Command(command(&["docker", "compose", "up"]))
+        );
+    }
+
+    #[test]
+    fn log_command_cli_parses_tail_request() {
+        let cli = LogCli::try_parse_from(command(&[
+            "loggle log",
+            "-i",
+            "1",
+            "-n",
+            "5",
+            "--service",
+            "api",
+            "--property",
+            "tenantId=tenant-1",
+            "--source-field",
+            "service",
+        ]))
+        .unwrap();
+
+        assert_eq!(cli.id.as_str(), "1");
+        assert_eq!(cli.lines, 5);
+        assert_eq!(cli.source.as_deref(), Some("api"));
+        assert_eq!(cli.property_filters, command(&["tenantId=tenant-1"]));
+        assert_eq!(cli.source_fields, command(&["service"]));
+    }
+
+    #[test]
+    fn pages_command_cli_parses() {
+        PagesCli::try_parse_from(command(&["loggle pages"])).unwrap();
+    }
+
+    #[test]
+    fn runtime_input_summary_describes_page_command() {
+        assert_eq!(
+            runtime_input_summary(&RuntimeInput::Command(command(&[
+                "docker", "compose", "up"
+            ]))),
+            "docker compose up"
+        );
+        assert_eq!(
+            runtime_input_summary(&RuntimeInput::Commands(vec![
+                named_command("api", &["pnpm", "start"]),
+                named_command("web", &["pnpm", "dev"]),
+            ])),
+            "run api, web"
+        );
+    }
+
+    #[test]
+    fn format_age_uses_compact_units() {
+        assert_eq!(format_age(100, 105), "5s");
+        assert_eq!(format_age(100, 220), "2m");
+        assert_eq!(format_age(100, 7300), "2h");
+        assert_eq!(format_age(100, 172900), "2d");
+    }
+
+    #[test]
     fn runner_rejects_missing_name() {
         assert_eq!(
-            runtime_input_for_command(command(&["run", "api", "--", "pnpm", "start"]))
-                .unwrap_err(),
+            runtime_input_for_command(command(&["run", "api", "--", "pnpm", "start"])).unwrap_err(),
             "runner commands must start with --name <name> -- <command>"
         );
     }
