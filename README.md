@@ -462,6 +462,13 @@ column.
 
 ## Development
 
+Enter the Nix development shell to get Rust, a native linker, and the release
+tools used by this repository:
+
+```sh
+nix develop
+```
+
 Run tests:
 
 ```sh
@@ -493,7 +500,8 @@ Before the first public release:
 - Create or confirm the `maximilianpw/homebrew-tap` GitHub repository.
 - Add a GitHub Actions secret named `HOMEBREW_TAP_TOKEN` to this repository.
   The token needs write access to `maximilianpw/homebrew-tap`.
-- Log in to crates.io locally with `cargo login`.
+- Add a GitHub Actions secret named `CARGO_REGISTRY_TOKEN` to this repository.
+  The token needs permission to publish the `loggle` crate on crates.io.
 
 For each release:
 
@@ -502,7 +510,7 @@ Update `version` in `Cargo.toml`, then run the local checks:
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --all-targets
-cargo publish --dry-run
+cargo publish --locked --dry-run
 ```
 
 Commit the release, push it to `main`, then push a matching semver tag:
@@ -514,13 +522,7 @@ git push origin v0.1.0
 
 Pushing the tag runs the generated `cargo-dist` release workflow. It builds
 Linux and macOS archives, creates the GitHub Release, publishes the Homebrew
-formula to `maximilianpw/homebrew-tap`, and renders the release body with
-install commands.
-
-After the GitHub release workflow succeeds, publish the crate:
-
-```sh
-cargo publish
-```
+formula to `maximilianpw/homebrew-tap`, publishes the crate to crates.io, and
+renders the release body with install commands.
 
 Crates.io versions are permanent: a published version cannot be overwritten.
