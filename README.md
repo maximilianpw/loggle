@@ -513,9 +513,9 @@ git push origin v0.1.0
 ```
 
 Pushing the tag runs the generated `cargo-dist` release workflow. It builds
-Linux, macOS, and Windows archives, creates the GitHub Release, publishes the
-Homebrew formula to `maximilianpw/homebrew-tap`, and renders the release body
-with install commands.
+Linux and macOS archives, creates the GitHub Release, publishes the Homebrew
+formula to `maximilianpw/homebrew-tap`, and renders the release body with
+install commands.
 
 After the GitHub release workflow succeeds, publish the crate:
 
