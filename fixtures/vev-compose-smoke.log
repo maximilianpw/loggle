@@ -1,0 +1,13 @@
+#35 [vev-statistics base 5/7] RUN --mount=type=secret,id=NODE_AUTH_TOKEN sh -c 'npm ci'
+#35 0.531 npm ci
+vev-server-rest Pulling
+vev-server-rest Error response from daemon: pull access denied for vev-server-rest
+traefik | time="2026-06-23T10:00:00Z" level=info msg="Configuration loaded from provider docker"
+mongodb | {"t":{"$date":"2026-06-23T10:00:01.000Z"},"s":"I","c":"NETWORK","id":23015,"ctx":"listener","msg":"Listening on","attr":{"address":"0.0.0.0"}}
+postgres | 2026-06-23 10:00:02.000 UTC [77] FATAL:  database "user" does not exist
+vev-server-rest | [09:12:31.000] WARN (#12):
+vev-server-rest | {
+vev-server-rest |   message: "FALLBACK_PEPPER is not set",
+vev-server-rest |   service: "vev-server-rest"
+vev-server-rest | }
+dependency failed to start: container rest is unhealthy

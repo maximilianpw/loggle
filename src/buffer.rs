@@ -1,7 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::model::{
     LogEvent, LogInterpreter, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig,
+    parse_buildkit_step_line,
 };
 
 #[derive(Debug)]
@@ -12,6 +13,7 @@ pub struct LogBuffer {
     pending_properties: Option<PendingPropertyBlock>,
     completed_property_blocks: VecDeque<CompletedPropertyBlock>,
     active_source: Option<String>,
+    buildkit_steps: HashMap<String, String>,
     source_config: SourceConfig,
     interpreter: LogInterpreter,
 }
@@ -63,6 +65,7 @@ impl LogBuffer {
             pending_properties: None,
             completed_property_blocks: VecDeque::new(),
             active_source: None,
+            buildkit_steps: HashMap::new(),
             source_config,
             interpreter: LogInterpreter,
         }
@@ -95,6 +98,7 @@ impl LogBuffer {
 
     fn push_event(&mut self, line: String, change: &mut BufferChange) -> Option<u64> {
         let mut parsed = self.interpreter.parse_source_line(&line);
+        self.apply_buildkit_source_context(&line, &mut parsed);
         self.apply_source_context(&mut parsed);
 
         if self.capacity == 0 {
@@ -120,6 +124,31 @@ impl LogBuffer {
         change.appended = Some(sequence);
         self.apply_completed_property_block_to_back(change);
         Some(sequence)
+    }
+
+    fn apply_buildkit_source_context(&mut self, line: &str, parsed: &mut ParsedLine) {
+        if parsed.source_explicit {
+            return;
+        }
+
+        let Some(buildkit) = parse_buildkit_step_line(line) else {
+            return;
+        };
+
+        if let Some(source) = buildkit.source {
+            self.buildkit_steps
+                .insert(buildkit.step_id.clone(), source.clone());
+            parsed.source = source;
+            parsed.message = buildkit.message;
+            parsed.source_explicit = true;
+            return;
+        }
+
+        if let Some(source) = self.buildkit_steps.get(&buildkit.step_id) {
+            parsed.source = source.clone();
+            parsed.message = buildkit.message;
+            parsed.source_explicit = true;
+        }
     }
 
     fn apply_source_context(&mut self, parsed: &mut ParsedLine) {
@@ -159,7 +188,7 @@ impl LogBuffer {
         let event = self.events.back()?;
         (event.timestamp.as_deref() == Some(header.timestamp.as_str())
             && event.level == header.level)
-        .then_some(event.sequence)
+            .then_some(event.sequence)
     }
 
     fn apply_pending_properties(
@@ -182,11 +211,12 @@ impl LogBuffer {
         }
 
         if let Some(header) = pending.deferred_header {
-            self.completed_property_blocks.push_back(CompletedPropertyBlock {
-                header_sequence: pending.target_sequence,
-                header,
-                properties,
-            });
+            self.completed_property_blocks
+                .push_back(CompletedPropertyBlock {
+                    header_sequence: pending.target_sequence,
+                    header,
+                    properties,
+                });
             self.trim_completed_property_blocks();
         }
     }
@@ -196,15 +226,11 @@ impl LogBuffer {
             return;
         };
 
-        let Some(position) = self
-            .completed_property_blocks
-            .iter()
-            .position(|block| {
-                event.sequence != block.header_sequence
-                    && event.timestamp.as_deref() == Some(block.header.timestamp.as_str())
-                    && event.level == block.header.level
-            })
-        else {
+        let Some(position) = self.completed_property_blocks.iter().position(|block| {
+            event.sequence != block.header_sequence
+                && event.timestamp.as_deref() == Some(block.header.timestamp.as_str())
+                && event.level == block.header.level
+        }) else {
             return;
         };
 
@@ -249,7 +275,17 @@ impl LogBuffer {
     }
 
     pub(crate) fn event_by_sequence(&self, sequence: u64) -> Option<&LogEvent> {
-        self.events().iter().find(|event| event.sequence == sequence)
+        let first_sequence = self.events.front()?.sequence;
+        let offset = sequence.checked_sub(first_sequence)?;
+        if let Ok(index) = usize::try_from(offset) {
+            if let Some(event) = self.events.get(index) {
+                if event.sequence == sequence {
+                    return Some(event);
+                }
+            }
+        }
+
+        self.events.iter().find(|event| event.sequence == sequence)
     }
 }
 
@@ -419,6 +455,65 @@ mod tests {
     }
 
     #[test]
+    fn finds_events_by_sequence_after_eviction() {
+        let mut buffer = LogBuffer::new(3);
+
+        buffer.push_line("api | one".to_string());
+        buffer.push_line("api | two".to_string());
+        buffer.push_line("api | three".to_string());
+        buffer.push_line("api | four".to_string());
+
+        assert!(buffer.event_by_sequence(0).is_none());
+        assert_eq!(buffer.event_by_sequence(1).unwrap().message, "two");
+        assert_eq!(buffer.event_by_sequence(3).unwrap().message, "four");
+    }
+
+    #[test]
+    fn finds_events_by_sequence_after_sequence_gap() {
+        let mut buffer = LogBuffer::new(5);
+
+        buffer.push_line("api | one".to_string());
+        buffer.push_line("api | two".to_string());
+        buffer.push_line("api | three".to_string());
+        buffer.events.remove(1);
+
+        assert_eq!(buffer.event_by_sequence(2).unwrap().message, "three");
+    }
+
+    #[test]
+    fn inherits_source_for_buildkit_step_continuations() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line(
+            "#35 [vev-statistics base 5/7] RUN --mount=type=secret,id=NODE_AUTH_TOKEN sh -c 'npm ci'"
+                .to_string(),
+        );
+        buffer.push_line("#35 0.531 npm ci".to_string());
+
+        assert_eq!(sources(&buffer), vec!["vev-statistics", "vev-statistics"]);
+        assert_eq!(
+            buffer.events()[0].message,
+            "#35 [base 5/7] RUN --mount=type=secret,id=NODE_AUTH_TOKEN sh -c 'npm ci'"
+        );
+        assert_eq!(buffer.events()[1].message, "#35 0.531 npm ci");
+    }
+
+    #[test]
+    fn inherits_source_for_buildkit_internal_step_continuations() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("#11 [vev-statistics internal] load metadata for node".to_string());
+        buffer.push_line("#11 DONE 1.4s".to_string());
+
+        assert_eq!(sources(&buffer), vec!["vev-statistics", "vev-statistics"]);
+        assert_eq!(
+            buffer.events()[0].message,
+            "#11 [internal] load metadata for node"
+        );
+        assert_eq!(buffer.events()[1].message, "#11 DONE 1.4s");
+    }
+
+    #[test]
     fn inherits_source_for_unprefixed_stack_continuations() {
         let mut buffer = LogBuffer::new(10);
 
@@ -431,7 +526,10 @@ mod tests {
             buffer.events()[1].message,
             "    at handler (/app/src/main.ts:10:3)"
         );
-        assert_eq!(buffer.events()[2].message, "Caused by: TypeError: missing user");
+        assert_eq!(
+            buffer.events()[2].message,
+            "Caused by: TypeError: missing user"
+        );
     }
 
     #[test]
@@ -538,9 +636,8 @@ mod tests {
     fn merges_property_block_into_previous_structured_event() {
         let mut buffer = LogBuffer::new(10);
 
-        buffer.push_line(
-            "14:06:58.892 INFO http.request GET /api/v1/inventory 200 96ms".to_string(),
-        );
+        buffer
+            .push_line("14:06:58.892 INFO http.request GET /api/v1/inventory 200 96ms".to_string());
         buffer.push_line("[14:06:58.892] INFO (#147):".to_string());
         buffer.push_line("  {".to_string());
         buffer.push_line("    messageKey: \"http.request\",".to_string());

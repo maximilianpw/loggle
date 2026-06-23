@@ -142,6 +142,13 @@ pub struct ParsedLine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuildKitStepLine {
+    pub(crate) step_id: String,
+    pub(crate) source: Option<String>,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredMessage {
     pub timestamp: Option<String>,
     pub level: Level,
@@ -208,9 +215,7 @@ impl LogEvent {
             .as_ref()
             .map(|message| message.level)
             .unwrap_or_else(|| infer_level(&message));
-        let message = structured
-            .map(|message| message.message)
-            .unwrap_or(message);
+        let message = structured.map(|message| message.message).unwrap_or(message);
         let (message, trailing_json_properties) = split_trailing_json_properties(&message);
         let mut properties = parse_inline_properties(&message);
         properties.extend(trailing_json_properties);
@@ -253,6 +258,10 @@ pub fn parse_compose_line(line: &str) -> ParsedLine {
         }
     }
 
+    if let Some(parsed) = parse_compose_status_line(&line) {
+        return parsed;
+    }
+
     ParsedLine {
         source: "unknown".to_string(),
         message: line,
@@ -271,6 +280,146 @@ fn parse_bracket_prefixed_line(line: &str) -> Option<ParsedLine> {
         source_explicit: true,
     })
 }
+
+pub(crate) fn parse_buildkit_step_line(line: &str) -> Option<BuildKitStepLine> {
+    let line = clean_display_text(line);
+    let trimmed = line.trim_start();
+    let after_hash = trimmed.strip_prefix('#')?;
+    let id_end = after_hash
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))?;
+    let step_number = &after_hash[..id_end];
+    if step_number.is_empty() || !step_number.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let step_id = format!("#{step_number}");
+    let after_step = after_hash[id_end..].trim_start();
+    let Some(after_open) = after_step.strip_prefix('[') else {
+        return Some(BuildKitStepLine {
+            step_id,
+            source: None,
+            message: trimmed.to_string(),
+        });
+    };
+
+    let (context, after_context) = after_open.split_once(']')?;
+    let context = context.trim();
+    let source = buildkit_context_source(context);
+    let message = buildkit_message_without_service(&step_id, context, after_context);
+
+    Some(BuildKitStepLine {
+        step_id,
+        source,
+        message,
+    })
+}
+
+fn parse_compose_status_line(line: &str) -> Option<ParsedLine> {
+    let trimmed = line.trim_start();
+    let (source, rest) = split_first_token(trimmed)?;
+    if !looks_like_source_token(source) {
+        return None;
+    }
+
+    let rest = rest.trim_start();
+    let (status, _) = split_first_token(rest)?;
+    let status = status.trim_end_matches(':');
+    if !COMPOSE_STATUS_TOKENS
+        .iter()
+        .any(|candidate| status.eq_ignore_ascii_case(candidate))
+    {
+        return None;
+    }
+
+    Some(ParsedLine {
+        source: source.to_string(),
+        message: rest.to_string(),
+        source_explicit: true,
+    })
+}
+
+fn buildkit_context_source(context: &str) -> Option<String> {
+    let parts = context.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let source = parts[0];
+    if !looks_like_source_token(source) || is_reserved_buildkit_source(source) {
+        return None;
+    }
+
+    let second = parts[1];
+    if second.eq_ignore_ascii_case("internal") {
+        return Some(source.to_string());
+    }
+
+    (parts.len() >= 3
+        && parts
+            .last()
+            .is_some_and(|part| looks_like_buildkit_step_count(part)))
+    .then(|| source.to_string())
+}
+
+fn buildkit_message_without_service(step_id: &str, context: &str, after_context: &str) -> String {
+    let mut context_parts = context.split_whitespace();
+    let context_without_source = if buildkit_context_source(context).is_some() {
+        context_parts.next();
+        context_parts.collect::<Vec<_>>().join(" ")
+    } else {
+        context.to_string()
+    };
+    let after_context = after_context.trim_start();
+
+    if context_without_source.is_empty() {
+        format!("{step_id} {after_context}").trim_end().to_string()
+    } else if after_context.is_empty() {
+        format!("{step_id} [{context_without_source}]")
+    } else {
+        format!("{step_id} [{context_without_source}] {after_context}")
+    }
+}
+
+fn is_reserved_buildkit_source(source: &str) -> bool {
+    source.eq_ignore_ascii_case("internal") || source.eq_ignore_ascii_case("auth")
+}
+
+fn looks_like_buildkit_step_count(value: &str) -> bool {
+    let Some((current, total)) = value.split_once('/') else {
+        return false;
+    };
+
+    !current.is_empty()
+        && !total.is_empty()
+        && current.chars().all(|ch| ch.is_ascii_digit())
+        && total.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_source_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+const COMPOSE_STATUS_TOKENS: &[&str] = &[
+    "Pulling",
+    "Pulled",
+    "Building",
+    "Built",
+    "Error",
+    "Started",
+    "Starting",
+    "Healthy",
+    "Waiting",
+    "Exited",
+    "Recreated",
+    "Recreating",
+    "Running",
+    "Created",
+    "Creating",
+];
 
 pub fn parse_structured_message(message: &str) -> Option<StructuredMessage> {
     let message = clean_display_text(message);
@@ -814,7 +963,8 @@ fn parse_property_value(value: &str) -> PropertyValue {
 }
 
 fn trim_trailing_comma(value: &str) -> &str {
-    value.trim_end()
+    value
+        .trim_end()
         .strip_suffix(',')
         .map(str::trim_end)
         .unwrap_or(value.trim_end())
@@ -1037,7 +1187,9 @@ mod tests {
             Some(&PropertyValue::String("Function".to_string()))
         );
         assert_eq!(
-            event.property("unknown.userId").map(|property| &property.value),
+            event
+                .property("unknown.userId")
+                .map(|property| &property.value),
             Some(&PropertyValue::String("user-1".to_string()))
         );
         assert_eq!(
@@ -1071,8 +1223,10 @@ mod tests {
 
     #[test]
     fn parses_quoted_inline_property_values() {
-        let event =
-            LogEvent::from_line(0, "INFO request completed service=\"api server\"".to_string());
+        let event = LogEvent::from_line(
+            0,
+            "INFO request completed service=\"api server\"".to_string(),
+        );
 
         assert_eq!(
             event.property("service").map(|property| &property.value),
@@ -1207,7 +1361,9 @@ mod tests {
             Some(&PropertyValue::String("/api/items".to_string()))
         );
         assert_eq!(
-            event.property("duration_ms").map(|property| &property.value),
+            event
+                .property("duration_ms")
+                .map(|property| &property.value),
             Some(&PropertyValue::Number("42".to_string()))
         );
     }
@@ -1222,10 +1378,7 @@ mod tests {
         assert_eq!(event.source, "unknown");
         assert_eq!(event.timestamp.as_deref(), Some("14:06:58.892"));
         assert_eq!(event.level, Level::Info);
-        assert_eq!(
-            event.message,
-            "http.request GET /api/v1/inventory 200 96ms"
-        );
+        assert_eq!(event.message, "http.request GET /api/v1/inventory 200 96ms");
     }
 
     #[test]
@@ -1256,6 +1409,38 @@ mod tests {
 
         assert_eq!(parsed.source, "backend");
         assert_eq!(parsed.message, "ERROR failed");
+    }
+
+    #[test]
+    fn parses_compose_status_lines_as_sources() {
+        let parsed = parse_compose_line("vev-server-rest Pulling");
+
+        assert_eq!(parsed.source, "vev-server-rest");
+        assert_eq!(parsed.message, "Pulling");
+        assert!(parsed.source_explicit);
+    }
+
+    #[test]
+    fn parses_compose_error_status_lines_as_sources() {
+        let parsed = parse_compose_line(
+            "vev-server-rest Error response from daemon: pull access denied for image",
+        );
+
+        assert_eq!(parsed.source, "vev-server-rest");
+        assert_eq!(
+            parsed.message,
+            "Error response from daemon: pull access denied for image"
+        );
+        assert!(parsed.source_explicit);
+    }
+
+    #[test]
+    fn keeps_non_status_plain_lines_unknown() {
+        let parsed = parse_compose_line("vev-server-rest connected to postgres");
+
+        assert_eq!(parsed.source, "unknown");
+        assert_eq!(parsed.message, "vev-server-rest connected to postgres");
+        assert!(!parsed.source_explicit);
     }
 
     #[test]
@@ -1324,8 +1509,7 @@ mod tests {
 
     #[test]
     fn parses_prefixed_property_block_header() {
-        let header =
-            parse_property_block_header("[backend] [14:06:58.892] INFO (#147):").unwrap();
+        let header = parse_property_block_header("[backend] [14:06:58.892] INFO (#147):").unwrap();
 
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
@@ -1333,10 +1517,9 @@ mod tests {
 
     #[test]
     fn parses_colored_prefixed_property_block_header() {
-        let header = parse_property_block_header(
-            "\u{1b}[36m[backend]\u{1b}[0m [14:06:58.892] INFO (#147):",
-        )
-        .unwrap();
+        let header =
+            parse_property_block_header("\u{1b}[36m[backend]\u{1b}[0m [14:06:58.892] INFO (#147):")
+                .unwrap();
 
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
@@ -1361,7 +1544,10 @@ mod tests {
             properties[0].value,
             PropertyValue::String("http.request".to_string())
         );
-        assert_eq!(properties[1].value, PropertyValue::Number("200".to_string()));
+        assert_eq!(
+            properties[1].value,
+            PropertyValue::Number("200".to_string())
+        );
         assert_eq!(properties[2].value, PropertyValue::Number("96".to_string()));
         assert_eq!(properties[3].value, PropertyValue::Bool(false));
         assert_eq!(properties[4].value, PropertyValue::Null);
@@ -1378,7 +1564,9 @@ mod tests {
         assert_eq!(infer_level("Warning: retrying"), Level::Warn);
         assert_eq!(infer_level("info: listening"), Level::Info);
         assert_eq!(
-            infer_level("[Nest] 32 - 05/08/2026, 4:18:15 PM LOG [NestFactory] Starting Nest application..."),
+            infer_level(
+                "[Nest] 32 - 05/08/2026, 4:18:15 PM LOG [NestFactory] Starting Nest application..."
+            ),
             Level::Info
         );
         assert_eq!(infer_level("debug details"), Level::Debug);
