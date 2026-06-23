@@ -10,15 +10,15 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use crate::{
     app::App,
     model::SourceConfig,
-    page_log::{claim_active_log_page, ActiveLogPageRegistration, LogPageId, PageLogRecorder},
+    page_log::{ActiveLogPageRegistration, LogPageId, PageLogRecorder, claim_active_log_page},
     ui,
 };
 
@@ -30,6 +30,7 @@ use super::{
 
 pub(super) fn run(
     mut rx: mpsc::Receiver<String>,
+    startup_lines: Vec<String>,
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
@@ -39,15 +40,11 @@ pub(super) fn run(
     page_logging: bool,
     mut children: Vec<Child>,
 ) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = TerminalSession::enter()?;
     let result = run_app(
-        &mut terminal,
+        terminal.terminal_mut(),
         &mut rx,
+        startup_lines,
         buffer_lines,
         color_enabled,
         source_config,
@@ -64,16 +61,114 @@ pub(super) fn run(
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
-    terminal.show_cursor()?;
+    let cleanup_result = terminal.restore();
+    match (result, cleanup_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
 
-    result
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    mode: TerminalModeGuard,
+}
+
+impl TerminalSession {
+    fn enter() -> io::Result<Self> {
+        let mut mode = TerminalModeGuard::enter_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        mode.mark_alternate_screen_entered();
+
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+
+        Ok(Self { terminal, mode })
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
+        &mut self.terminal
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        self.mode.restore(&mut self.terminal)
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+struct TerminalModeGuard {
+    raw_mode: bool,
+    alternate_screen: bool,
+}
+
+impl TerminalModeGuard {
+    fn enter_raw_mode() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self {
+            raw_mode: true,
+            alternate_screen: false,
+        })
+    }
+
+    fn mark_alternate_screen_entered(&mut self) {
+        self.alternate_screen = true;
+    }
+
+    fn restore(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+        let mut first_error = None;
+
+        if self.raw_mode {
+            if let Err(error) = disable_raw_mode() {
+                first_error.get_or_insert(error);
+            }
+            self.raw_mode = false;
+        }
+
+        if self.alternate_screen {
+            if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)
+            {
+                first_error.get_or_insert(error);
+            }
+            self.alternate_screen = false;
+        }
+
+        if let Err(error) = terminal.show_cursor() {
+            first_error.get_or_insert(error);
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if self.raw_mode {
+            let _ = disable_raw_mode();
+            self.raw_mode = false;
+        }
+
+        if self.alternate_screen {
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
+            self.alternate_screen = false;
+        }
+    }
 }
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     rx: &mut mpsc::Receiver<String>,
+    startup_lines: Vec<String>,
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
@@ -104,19 +199,18 @@ fn run_app(
     }
     let _active_page = active_page;
 
+    let had_startup_lines = !startup_lines.is_empty();
+    for line in startup_lines {
+        ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
+    }
+    if had_startup_lines {
+        flush_page_recorder(&mut app, &mut page_recorder);
+    }
+
     loop {
         let mut received = false;
         while let Ok(line) = rx.try_recv() {
-            if let Some(recorder) = recorder.as_mut() {
-                recorder.record_line(&line)?;
-            }
-            if let Some(active_recorder) = page_recorder.as_mut() {
-                if let Err(error) = active_recorder.record_line(&line) {
-                    app.set_notice(format!("page log disabled: {error}"));
-                    page_recorder = None;
-                }
-            }
-            app.push_line(line);
+            ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
             received = true;
             dirty = true;
         }
@@ -124,12 +218,7 @@ fn run_app(
         // Flush once per drain instead of per line, so the read command sees
         // fresh data without a syscall on every ingested line.
         if received {
-            if let Some(active_recorder) = page_recorder.as_mut() {
-                if let Err(error) = active_recorder.flush() {
-                    app.set_notice(format!("page log disabled: {error}"));
-                    page_recorder = None;
-                }
-            }
+            flush_page_recorder(&mut app, &mut page_recorder);
         }
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
@@ -216,6 +305,34 @@ fn run_app(
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+fn ingest_line(
+    app: &mut App,
+    recorder: &mut Option<SessionRecorder>,
+    page_recorder: &mut Option<PageLogRecorder>,
+    line: String,
+) -> io::Result<()> {
+    if let Some(recorder) = recorder.as_mut() {
+        recorder.record_line(&line)?;
+    }
+    if let Some(active_recorder) = page_recorder.as_mut() {
+        if let Err(error) = active_recorder.record_line(&line) {
+            app.set_notice(format!("page log disabled: {error}"));
+            *page_recorder = None;
+        }
+    }
+    app.push_line(line);
+    Ok(())
+}
+
+fn flush_page_recorder(app: &mut App, page_recorder: &mut Option<PageLogRecorder>) {
+    if let Some(active_recorder) = page_recorder.as_mut() {
+        if let Err(error) = active_recorder.flush() {
+            app.set_notice(format!("page log disabled: {error}"));
+            *page_recorder = None;
         }
     }
 }

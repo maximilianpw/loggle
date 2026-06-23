@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{App, DialogKind, Mode, PromptKind, YankedLines};
-use crate::commands::{normal_action_for_key, CommandAction};
+use crate::commands::{CommandAction, normal_action_for_key};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum KeyOutcome {

@@ -50,7 +50,10 @@ pub(super) fn render_event<'a>(
     let mut spans = vec![
         Span::styled(if marked { "*" } else { " " }, rail_style),
         sequence,
-        Span::styled(format!("{:<14}", truncate_tail(&event.source, 14)), source_style),
+        Span::styled(
+            format!("{:<14}", truncate_tail(&event.source, 14)),
+            source_style,
+        ),
         Span::styled(" ", row_style),
         Span::styled(format!("{:<7}", event.level.as_str()), level_style),
         Span::styled(" ", row_style),
@@ -112,7 +115,10 @@ fn message_spans<'a>(
         }
 
         let end = start + value.len();
-        spans.push(Span::styled(remaining[start..end].to_string(), highlight_style));
+        spans.push(Span::styled(
+            remaining[start..end].to_string(),
+            highlight_style,
+        ));
         remaining = &remaining[end..];
     }
 
@@ -211,7 +217,11 @@ mod tests {
         }]);
 
         let row = render_event(&event, false, false, false, &[], &[]);
-        let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
+        let text = row
+            .spans
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
 
         assert!(text.ends_with("request completed"));
         assert!(!text.contains("tenantId=tenant-1"));
@@ -233,7 +243,11 @@ mod tests {
 
         let message_fields = ["tenantId".to_string(), "missing".to_string()];
         let row = render_event(&event, false, false, false, &message_fields, &[]);
-        let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
+        let text = row
+            .spans
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
 
         assert!(text.contains("tenantId=tenant-1"));
         assert!(text.contains("-                    request completed"));
@@ -297,10 +311,11 @@ mod tests {
 
         let row = render_event(&event, false, false, false, &[], &["-"]);
 
-        assert!(row
-            .spans
-            .into_iter()
-            .all(|span| span.style.bg != Some(THEME.highlight)));
+        assert!(
+            row.spans
+                .into_iter()
+                .all(|span| span.style.bg != Some(THEME.highlight))
+        );
     }
 
     #[test]
@@ -324,10 +339,11 @@ mod tests {
 
         let row = render_event(&event, false, false, false, &[], &[]);
 
-        assert!(row
-            .spans
-            .into_iter()
-            .all(|span| span.style.bg != Some(THEME.highlight)));
+        assert!(
+            row.spans
+                .into_iter()
+                .all(|span| span.style.bg != Some(THEME.highlight))
+        );
     }
 
     #[test]

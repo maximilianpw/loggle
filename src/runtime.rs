@@ -95,11 +95,12 @@ impl From<io::Error> for RuntimeError {
 }
 
 pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
-    let (tx, rx) = mpsc::channel(input::LINE_CHANNEL_CAPACITY);
-    let children = start_input(&config.input, tx)?;
+    let (tx, mut rx) = mpsc::channel(input::LINE_CHANNEL_CAPACITY);
+    let started = start_input(&config.input, tx, &mut rx, config.buffer_lines)?;
 
     terminal::run(
         rx,
+        started.startup_lines,
         config.buffer_lines,
         config.color_enabled,
         config.source_config,
@@ -107,15 +108,22 @@ pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
         config.page_id,
         config.page_command,
         config.page_logging,
-        children,
+        started.children,
     )
     .map_err(RuntimeError::from)
+}
+
+struct StartedInput {
+    children: Vec<Child>,
+    startup_lines: Vec<String>,
 }
 
 fn start_input(
     input_mode: &RuntimeInput,
     tx: mpsc::Sender<String>,
-) -> Result<Vec<Child>, RuntimeError> {
+    rx: &mut mpsc::Receiver<String>,
+    startup_line_capacity: usize,
+) -> Result<StartedInput, RuntimeError> {
     match input_mode {
         RuntimeInput::Stdin => {
             if input::stdin_is_terminal() {
@@ -123,10 +131,26 @@ fn start_input(
             }
 
             input::spawn_stdin_reader(tx)?;
-            Ok(Vec::new())
+            Ok(StartedInput {
+                children: Vec::new(),
+                startup_lines: Vec::new(),
+            })
         }
-        RuntimeInput::Command(command) => Ok(vec![input::spawn_command(command, tx)?]),
-        RuntimeInput::Commands(commands) => Ok(input::spawn_named_commands(commands, tx)?),
-        RuntimeInput::StartCommands(commands) => Ok(input::spawn_start_commands(commands, tx)?),
+        RuntimeInput::Command(command) => Ok(StartedInput {
+            children: vec![input::spawn_command(command, tx)?],
+            startup_lines: Vec::new(),
+        }),
+        RuntimeInput::Commands(commands) => Ok(StartedInput {
+            children: input::spawn_named_commands(commands, tx)?,
+            startup_lines: Vec::new(),
+        }),
+        RuntimeInput::StartCommands(commands) => {
+            let (startup_lines, children) =
+                input::spawn_start_commands_draining(commands, tx, rx, startup_line_capacity)?;
+            Ok(StartedInput {
+                children,
+                startup_lines,
+            })
+        }
     }
 }

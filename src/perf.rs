@@ -137,7 +137,9 @@ fn apply_filter(app: &mut App, filter: BenchFilter) {
         BenchFilter::Text => apply_prompt(app, PromptKind::Text, "request completed"),
         BenchFilter::Source => apply_prompt(app, PromptKind::Source, "api"),
         BenchFilter::Level => apply_prompt(app, PromptKind::Level, "error"),
-        BenchFilter::Property => apply_prompt(app, PromptKind::IncludeProperty, "tenantId=tenant-4"),
+        BenchFilter::Property => {
+            apply_prompt(app, PromptKind::IncludeProperty, "tenantId=tenant-4")
+        }
     }
 }
 

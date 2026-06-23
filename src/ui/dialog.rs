@@ -177,10 +177,7 @@ fn render_selectable_rows(
             let prefix_len = 2 + shortcut_width + 2 + label_width + 2;
             let description_width = width.saturating_sub(prefix_len);
             let shortcut_text = format!("{shortcut:shortcut_width$}");
-            let label_text = format!(
-                "{:<label_width$}",
-                truncate_tail(item.label, label_width)
-            );
+            let label_text = format!("{:<label_width$}", truncate_tail(item.label, label_width));
 
             Line::from(vec![
                 Span::styled(format!("{marker} "), row_style),
@@ -221,7 +218,11 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let text = row.spans.into_iter().map(|span| span.content).collect::<String>();
+        let text = row
+            .spans
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
 
         assert!(text.contains("~"));
         assert!(!text.contains("Extremely long command label"));

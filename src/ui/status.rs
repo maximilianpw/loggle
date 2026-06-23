@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Mode},
-    commands::{status_help_items, CommandHelpItem, CommandHelpLevel},
+    commands::{CommandHelpItem, CommandHelpLevel, status_help_items},
     filter::LogFilter,
 };
 
@@ -85,10 +85,7 @@ fn visual_segments(app: &App) -> Vec<StatusSegment> {
 fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
     let text = filters.text.as_deref().unwrap_or("-");
     let source = filters.source.as_deref().unwrap_or("-");
-    let level = filters
-        .level
-        .map(|level| level.as_str())
-        .unwrap_or("-");
+    let level = filters.level.map(|level| level.as_str()).unwrap_or("-");
     let properties = property_filters_summary(filters);
     let help = help_variant(width);
     let (source_limit, level_limit, text_limit, property_limit) = value_limits(width, help);

@@ -425,9 +425,13 @@ fn filtered_tail_lines<R: BufRead>(
             source,
         })?;
         let change = buffer.push_line(line.clone());
+        let removed_group_lines =
+            take_removed_group_lines(&groups, &mut group_of_sequence, &change.removed);
         if let Some(sequence) = change.appended {
             let index = groups.len();
-            groups.push(vec![line]);
+            let mut group = removed_group_lines;
+            group.push(line);
+            groups.push(group);
             group_of_sequence.insert(sequence, index);
             current_group = Some(index);
         } else if let Some(index) = current_group {
@@ -452,6 +456,27 @@ fn filtered_tail_lines<R: BufRead>(
     }
 
     Ok(lines)
+}
+
+fn take_removed_group_lines(
+    groups: &[Vec<String>],
+    group_of_sequence: &mut HashMap<u64, usize>,
+    removed: &[u64],
+) -> Vec<String> {
+    let mut indexes = Vec::new();
+    for sequence in removed {
+        let Some(index) = group_of_sequence.remove(sequence) else {
+            continue;
+        };
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+
+    indexes
+        .into_iter()
+        .flat_map(|index| groups[index].iter().cloned())
+        .collect()
 }
 
 fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, LogPageError> {
@@ -748,6 +773,34 @@ mod tests {
             filtered_tail_lines(BufReader::new(input), &options, Path::new("test.log")).unwrap();
 
         assert_eq!(lines, vec!["api | ERROR database unavailable".to_string()]);
+    }
+
+    #[test]
+    fn filtered_tail_lines_includes_property_block_that_precedes_summary() {
+        let input = "[api] [21:05:37.312] INFO (#140):\n[api] {\n[api] requestId: \"abc-123\",\n[api] statusCode: 200,\n[api] }\n[api] 21:05:37.312 INFO http.request ok\n"
+            .as_bytes();
+        let options = LogPageTailOptions {
+            line_count: 5,
+            source: None,
+            text: None,
+            property_filters: vec!["requestId=abc-123".to_string()],
+            source_config: SourceConfig::default(),
+        };
+
+        let lines =
+            filtered_tail_lines(BufReader::new(input), &options, Path::new("test.log")).unwrap();
+
+        assert_eq!(
+            lines,
+            vec![
+                "[api] [21:05:37.312] INFO (#140):".to_string(),
+                "[api] {".to_string(),
+                "[api] requestId: \"abc-123\",".to_string(),
+                "[api] statusCode: 200,".to_string(),
+                "[api] }".to_string(),
+                "[api] 21:05:37.312 INFO http.request ok".to_string(),
+            ]
+        );
     }
 
     #[test]

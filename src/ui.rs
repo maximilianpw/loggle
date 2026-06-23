@@ -12,7 +12,10 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 
-use crate::{LogPageId, app::{App, DialogKind, Mode, PromptKind}};
+use crate::{
+    LogPageId,
+    app::{App, DialogKind, Mode, PromptKind},
+};
 
 use theme::THEME;
 
@@ -81,10 +84,7 @@ fn draw_header(
 
     let header = Line::from(vec![
         Span::styled(" loggle ", accent_style),
-        Span::styled(
-            follow,
-            Style::default().fg(THEME.text).bg(THEME.panel_alt),
-        ),
+        Span::styled(follow, Style::default().fg(THEME.text).bg(THEME.panel_alt)),
         Span::styled("  retained ", style),
         Span::styled(
             app.retained_len().to_string(),
@@ -242,7 +242,10 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled(" message ", muted),
-            Span::styled(text::truncate_tail(&event.message, width.saturating_sub(9)), base),
+            Span::styled(
+                text::truncate_tail(&event.message, width.saturating_sub(9)),
+                base,
+            ),
         ]),
     ];
 
@@ -365,12 +368,10 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
                 items = source_rows
                     .iter()
                     .zip(source_summaries.iter())
-                    .map(|(row, summary)| {
-                        dialog::SelectableListItem {
-                            shortcut: None,
-                            label: &row.source,
-                            description: summary,
-                        }
+                    .map(|(row, summary)| dialog::SelectableListItem {
+                        shortcut: None,
+                        label: &row.source,
+                        description: summary,
                     })
                     .collect::<Vec<_>>();
                 &items[..]
@@ -443,9 +444,15 @@ fn draw_closing_overlay(frame: &mut Frame<'_>, area: Rect, message: &str) {
                 .bg(THEME.panel_alt)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(message.to_string(), Style::default().fg(THEME.text).bg(THEME.panel_alt)),
+        Span::styled(
+            message.to_string(),
+            Style::default().fg(THEME.text).bg(THEME.panel_alt),
+        ),
     ]);
-    frame.render_widget(Paragraph::new(line).style(Style::default().bg(THEME.panel_alt)), content);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(THEME.panel_alt)),
+        content,
+    );
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {

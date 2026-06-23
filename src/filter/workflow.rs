@@ -63,9 +63,9 @@ impl FilterWorkflow {
                 .level
                 .map(|level| level.to_string())
                 .unwrap_or_default(),
-            FilterEdit::IncludeProperty | FilterEdit::ExcludeProperty => property
-                .map(property_prompt_value)
-                .unwrap_or_default(),
+            FilterEdit::IncludeProperty | FilterEdit::ExcludeProperty => {
+                property.map(property_prompt_value).unwrap_or_default()
+            }
             FilterEdit::EditPropertyFilter => String::new(),
         }
     }

@@ -55,17 +55,34 @@ pub(super) fn spawn_named_commands(
     Ok(children)
 }
 
+#[cfg(test)]
 pub(super) fn spawn_start_commands(
     commands: &[StartCommand],
     tx: mpsc::Sender<String>,
 ) -> io::Result<Vec<Child>> {
     let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
-    StartScheduler::new(plan, tx).run()
+    StartScheduler::new(plan, tx).run(None, None)
+}
+
+pub(super) fn spawn_start_commands_draining(
+    commands: &[StartCommand],
+    tx: mpsc::Sender<String>,
+    rx: &mut mpsc::Receiver<String>,
+    retained_lines: usize,
+) -> io::Result<(Vec<String>, Vec<Child>)> {
+    let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut startup_lines = StartupLineBuffer::new(retained_lines);
+    let children = StartScheduler::new(plan, tx).run(Some(rx), Some(&mut startup_lines))?;
+    Ok((startup_lines.into_vec(), children))
 }
 
 fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
     let mut child = spawn_child(&command.command, command.cwd.as_deref())?;
-    spawn_output_readers(&mut child, tx, LineReaderConfig::with_source(command.name.clone()));
+    spawn_output_readers(
+        &mut child,
+        tx,
+        LineReaderConfig::with_source(command.name.clone()),
+    );
 
     Ok(child)
 }
@@ -176,11 +193,7 @@ impl LineReaderConfig {
     }
 }
 
-fn spawn_output_readers(
-    child: &mut Child,
-    tx: mpsc::Sender<String>,
-    config: LineReaderConfig,
-) {
+fn spawn_output_readers(child: &mut Child, tx: mpsc::Sender<String>, config: LineReaderConfig) {
     if let Some(stdout) = child.stdout.take() {
         spawn_line_reader(stdout, tx.clone(), config.clone());
     }
@@ -261,7 +274,11 @@ impl<'a> StartScheduler<'a> {
         }
     }
 
-    fn run(mut self) -> io::Result<Vec<Child>> {
+    fn run(
+        mut self,
+        mut startup_rx: Option<&mut mpsc::Receiver<String>>,
+        mut startup_lines: Option<&mut StartupLineBuffer>,
+    ) -> io::Result<Vec<Child>> {
         while !self.all_ready() {
             let now = Instant::now();
             let mut progressed = match self.spawn_unblocked(now) {
@@ -282,7 +299,11 @@ impl<'a> StartScheduler<'a> {
             if !progressed {
                 thread::sleep(Duration::from_millis(10));
             }
+
+            drain_startup_lines(&mut startup_rx, &mut startup_lines);
         }
+
+        drain_startup_lines(&mut startup_rx, &mut startup_lines);
 
         Ok(self
             .children
@@ -417,6 +438,61 @@ impl<'a> StartScheduler<'a> {
     }
 }
 
+fn drain_startup_lines(
+    startup_rx: &mut Option<&mut mpsc::Receiver<String>>,
+    startup_lines: &mut Option<&mut StartupLineBuffer>,
+) {
+    let Some(rx) = startup_rx.as_deref_mut() else {
+        return;
+    };
+    let Some(lines) = startup_lines.as_deref_mut() else {
+        return;
+    };
+
+    lines.drain(rx);
+}
+
+#[derive(Debug)]
+struct StartupLineBuffer {
+    lines: VecDeque<String>,
+    capacity: usize,
+}
+
+impl StartupLineBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            lines: VecDeque::with_capacity(capacity.min(LINE_CHANNEL_CAPACITY)),
+            capacity,
+        }
+    }
+
+    fn drain(&mut self, rx: &mut mpsc::Receiver<String>) {
+        loop {
+            match rx.try_recv() {
+                Ok(line) => self.push(line),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        while self.lines.len() >= self.capacity {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.lines.into_iter().collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartState {
     Pending,
@@ -509,7 +585,9 @@ impl CommandReadyState {
         if output.is_empty() {
             io::Error::other(message.to_string())
         } else {
-            io::Error::other(format!("{message}\nrecent readiness probe output:\n{output}"))
+            io::Error::other(format!(
+                "{message}\nrecent readiness probe output:\n{output}"
+            ))
         }
     }
 }
@@ -781,10 +859,8 @@ mod tests {
     use std::fs;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "loggle-runtime-test-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("loggle-runtime-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
@@ -918,10 +994,7 @@ mod tests {
     fn start_commands_wait_for_ready_command_before_starting_dependents() {
         let cwd = temp_dir("ready-command");
         let (tx, mut rx) = mpsc::channel(16);
-        let mut db = start_command(
-            "db",
-            &["/bin/sh", "-c", "sleep 0.1; touch ready; sleep 1"],
-        );
+        let mut db = start_command("db", &["/bin/sh", "-c", "sleep 0.1; touch ready; sleep 1"]);
         db.cwd = Some(cwd.clone());
         db.ready = Some(ReadySpec::Command {
             command: command(&["/bin/sh", "-c", "echo probe-output; test -f ready"]),
@@ -990,6 +1063,24 @@ mod tests {
     }
 
     #[test]
+    fn startup_line_buffer_drains_channel_and_keeps_tail() {
+        let (tx, mut rx) = mpsc::channel(4);
+        for index in 0..4 {
+            tx.try_send(format!("line {index}")).unwrap();
+        }
+        assert!(tx.try_send("would-block".to_string()).is_err());
+
+        let mut buffer = StartupLineBuffer::new(2);
+        buffer.drain(&mut rx);
+
+        assert_eq!(
+            buffer.into_vec(),
+            vec!["line 2".to_string(), "line 3".to_string()]
+        );
+        tx.try_send("line 4".to_string()).unwrap();
+    }
+
+    #[test]
     fn start_command_ready_timeout_kills_started_children() {
         let cwd = temp_dir("ready-timeout");
         let pid_file = cwd.join("pid");
@@ -1048,10 +1139,16 @@ mod tests {
         };
 
         shutdown.escalate(now + interrupt_timeout());
-        assert_eq!(shutdown.status(), ShutdownStatus::Waiting(ShutdownSignal::Terminate));
+        assert_eq!(
+            shutdown.status(),
+            ShutdownStatus::Waiting(ShutdownSignal::Terminate)
+        );
 
         shutdown.escalate(now + interrupt_timeout() + terminate_timeout());
-        assert_eq!(shutdown.status(), ShutdownStatus::Waiting(ShutdownSignal::Kill));
+        assert_eq!(
+            shutdown.status(),
+            ShutdownStatus::Waiting(ShutdownSignal::Kill)
+        );
     }
 
     #[test]
@@ -1067,7 +1164,10 @@ mod tests {
 
         shutdown.escalate_now(now);
 
-        assert_eq!(shutdown.status(), ShutdownStatus::Waiting(ShutdownSignal::Terminate));
+        assert_eq!(
+            shutdown.status(),
+            ShutdownStatus::Waiting(ShutdownSignal::Terminate)
+        );
     }
 
     #[test]

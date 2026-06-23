@@ -36,10 +36,15 @@ impl ConfigEnv {
 
 #[derive(Debug)]
 pub enum ConfigError {
-    InvalidName { name: String },
+    InvalidName {
+        name: String,
+    },
     MissingConfigDirectory,
     MissingFile(PathBuf),
-    Read { path: PathBuf, source: io::Error },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
     Parse {
         path: Option<PathBuf>,
         source: toml::de::Error,
@@ -147,10 +152,7 @@ pub fn parse_config(input: &str) -> Result<StartConfig, ConfigError> {
     parse_config_with_path(input, None)
 }
 
-fn parse_config_with_path(
-    input: &str,
-    path: Option<PathBuf>,
-) -> Result<StartConfig, ConfigError> {
+fn parse_config_with_path(input: &str, path: Option<PathBuf>) -> Result<StartConfig, ConfigError> {
     let raw = toml::from_str::<RawConfig>(input).map_err(|source| ConfigError::Parse {
         path: path.clone(),
         source,
@@ -159,10 +161,7 @@ fn parse_config_with_path(
     validate_config(raw, path)
 }
 
-fn validate_config(
-    raw: RawConfig,
-    path: Option<PathBuf>,
-) -> Result<StartConfig, ConfigError> {
+fn validate_config(raw: RawConfig, path: Option<PathBuf>) -> Result<StartConfig, ConfigError> {
     let root = raw
         .root
         .ok_or_else(|| validation_error(path.clone(), "missing required field `root`"))?;
@@ -204,7 +203,10 @@ fn validate_config(
         .map(|(name, command)| {
             let name = name.trim().to_string();
             if name.is_empty() {
-                return Err(validation_error(path.clone(), "command names must not be empty"));
+                return Err(validation_error(
+                    path.clone(),
+                    "command names must not be empty",
+                ));
             }
 
             let command = validate_command(name, command, &root, &env, path.clone())?;
@@ -428,8 +430,8 @@ fn merged_env(
 fn validate_config_name(name: &str) -> Result<&str, ConfigError> {
     let name = name.trim();
     let mut components = Path::new(name).components();
-    let is_simple_name = matches!(components.next(), Some(Component::Normal(_)))
-        && components.next().is_none();
+    let is_simple_name =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
 
     if is_simple_name {
         Ok(name)
@@ -834,9 +836,10 @@ wait_for = ["api"]
     #[test]
     fn rejects_malformed_toml() {
         assert!(
-            parse_config("root = ").unwrap_err().to_string().starts_with(
-                "failed to parse config: TOML parse error"
-            )
+            parse_config("root = ")
+                .unwrap_err()
+                .to_string()
+                .starts_with("failed to parse config: TOML parse error")
         );
     }
 

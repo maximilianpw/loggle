@@ -66,6 +66,26 @@ workflow and adds the pieces you usually reach for in heavier log tools:
 | Property filters and inline fields | no | no | yes |
 | Command-owned shutdown | no | no | yes |
 
+## Installation
+
+Install from crates.io:
+
+```sh
+cargo install loggle
+```
+
+Install the prebuilt binary with Homebrew:
+
+```sh
+brew install maximilianpw/tap/loggle
+```
+
+Install the latest GitHub Release binary with the generated installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/maximilianpw/loggle/releases/latest/download/loggle-installer.sh | sh
+```
+
 ## Usage
 
 From this repository:
@@ -465,3 +485,42 @@ The debug binary is written to:
 ```sh
 target/debug/loggle
 ```
+
+## Release
+
+Before the first public release:
+
+- Create or confirm the `maximilianpw/homebrew-tap` GitHub repository.
+- Add a GitHub Actions secret named `HOMEBREW_TAP_TOKEN` to this repository.
+  The token needs write access to `maximilianpw/homebrew-tap`.
+- Log in to crates.io locally with `cargo login`.
+
+For each release:
+
+Update `version` in `Cargo.toml`, then run the local checks:
+
+```sh
+cargo fmt --all -- --check
+cargo test --locked --all-targets
+cargo publish --dry-run
+```
+
+Commit the release, push it to `main`, then push a matching semver tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Pushing the tag runs the generated `cargo-dist` release workflow. It builds
+Linux, macOS, and Windows archives, creates the GitHub Release, publishes the
+Homebrew formula to `maximilianpw/homebrew-tap`, and renders the release body
+with install commands.
+
+After the GitHub release workflow succeeds, publish the crate:
+
+```sh
+cargo publish
+```
+
+Crates.io versions are permanent: a published version cannot be overwritten.

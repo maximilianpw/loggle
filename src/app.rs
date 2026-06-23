@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::buffer::{BufferChange, LogBuffer};
-use crate::commands::{Command, COMMANDS};
+use crate::commands::{COMMANDS, Command};
 use crate::filter::{
     FilterEdit, FilterPresetRow, FilterWorkflow, LogFilter, PropertyFilterId, PropertyFilterRow,
 };
@@ -206,9 +206,7 @@ impl App {
         self.message_field_keys
             .iter()
             .map(String::as_str)
-            .filter(|key| {
-                query.is_empty() || crate::filter::contains_ignore_ascii_case(key, query)
-            })
+            .filter(|key| query.is_empty() || crate::filter::contains_ignore_ascii_case(key, query))
             .collect()
     }
 
@@ -355,8 +353,11 @@ impl App {
     }
 
     pub fn sync_log_viewport(&mut self, viewport_height: usize) {
-        self.visible
-            .sync_viewport(&self.buffer, self.filter_workflow.filters(), viewport_height);
+        self.visible.sync_viewport(
+            &self.buffer,
+            self.filter_workflow.filters(),
+            viewport_height,
+        );
     }
 
     pub fn move_down(&mut self, amount: usize) {
@@ -447,7 +448,8 @@ impl App {
     }
 
     pub fn move_palette_down(&mut self, amount: usize) {
-        self.palette.move_down(amount, self.palette_commands().len());
+        self.palette
+            .move_down(amount, self.palette_commands().len());
     }
 
     pub fn move_palette_up(&mut self, amount: usize) {
@@ -491,11 +493,18 @@ impl App {
 
     pub fn add_selected_message_field(&mut self) {
         self.pending_g = false;
-        let Some(key) = self.selected_property().map(|property| property.key.clone()) else {
+        let Some(key) = self
+            .selected_property()
+            .map(|property| property.key.clone())
+        else {
             return;
         };
 
-        if !self.message_field_keys.iter().any(|existing| existing == &key) {
+        if !self
+            .message_field_keys
+            .iter()
+            .any(|existing| existing == &key)
+        {
             self.message_field_keys.push(key);
         }
         self.sync_message_field_selection();
@@ -717,11 +726,8 @@ impl App {
 
     fn move_to_search_match(&mut self, forward: bool) {
         self.pending_g = false;
-        self.visible.move_to_search_match(
-            &self.buffer,
-            self.filter_workflow.filters(),
-            forward,
-        );
+        self.visible
+            .move_to_search_match(&self.buffer, self.filter_workflow.filters(), forward);
         self.sync_selected_property();
     }
 
@@ -736,11 +742,8 @@ impl App {
         for sequence in &change.removed {
             self.remove_marker(sequence);
         }
-        self.visible.on_line_received(
-            &change,
-            &self.buffer,
-            self.filter_workflow.filters(),
-        );
+        self.visible
+            .on_line_received(&change, &self.buffer, self.filter_workflow.filters());
     }
 
     fn sync_visible_cache(&mut self) {
@@ -1058,10 +1061,16 @@ mod tests {
         app.jump_top();
 
         app.next_search_match();
-        assert_eq!(app.event_at_visible(app.selected()).unwrap().raw, "web | ERROR two");
+        assert_eq!(
+            app.event_at_visible(app.selected()).unwrap().raw,
+            "web | ERROR two"
+        );
 
         app.previous_search_match();
-        assert_eq!(app.event_at_visible(app.selected()).unwrap().raw, "api | ERROR one");
+        assert_eq!(
+            app.event_at_visible(app.selected()).unwrap().raw,
+            "api | ERROR one"
+        );
     }
 
     #[test]
@@ -1292,10 +1301,8 @@ mod tests {
         }
         app.apply_prompt();
 
-        let path = std::env::temp_dir().join(format!(
-            "loggle-export-test-{}.log",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("loggle-export-test-{}.log", std::process::id()));
         let count = app.export_visible_logs(&path).unwrap();
         let output = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);

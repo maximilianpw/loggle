@@ -34,7 +34,10 @@ pub struct PropertyFilterId {
 impl LogFilter {
     pub fn has_active_filters(&self) -> bool {
         self.text.as_ref().is_some_and(|query| !query.is_empty())
-            || self.source.as_ref().is_some_and(|source| !source.is_empty())
+            || self
+                .source
+                .as_ref()
+                .is_some_and(|source| !source.is_empty())
             || self.level.is_some()
             || !self.property_includes.is_empty()
             || !self.property_excludes.is_empty()
