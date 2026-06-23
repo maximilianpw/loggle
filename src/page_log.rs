@@ -151,6 +151,7 @@ pub struct ActiveLogPage {
 pub struct LogPageTailOptions {
     pub line_count: usize,
     pub source: Option<String>,
+    pub text: Option<String>,
     pub property_filters: Vec<String>,
     pub source_config: SourceConfig,
 }
@@ -160,6 +161,7 @@ impl LogPageTailOptions {
         Self {
             line_count,
             source: None,
+            text: None,
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
         }
@@ -169,6 +171,7 @@ impl LogPageTailOptions {
         self.source
             .as_ref()
             .is_some_and(|source| !source.is_empty())
+            || self.text.as_ref().is_some_and(|text| !text.is_empty())
             || !self.property_filters.is_empty()
     }
 }
@@ -458,6 +461,11 @@ fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, Log
         .as_ref()
         .map(|source| source.trim().to_string())
         .filter(|source| !source.is_empty());
+    filter.text = options
+        .text
+        .as_ref()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
 
     for property_filter in &options.property_filters {
         let update = PropertyFilterUpdate::parse(property_filter, false)
@@ -637,6 +645,7 @@ mod tests {
         let options = LogPageTailOptions {
             line_count: 2,
             source: Some("api".to_string()),
+            text: None,
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
         };
@@ -656,6 +665,7 @@ mod tests {
         let options = LogPageTailOptions {
             line_count: 5,
             source: Some("api".to_string()),
+            text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
             source_config: SourceConfig::default(),
         };
@@ -675,6 +685,7 @@ mod tests {
         let options = LogPageTailOptions {
             line_count: 5,
             source: None,
+            text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
             source_config: SourceConfig::default(),
         };
@@ -698,11 +709,13 @@ mod tests {
 
     #[test]
     fn filtered_tail_lines_counts_matching_records_not_lines() {
-        let input = "api | INFO a tenantId=t1\napi | INFO b tenantId=t1\napi | INFO c tenantId=t1\n"
-            .as_bytes();
+        let input =
+            "api | INFO a tenantId=t1\napi | INFO b tenantId=t1\napi | INFO c tenantId=t1\n"
+                .as_bytes();
         let options = LogPageTailOptions {
             line_count: 2,
             source: None,
+            text: None,
             property_filters: vec!["tenantId=t1".to_string()],
             source_config: SourceConfig::default(),
         };
@@ -715,6 +728,50 @@ mod tests {
             vec![
                 "api | INFO b tenantId=t1".to_string(),
                 "api | INFO c tenantId=t1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn filtered_tail_lines_matches_text() {
+        let input = "api | INFO ready\napi | ERROR database unavailable\nweb | ERROR database unavailable\n"
+            .as_bytes();
+        let options = LogPageTailOptions {
+            line_count: 5,
+            source: Some("api".to_string()),
+            text: Some("database".to_string()),
+            property_filters: Vec::new(),
+            source_config: SourceConfig::default(),
+        };
+
+        let lines =
+            filtered_tail_lines(BufReader::new(input), &options, Path::new("test.log")).unwrap();
+
+        assert_eq!(lines, vec!["api | ERROR database unavailable".to_string()]);
+    }
+
+    #[test]
+    fn vev_compose_fixture_replays_buildkit_and_status_filters() {
+        let options = LogPageTailOptions {
+            line_count: 10,
+            source: Some("vev-statistics".to_string()),
+            text: Some("npm ci".to_string()),
+            property_filters: Vec::new(),
+            source_config: SourceConfig::default(),
+        };
+
+        let lines = filtered_tail_lines(
+            BufReader::new(include_str!("../fixtures/vev-compose-smoke.log").as_bytes()),
+            &options,
+            Path::new("fixtures/vev-compose-smoke.log"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lines,
+            vec![
+                "#35 [vev-statistics base 5/7] RUN --mount=type=secret,id=NODE_AUTH_TOKEN sh -c 'npm ci'".to_string(),
+                "#35 0.531 npm ci".to_string(),
             ]
         );
     }
@@ -825,7 +882,8 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         let id = LogPageId::parse("api").unwrap();
-        let (_, _registration) = claim_active_log_page_in_dir(Some(id.clone()), "api", &dir).unwrap();
+        let (_, _registration) =
+            claim_active_log_page_in_dir(Some(id.clone()), "api", &dir).unwrap();
 
         let error = claim_active_log_page_in_dir(Some(id), "api", &dir).unwrap_err();
 

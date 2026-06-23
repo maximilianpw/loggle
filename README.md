@@ -94,6 +94,7 @@ loggle -- docker compose up
 loggle pages
 loggle log -i 1 -n 5
 loggle log -i 1 -n 5 --service api
+loggle log -i 1 -n 5 --text database
 loggle log -i 1 -n 5 --property requestId=716d1e62
 loggle --id api -- docker compose up
 loggle start
@@ -150,18 +151,22 @@ Use `--id` when you want to choose a stable human-readable ID yourself:
 loggle --id api -- docker compose up
 ```
 
-Filter the tail to a service/source or parsed property:
+Filter the tail to a service/source, text query, or parsed property:
 
 ```sh
 loggle log -i 1 -n 5 --service api
+loggle log -i 1 -n 5 --text "database unavailable"
 loggle log -i 1 -n 5 --source worker --property tenantId=tenant-1
+loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1
 loggle log -i 1 -n 5 --property requestId
 ```
 
-Property filters use the same syntax as the TUI property prompt: `key`,
-`key=value`, `key!=value`, and `!key`. A filtered tail returns whole matching
-records — the header line plus any folded multi-line property block — and `-n`
-counts matching records rather than individual lines.
+Text filters match the same event fields as TUI search: raw line, parsed
+message, source, and property keys/values. Property filters use the same syntax
+as the TUI property prompt: `key`, `key=value`, `key!=value`, and `!key`. A
+filtered tail returns whole matching records — the header line plus any folded
+multi-line property block — and `-n` counts matching records rather than
+individual lines.
 
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the

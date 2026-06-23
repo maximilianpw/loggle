@@ -7,9 +7,9 @@ use std::{
 
 use clap::Parser;
 use loggle::{
-    active_log_pages, load_named_config, load_project_config, print_log_page_tail_with_options,
-    run, ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
-    RuntimeError, RuntimeInput, SourceConfig,
+    ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
+    RuntimeError, RuntimeInput, SourceConfig, active_log_pages, load_named_config,
+    load_project_config, print_log_page_tail_with_options, run,
 };
 
 #[derive(Debug, Parser)]
@@ -17,7 +17,7 @@ use loggle::{
     name = "loggle",
     about = "A terminal log viewer for piped Docker Compose-style logs.",
     dont_delimit_trailing_values = true,
-    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --property tenantId=tenant-1"
+    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
 )]
 struct Cli {
     #[arg(long, default_value_t = 100_000, value_parser = parse_buffer_lines)]
@@ -81,6 +81,15 @@ struct LogCli {
     )]
     property_filters: Vec<String>,
 
+    #[arg(
+        short = 't',
+        long = "text",
+        visible_alias = "search",
+        value_name = "QUERY",
+        value_parser = parse_text_filter
+    )]
+    text: Option<String>,
+
     #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
     source_fields: Vec<String>,
 }
@@ -128,6 +137,10 @@ fn parse_source_filter(input: &str) -> Result<String, String> {
 
 fn parse_property_filter(input: &str) -> Result<String, String> {
     parse_non_empty(input, "property filter")
+}
+
+fn parse_text_filter(input: &str) -> Result<String, String> {
+    parse_non_empty(input, "text filter")
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -189,6 +202,7 @@ fn run_log_command(cli: LogCli) -> Result<(), LogPageError> {
     let options = LogPageTailOptions {
         line_count: cli.lines,
         source: cli.source,
+        text: cli.text,
         property_filters: cli.property_filters,
         source_config: SourceConfig::with_fields(cli.source_fields),
     };
@@ -516,7 +530,13 @@ api = ["pnpm", "start"]
 
     #[test]
     fn record_option_does_not_consume_runtime_command() {
-        let cli = parse_cli(&command(&["--record", "session.log", "docker", "compose", "up"]));
+        let cli = parse_cli(&command(&[
+            "--record",
+            "session.log",
+            "docker",
+            "compose",
+            "up",
+        ]));
 
         assert_eq!(
             runtime_input(cli.command),
@@ -567,6 +587,8 @@ api = ["pnpm", "start"]
             "5",
             "--service",
             "api",
+            "--text",
+            "database",
             "--property",
             "tenantId=tenant-1",
             "--source-field",
@@ -577,6 +599,7 @@ api = ["pnpm", "start"]
         assert_eq!(cli.id.as_str(), "1");
         assert_eq!(cli.lines, 5);
         assert_eq!(cli.source.as_deref(), Some("api"));
+        assert_eq!(cli.text.as_deref(), Some("database"));
         assert_eq!(cli.property_filters, command(&["tenantId=tenant-1"]));
         assert_eq!(cli.source_fields, command(&["service"]));
     }
