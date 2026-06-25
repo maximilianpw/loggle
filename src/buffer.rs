@@ -5,6 +5,8 @@ use crate::model::{
     parse_buildkit_step_line,
 };
 
+const DOCKER_BUILD_SOURCE: &str = "docker";
+
 #[derive(Debug)]
 pub struct LogBuffer {
     capacity: usize,
@@ -148,7 +150,12 @@ impl LogBuffer {
             parsed.source = source.clone();
             parsed.message = buildkit.message;
             parsed.source_explicit = true;
+            return;
         }
+
+        parsed.source = DOCKER_BUILD_SOURCE.to_string();
+        parsed.message = buildkit.message;
+        parsed.source_explicit = true;
     }
 
     fn apply_source_context(&mut self, parsed: &mut ParsedLine) {
@@ -511,6 +518,23 @@ mod tests {
             "#11 [internal] load metadata for node"
         );
         assert_eq!(buffer.events()[1].message, "#11 DONE 1.4s");
+    }
+
+    #[test]
+    fn marks_buildkit_lines_without_service_as_docker() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line(
+            "#0 building with \"desktop-linux\" instance using docker driver".to_string(),
+        );
+        buffer.push_line("#1 [internal] load build definition from Dockerfile".to_string());
+        buffer.push_line("#1 DONE 0.0s".to_string());
+
+        assert_eq!(sources(&buffer), vec!["docker", "docker", "docker"]);
+        assert_eq!(
+            buffer.events()[1].message,
+            "#1 [internal] load build definition from Dockerfile"
+        );
     }
 
     #[test]

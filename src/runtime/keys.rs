@@ -106,7 +106,9 @@ fn handle_dialog_key(
 }
 
 fn delete_key_removes_dialog_row(app: &App, kind: DialogKind) -> bool {
-    kind == DialogKind::PropertyFilters || app.dialog_query(kind).is_empty()
+    kind == DialogKind::PropertyFilters
+        || kind == DialogKind::DisplayFields
+        || app.dialog_query(kind).is_empty()
 }
 
 fn handle_palette_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
@@ -141,8 +143,8 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::PreviousProperty => app.previous_property(),
         CommandAction::NextProperty => app.next_property(),
         CommandAction::FollowProperty => app.follow_selected_property(),
-        CommandAction::AddMessageField => app.add_selected_message_field(),
-        CommandAction::MessageFields => app.open_dialog(DialogKind::MessageFields),
+        CommandAction::AddDisplayField => app.add_selected_display_field(),
+        CommandAction::DisplayFields => app.open_dialog(DialogKind::DisplayFields),
         CommandAction::PropertyFilters => app.open_dialog(DialogKind::PropertyFilters),
         CommandAction::IncludeProperty => app.start_prompt(PromptKind::IncludeProperty),
         CommandAction::ExcludeProperty => app.start_prompt(PromptKind::ExcludeProperty),
@@ -279,12 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn capital_m_opens_message_fields_dialog() {
+    fn capital_m_opens_display_fields_dialog() {
         let mut app = App::new(10);
 
         handle_key(&mut app, key(KeyCode::Char('M')), 5);
 
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::DisplayFields));
     }
 
     #[test]
@@ -410,32 +412,36 @@ mod tests {
     }
 
     #[test]
-    fn message_fields_dialog_searches_and_deletes() {
+    fn display_fields_dialog_searches_toggles_and_deletes() {
         let mut app = App::new(10);
-        add_message_field_from_selected_property(&mut app);
+        add_display_field_from_selected_property(&mut app);
 
-        app.open_dialog(DialogKind::MessageFields);
+        app.open_dialog(DialogKind::DisplayFields);
         handle_key(&mut app, key(KeyCode::Char('t')), 5);
-        assert_eq!(app.dialog_query(DialogKind::MessageFields), "t");
+        assert_eq!(app.dialog_query(DialogKind::DisplayFields), "t");
 
         handle_key(&mut app, key(KeyCode::Backspace), 5);
-        assert_eq!(app.dialog_query(DialogKind::MessageFields), "");
+        assert_eq!(app.dialog_query(DialogKind::DisplayFields), "");
 
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+        assert!(app.display_field_keys().is_empty());
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+        assert_eq!(app.display_field_keys(), &["tenantId".to_string()]);
         handle_key(&mut app, key(KeyCode::Delete), 5);
-        assert!(app.message_field_keys().is_empty());
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
+        assert!(app.display_field_keys().is_empty());
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::DisplayFields));
     }
 
     #[test]
-    fn message_fields_dialog_backspace_deletes_when_search_is_empty() {
+    fn display_fields_dialog_backspace_deletes_when_search_is_empty() {
         let mut app = App::new(10);
-        add_message_field_from_selected_property(&mut app);
+        add_display_field_from_selected_property(&mut app);
 
-        app.open_dialog(DialogKind::MessageFields);
+        app.open_dialog(DialogKind::DisplayFields);
         handle_key(&mut app, key(KeyCode::Backspace), 5);
 
-        assert!(app.message_field_keys().is_empty());
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
+        assert!(app.display_field_keys().is_empty());
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::DisplayFields));
     }
 
     #[test]
@@ -541,14 +547,10 @@ mod tests {
         handle_key(app, key(KeyCode::Enter), 5);
     }
 
-    fn add_message_field_from_selected_property(app: &mut App) {
-        app.push_line("14:06:58.892 INFO request completed".to_string());
-        app.push_line("[14:06:58.892] INFO (#1):".to_string());
-        app.push_line("{".to_string());
-        app.push_line("tenantId: \"tenant-1\",".to_string());
-        app.push_line("}".to_string());
+    fn add_display_field_from_selected_property(app: &mut App) {
+        app.push_line("api | INFO request tenantId=tenant-1".to_string());
 
         handle_key(app, key(KeyCode::Char('m')), 5);
-        assert_eq!(app.message_field_keys(), &["tenantId".to_string()]);
+        assert_eq!(app.display_field_keys(), &["tenantId".to_string()]);
     }
 }

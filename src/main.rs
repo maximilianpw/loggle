@@ -50,7 +50,7 @@ struct Cli {
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
-        help = "Command to run under loggle; use dc as a shortcut for docker compose up"
+        help = "Command to run under loggle; use dc/dcb as shortcuts for docker compose up/build"
     )]
     command: Vec<String>,
 }
@@ -338,6 +338,8 @@ fn runtime_input_for_command_with_context(
 fn command_for_runtime(command: Vec<String>) -> Vec<String> {
     if command == ["dc"] {
         vec!["docker".into(), "compose".into(), "up".into()]
+    } else if command == ["dcb"] {
+        vec!["docker".into(), "compose".into(), "build".into()]
     } else {
         command
     }
@@ -470,10 +472,26 @@ api = ["pnpm", "start"]
     }
 
     #[test]
+    fn dcb_expands_to_docker_compose_build() {
+        assert_eq!(
+            runtime_input(command(&["dcb"])),
+            RuntimeInput::Command(command(&["docker", "compose", "build"]))
+        );
+    }
+
+    #[test]
     fn dc_with_arguments_is_not_a_compose_shortcut() {
         assert_eq!(
             runtime_input(command(&["dc", "logs", "-f"])),
             RuntimeInput::Command(command(&["dc", "logs", "-f"]))
+        );
+    }
+
+    #[test]
+    fn dcb_with_arguments_is_not_a_compose_shortcut() {
+        assert_eq!(
+            runtime_input(command(&["dcb", "api"])),
+            RuntimeInput::Command(command(&["dcb", "api"]))
         );
     }
 

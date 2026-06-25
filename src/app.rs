@@ -31,7 +31,7 @@ pub enum PromptKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogKind {
     PropertyFilters,
-    MessageFields,
+    DisplayFields,
     FilterPresets,
     Sources,
 }
@@ -56,6 +56,19 @@ pub struct SourceStatusRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayFieldRow {
+    pub key: String,
+    pub count: usize,
+    pub shown: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayFieldColumn {
+    pub key: String,
+    pub width: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YankedLines {
     pub text: String,
     pub line_count: usize,
@@ -77,11 +90,13 @@ pub struct App {
     selected_property: usize,
     property_filters: SearchableListState,
     editing_property_filter: Option<PropertyFilterId>,
-    message_field_keys: Vec<String>,
-    message_fields: SearchableListState,
+    display_field_keys: Vec<String>,
+    display_fields: SearchableListState,
     filter_preset_list: SearchableListState,
     sources: SearchableListState,
 }
+
+const MAX_DISPLAY_FIELD_WIDTH: usize = 32;
 
 impl App {
     #[cfg(test)]
@@ -105,8 +120,8 @@ impl App {
             selected_property: 0,
             property_filters: SearchableListState::default(),
             editing_property_filter: None,
-            message_field_keys: Vec::new(),
-            message_fields: SearchableListState::default(),
+            display_field_keys: Vec::new(),
+            display_fields: SearchableListState::default(),
             filter_preset_list: SearchableListState::default(),
             sources: SearchableListState::default(),
         }
@@ -197,23 +212,51 @@ impl App {
             .cloned()
     }
 
-    pub fn message_field_keys(&self) -> &[String] {
-        &self.message_field_keys
+    #[cfg(test)]
+    pub fn display_field_keys(&self) -> &[String] {
+        &self.display_field_keys
     }
 
-    pub fn message_field_rows(&self) -> Vec<&str> {
-        let query = self.message_fields.query().trim();
-        self.message_field_keys
-            .iter()
-            .map(String::as_str)
-            .filter(|key| query.is_empty() || crate::filter::contains_ignore_ascii_case(key, query))
+    pub fn display_field_rows(&self) -> Vec<DisplayFieldRow> {
+        let query = self.display_fields.query().trim();
+        self.all_display_field_rows()
+            .into_iter()
+            .filter(|row| display_field_row_matches(row, query))
             .collect()
     }
 
-    pub fn selected_message_field_key(&self) -> Option<&str> {
-        self.message_field_rows()
-            .get(self.message_fields.selected())
-            .copied()
+    pub fn selected_display_field_row(&self) -> Option<DisplayFieldRow> {
+        self.display_field_rows()
+            .get(self.display_fields.selected())
+            .cloned()
+    }
+
+    pub fn display_field_columns(&self) -> Vec<DisplayFieldColumn> {
+        let mut columns = self
+            .display_field_keys
+            .iter()
+            .map(|key| (key.clone(), key.chars().count().max("-".chars().count())))
+            .collect::<Vec<_>>();
+
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        self.for_each_visible_event(0, self.visible_count(), |_, event| {
+            for (key, width) in &mut columns {
+                if let Some(property) = event.property(key) {
+                    *width = (*width).max(property.value.as_display_str().chars().count());
+                }
+            }
+        });
+
+        columns
+            .into_iter()
+            .map(|(key, width)| DisplayFieldColumn {
+                key,
+                width: width.min(MAX_DISPLAY_FIELD_WIDTH),
+            })
+            .collect()
     }
 
     pub fn filter_preset_rows(&self) -> Vec<FilterPresetRow> {
@@ -491,7 +534,7 @@ impl App {
         self.dialog_state_mut(kind).pop_query_char(len);
     }
 
-    pub fn add_selected_message_field(&mut self) {
+    pub fn add_selected_display_field(&mut self) {
         self.pending_g = false;
         let Some(key) = self
             .selected_property()
@@ -500,20 +543,14 @@ impl App {
             return;
         };
 
-        if !self
-            .message_field_keys
-            .iter()
-            .any(|existing| existing == &key)
-        {
-            self.message_field_keys.push(key);
-        }
-        self.sync_message_field_selection();
+        self.show_display_field(key);
+        self.sync_display_field_selection();
     }
 
     pub fn activate_selected_dialog_row(&mut self, kind: DialogKind) {
         match kind {
             DialogKind::PropertyFilters => self.start_property_filter_edit(),
-            DialogKind::MessageFields => {}
+            DialogKind::DisplayFields => self.toggle_selected_display_field(),
             DialogKind::FilterPresets => self.apply_selected_filter_preset(),
             DialogKind::Sources => {}
         }
@@ -522,7 +559,7 @@ impl App {
     pub fn delete_selected_dialog_row(&mut self, kind: DialogKind) {
         match kind {
             DialogKind::PropertyFilters => self.delete_selected_property_filter(),
-            DialogKind::MessageFields => self.delete_selected_message_field(),
+            DialogKind::DisplayFields => self.delete_selected_display_field(),
             DialogKind::FilterPresets => self.delete_selected_filter_preset(),
             DialogKind::Sources => {}
         }
@@ -805,7 +842,7 @@ impl App {
     fn dialog_state(&self, kind: DialogKind) -> &SearchableListState {
         match kind {
             DialogKind::PropertyFilters => &self.property_filters,
-            DialogKind::MessageFields => &self.message_fields,
+            DialogKind::DisplayFields => &self.display_fields,
             DialogKind::FilterPresets => &self.filter_preset_list,
             DialogKind::Sources => &self.sources,
         }
@@ -814,7 +851,7 @@ impl App {
     fn dialog_state_mut(&mut self, kind: DialogKind) -> &mut SearchableListState {
         match kind {
             DialogKind::PropertyFilters => &mut self.property_filters,
-            DialogKind::MessageFields => &mut self.message_fields,
+            DialogKind::DisplayFields => &mut self.display_fields,
             DialogKind::FilterPresets => &mut self.filter_preset_list,
             DialogKind::Sources => &mut self.sources,
         }
@@ -823,7 +860,7 @@ impl App {
     fn dialog_len(&self, kind: DialogKind) -> usize {
         match kind {
             DialogKind::PropertyFilters => self.property_filter_rows().len(),
-            DialogKind::MessageFields => self.message_field_rows().len(),
+            DialogKind::DisplayFields => self.display_field_rows().len(),
             DialogKind::FilterPresets => self.filter_preset_rows().len(),
             DialogKind::Sources => self.source_status_rows().len(),
         }
@@ -844,14 +881,7 @@ impl App {
     fn dialog_len_for_query(&self, kind: DialogKind, query: &str) -> usize {
         match kind {
             DialogKind::PropertyFilters => self.filter_workflow.property_filter_row_count(query),
-            DialogKind::MessageFields => self
-                .message_field_keys
-                .iter()
-                .filter(|key| {
-                    query.is_empty()
-                        || crate::filter::contains_ignore_ascii_case(key.as_str(), query)
-                })
-                .count(),
+            DialogKind::DisplayFields => self.display_field_row_count(query),
             DialogKind::FilterPresets => self.filter_workflow.filter_preset_row_count(query),
             DialogKind::Sources => self.source_status_rows_for_query(query).len(),
         }
@@ -870,8 +900,8 @@ impl App {
         self.sync_dialog_selection(DialogKind::PropertyFilters);
     }
 
-    fn sync_message_field_selection(&mut self) {
-        self.sync_dialog_selection(DialogKind::MessageFields);
+    fn sync_display_field_selection(&mut self) {
+        self.sync_dialog_selection(DialogKind::DisplayFields);
     }
 
     fn sync_filter_preset_selection(&mut self) {
@@ -889,18 +919,75 @@ impl App {
         self.sync_selection();
     }
 
-    fn delete_selected_message_field(&mut self) {
-        let Some(key) = self.selected_message_field_key().map(str::to_string) else {
+    fn delete_selected_display_field(&mut self) {
+        let Some(row) = self.selected_display_field_row() else {
             return;
         };
-        if let Some(index) = self
-            .message_field_keys
-            .iter()
-            .position(|candidate| candidate == &key)
-        {
-            self.message_field_keys.remove(index);
+        self.hide_display_field(&row.key);
+        self.sync_display_field_selection();
+    }
+
+    fn toggle_selected_display_field(&mut self) {
+        let Some(row) = self.selected_display_field_row() else {
+            return;
+        };
+
+        if row.shown {
+            self.hide_display_field(&row.key);
+        } else {
+            self.show_display_field(row.key);
         }
-        self.sync_message_field_selection();
+        self.sync_display_field_selection();
+    }
+
+    fn show_display_field(&mut self, key: String) {
+        if !self
+            .display_field_keys
+            .iter()
+            .any(|existing| existing == &key)
+        {
+            self.display_field_keys.push(key);
+        }
+    }
+
+    fn hide_display_field(&mut self, key: &str) {
+        if let Some(index) = self
+            .display_field_keys
+            .iter()
+            .position(|candidate| candidate == key)
+        {
+            self.display_field_keys.remove(index);
+        }
+    }
+
+    fn all_display_field_rows(&self) -> Vec<DisplayFieldRow> {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for event in self.buffer.events() {
+            for property in &event.properties {
+                *counts.entry(property.key.clone()).or_default() += 1;
+            }
+        }
+        for key in &self.display_field_keys {
+            counts.entry(key.clone()).or_default();
+        }
+
+        counts
+            .into_iter()
+            .map(|(key, count)| {
+                let shown = self
+                    .display_field_keys
+                    .iter()
+                    .any(|display_key| display_key == &key);
+                DisplayFieldRow { key, count, shown }
+            })
+            .collect()
+    }
+
+    fn display_field_row_count(&self, query: &str) -> usize {
+        self.all_display_field_rows()
+            .into_iter()
+            .filter(|row| display_field_row_matches(row, query))
+            .count()
     }
 
     fn apply_selected_filter_preset(&mut self) {
@@ -935,6 +1022,10 @@ fn filter_edit(kind: PromptKind) -> FilterEdit {
         PromptKind::ExcludeProperty => FilterEdit::ExcludeProperty,
         PromptKind::EditPropertyFilter => FilterEdit::EditPropertyFilter,
     }
+}
+
+fn display_field_row_matches(row: &DisplayFieldRow, query: &str) -> bool {
+    query.is_empty() || crate::filter::contains_ignore_ascii_case(&row.key, query)
 }
 
 #[cfg(test)]
@@ -1439,62 +1530,186 @@ mod tests {
     }
 
     #[test]
-    fn adding_selected_message_field_uses_property_key_once() {
+    fn adding_selected_display_field_uses_property_key_once() {
         let mut app = App::new(10);
-        app.push_line("14:06:58.892 INFO request completed".to_string());
-        app.push_line("[14:06:58.892] INFO (#1):".to_string());
-        app.push_line("{".to_string());
-        app.push_line("tenantId: \"tenant-1\",".to_string());
-        app.push_line("requestId: \"abc\",".to_string());
-        app.push_line("}".to_string());
+        app.push_line("api | INFO request tenantId=tenant-1 requestId=abc".to_string());
 
-        app.add_selected_message_field();
-        app.add_selected_message_field();
+        app.add_selected_display_field();
+        app.add_selected_display_field();
         app.next_property();
-        app.add_selected_message_field();
+        app.add_selected_display_field();
 
         assert_eq!(
-            app.message_field_keys(),
+            app.display_field_keys(),
             &["tenantId".to_string(), "requestId".to_string()]
         );
     }
 
     #[test]
-    fn message_field_dialog_searches_and_deletes_selected_fields() {
+    fn display_field_rows_list_observed_property_counts_and_search() {
         let mut app = App::new(10);
-        app.message_field_keys = vec![
+        app.push_line("api | INFO request tenantId=tenant-1 requestId=abc".to_string());
+        app.push_line("api | INFO request tenantId=tenant-2 durationMs=96".to_string());
+        app.display_field_keys = vec!["tenantId".to_string()];
+
+        let rows = app.display_field_rows();
+
+        assert_eq!(
+            rows,
+            vec![
+                DisplayFieldRow {
+                    key: "durationMs".to_string(),
+                    count: 1,
+                    shown: false,
+                },
+                DisplayFieldRow {
+                    key: "requestId".to_string(),
+                    count: 1,
+                    shown: false,
+                },
+                DisplayFieldRow {
+                    key: "tenantId".to_string(),
+                    count: 2,
+                    shown: true,
+                },
+            ]
+        );
+
+        app.open_dialog(DialogKind::DisplayFields);
+        app.push_dialog_query_char(DialogKind::DisplayFields, 'r');
+        app.push_dialog_query_char(DialogKind::DisplayFields, 'e');
+
+        assert_eq!(
+            app.display_field_rows(),
+            vec![DisplayFieldRow {
+                key: "requestId".to_string(),
+                count: 1,
+                shown: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn display_field_dialog_toggles_selected_observed_field() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO request tenantId=tenant-1 requestId=abc".to_string());
+
+        app.open_dialog(DialogKind::DisplayFields);
+        app.push_dialog_query_char(DialogKind::DisplayFields, 'r');
+        app.push_dialog_query_char(DialogKind::DisplayFields, 'e');
+
+        app.activate_selected_dialog_row(DialogKind::DisplayFields);
+        assert_eq!(app.display_field_keys(), &["requestId".to_string()]);
+        assert!(app.display_field_rows()[0].shown);
+
+        app.activate_selected_dialog_row(DialogKind::DisplayFields);
+        assert!(app.display_field_keys().is_empty());
+        assert!(!app.display_field_rows()[0].shown);
+    }
+
+    #[test]
+    fn display_field_rows_keep_shown_fields_after_eviction() {
+        let mut app = App::new(1);
+        app.push_line("api | INFO request tenantId=tenant-1".to_string());
+        app.add_selected_display_field();
+
+        app.push_line("api | INFO no structured properties".to_string());
+
+        assert_eq!(
+            app.display_field_rows(),
+            vec![DisplayFieldRow {
+                key: "tenantId".to_string(),
+                count: 0,
+                shown: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn display_field_dialog_deletes_shown_fields() {
+        let mut app = App::new(10);
+        app.push_line(
+            "api | INFO request tenantId=tenant-1 requestId=abc durationMs=96".to_string(),
+        );
+        app.display_field_keys = vec![
             "tenantId".to_string(),
             "requestId".to_string(),
             "durationMs".to_string(),
         ];
 
-        app.open_dialog(DialogKind::MessageFields);
-        app.push_dialog_query_char(DialogKind::MessageFields, 'r');
-        app.push_dialog_query_char(DialogKind::MessageFields, 'e');
+        app.open_dialog(DialogKind::DisplayFields);
+        app.push_dialog_query_char(DialogKind::DisplayFields, 'r');
+        app.push_dialog_query_char(DialogKind::DisplayFields, 'e');
 
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
-        assert_eq!(app.message_field_rows(), vec!["requestId"]);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::DisplayFields));
+        assert_eq!(app.display_field_rows()[0].key, "requestId");
 
-        app.delete_selected_dialog_row(DialogKind::MessageFields);
+        app.delete_selected_dialog_row(DialogKind::DisplayFields);
 
         assert_eq!(
-            app.message_field_keys(),
+            app.display_field_keys(),
             &["tenantId".to_string(), "durationMs".to_string()]
         );
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
-        assert_eq!(app.selected_dialog_index(DialogKind::MessageFields), 0);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::DisplayFields));
+        assert_eq!(app.selected_dialog_index(DialogKind::DisplayFields), 0);
     }
 
     #[test]
-    fn message_field_dialog_backspace_deletes_when_search_is_empty() {
+    fn display_field_dialog_backspace_deletes_when_search_is_empty() {
         let mut app = App::new(10);
-        app.message_field_keys = vec!["tenantId".to_string()];
+        app.push_line("api | INFO request tenantId=tenant-1".to_string());
+        app.display_field_keys = vec!["tenantId".to_string()];
 
-        app.open_dialog(DialogKind::MessageFields);
-        app.delete_selected_dialog_row(DialogKind::MessageFields);
+        app.open_dialog(DialogKind::DisplayFields);
+        app.delete_selected_dialog_row(DialogKind::DisplayFields);
 
-        assert!(app.message_field_keys().is_empty());
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
+        assert!(app.display_field_keys().is_empty());
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::DisplayFields));
+    }
+
+    #[test]
+    fn display_field_columns_use_visible_rows_and_cap_long_values() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO request tenantId=short requestId=req-api".to_string());
+        app.push_line(
+            "web | INFO request tenantId=very-very-long-hidden-value requestId=req-web".to_string(),
+        );
+        app.push_line(
+            "api | INFO request longField=abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
+        );
+        app.display_field_keys = vec![
+            "tenantId".to_string(),
+            "requestId".to_string(),
+            "longField".to_string(),
+            "missing".to_string(),
+        ];
+        app.start_prompt(PromptKind::Source);
+        for ch in "api".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        assert_eq!(
+            app.display_field_columns(),
+            vec![
+                DisplayFieldColumn {
+                    key: "tenantId".to_string(),
+                    width: 8,
+                },
+                DisplayFieldColumn {
+                    key: "requestId".to_string(),
+                    width: 9,
+                },
+                DisplayFieldColumn {
+                    key: "longField".to_string(),
+                    width: 32,
+                },
+                DisplayFieldColumn {
+                    key: "missing".to_string(),
+                    width: 7,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -42,8 +42,8 @@ Loggle turns noisy multi-process output into a scannable live log view:
 - Live tail with pause/resume, scrollback, search, and jump-to-match navigation
 - Source, level, text, and structured property filters for narrowing dense logs
 - Details pane for inspecting parsed timestamps, levels, messages, and properties
-- Pinned field columns for keeping selected properties such as `requestId` or
-  `durationMs` aligned across every matching row
+- Display field columns for keeping selected properties such as `requestId` or
+  `durationMs` aligned across matching rows
 - Command palette and searchable managers for discovering and pruning active
   filters/fields
 - Graceful shutdown for launched commands: quit behaves like interrupting the
@@ -110,6 +110,7 @@ Then run it from any Compose project:
 
 ```sh
 loggle dc
+loggle dcb
 loggle -- docker compose up
 loggle pages
 loggle log -i 1 -n 5
@@ -121,9 +122,10 @@ loggle start
 loggle start libre
 ```
 
-`loggle dc` is an exact shortcut for `loggle -- docker compose up`. Only bare
-`dc` is special; use the `-- docker compose ...` form for other Compose
-commands.
+`loggle dc` is an exact shortcut for `loggle -- docker compose up`, and
+`loggle dcb` is an exact shortcut for `loggle -- docker compose build`. Only
+bare `dc` and `dcb` are special; use the `-- docker compose ...` form for other
+Compose commands.
 
 The `--` form is recommended because Loggle starts the command itself and
 captures both stdout and stderr. That prevents Docker Compose or service output
@@ -304,6 +306,7 @@ loggle start libre
 - `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
   properties. Repeat for multiple required predicates
 - `dc`: shortcut for `docker compose up`
+- `dcb`: shortcut for `docker compose build`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
   prefixes each output line with `[NAME]`, and shows them in one Loggle session
@@ -363,14 +366,14 @@ Press `?` to open the in-app command palette:
 - `Enter`: toggle selected log details
 - `[` / `]`: move through properties in the details pane
 - `f`: show only rows with the selected property value
-- `m`: pin the selected property key as a displayed log-row column
+- `m`: show the selected property key as a displayed log-row column
 
 ### Dialogs
 
-- `M`: open searchable pinned field manager
+- `M`: open searchable display field picker
 - `P`: open searchable property filter manager
 - `?`: open/close the command palette
-- Message field manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Backspace` or `Delete` removes when search is empty; `Esc` closes
+- Display field picker: type to search observed property keys; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` toggles a field; `Backspace` removes when search is empty; `Delete` removes a shown field; `Esc` closes
 - Property filter manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` edits; `Backspace` or `Delete` removes when search is empty; `Esc` closes
 - Command palette: `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` runs; `Esc` closes
 
@@ -456,9 +459,11 @@ Property filters support exact values and key existence. Use `key=value` or
 The details pane can prefill these filters from the selected event property.
 The active text search is highlighted in visible log-row messages.
 
-Pinned fields are session-local property keys rendered as stable columns before
-the parsed message. Rows that do not have a selected property show `-` in that
-column.
+Display fields are session-local property keys rendered as stable columns after
+the parsed message. The picker lists observed property keys from the retained
+buffer. Column widths are based on the longest visible value for each selected
+field, capped for long values, and rows that do not have a selected property
+show `-` in that column. Only the message column wraps.
 
 ## Development
 

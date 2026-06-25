@@ -14,10 +14,12 @@ use ratatui::{
 
 use crate::{
     LogPageId,
-    app::{App, DialogKind, Mode, PromptKind},
+    app::{App, DialogKind, DisplayFieldColumn, Mode, PromptKind},
 };
 
 use theme::THEME;
+
+const MAX_LOG_ROW_LINES: usize = 3;
 
 pub fn draw(
     frame: &mut Frame<'_>,
@@ -180,7 +182,33 @@ fn draw_logs(
         area,
     );
 
-    let viewport_height = area.height as usize;
+    if area.height == 0 {
+        return;
+    }
+
+    let display_columns = app.display_field_columns();
+    let header_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(row::render_header(&display_columns, area.width as usize)),
+        header_area,
+    );
+
+    let log_area = Rect {
+        x: area.x,
+        y: area.y.saturating_add(1),
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    if log_area.height == 0 {
+        return;
+    }
+
+    let viewport_height = log_area.height as usize;
     app.sync_log_viewport(viewport_height);
 
     let mut highlight_values = app.filters().property_highlight_values();
@@ -192,27 +220,146 @@ fn draw_logs(
     {
         highlight_values.push(query);
     }
+    let row_width = log_area.width as usize;
     let selected = app.selected();
     let visual_range = app.visual_selection_range();
-    let start = app.log_viewport_start();
-    let end = start.saturating_add(viewport_height).min(visible_count);
+    let start = visual_log_start(
+        app,
+        visible_count,
+        viewport_height,
+        row_width,
+        &display_columns,
+    );
 
-    let mut items = Vec::with_capacity(end.saturating_sub(start));
-    app.for_each_visible_event(start, end.saturating_sub(start), |visible_index, event| {
+    let mut remaining_height = viewport_height;
+    let mut items = Vec::with_capacity(viewport_height.min(visible_count.saturating_sub(start)));
+    let mut visible_index = start;
+    while remaining_height > 0 && visible_index < visible_count {
+        let Some(event) = app.visible_event_at(visible_index) else {
+            visible_index += 1;
+            continue;
+        };
+
         let in_visual_range =
             visual_range.is_some_and(|(start, end)| (start..=end).contains(&visible_index));
-        items.push(ListItem::new(row::render_event(
+        let lines = row::render_event(
             event,
             color_enabled,
             visible_index == selected || in_visual_range,
             app.is_marked(event.sequence),
-            app.message_field_keys(),
+            &display_columns,
             &highlight_values,
-        )));
-    });
+            row_width,
+            remaining_height.min(MAX_LOG_ROW_LINES),
+        );
+        remaining_height = remaining_height.saturating_sub(lines.len());
+        items.push(ListItem::new(lines));
+        visible_index += 1;
+    }
 
     let list = List::new(items);
-    frame.render_widget(list, area);
+    frame.render_widget(list, log_area);
+}
+
+fn visual_log_start(
+    app: &App,
+    visible_count: usize,
+    viewport_height: usize,
+    width: usize,
+    display_columns: &[DisplayFieldColumn],
+) -> usize {
+    if visible_count == 0 || viewport_height == 0 {
+        return 0;
+    }
+
+    if app.is_following() {
+        return visual_tail_start(app, visible_count, viewport_height, width, display_columns);
+    }
+
+    let selected = app.selected().min(visible_count - 1);
+    let mut start = app
+        .log_viewport_start()
+        .min(visible_count - 1)
+        .min(selected);
+
+    while start < selected
+        && visual_range_height(
+            app,
+            start,
+            selected,
+            viewport_height,
+            width,
+            display_columns,
+        ) > viewport_height
+    {
+        start += 1;
+    }
+
+    start
+}
+
+fn visual_tail_start(
+    app: &App,
+    visible_count: usize,
+    viewport_height: usize,
+    width: usize,
+    display_columns: &[DisplayFieldColumn],
+) -> usize {
+    let mut start = visible_count;
+    let mut height = 0;
+
+    while start > 0 {
+        let candidate = start - 1;
+        let row_height =
+            visual_event_height(app, candidate, viewport_height, width, display_columns);
+        if row_height == 0 || height + row_height > viewport_height {
+            break;
+        }
+
+        height += row_height;
+        start = candidate;
+    }
+
+    start.min(visible_count.saturating_sub(1))
+}
+
+fn visual_range_height(
+    app: &App,
+    start: usize,
+    end: usize,
+    viewport_height: usize,
+    width: usize,
+    display_columns: &[DisplayFieldColumn],
+) -> usize {
+    let mut height = 0;
+
+    for visible_index in start..=end {
+        height += visual_event_height(app, visible_index, viewport_height, width, display_columns);
+        if height > viewport_height {
+            break;
+        }
+    }
+
+    height
+}
+
+fn visual_event_height(
+    app: &App,
+    visible_index: usize,
+    viewport_height: usize,
+    width: usize,
+    display_columns: &[DisplayFieldColumn],
+) -> usize {
+    app.visible_event_at(visible_index)
+        .map(|event| {
+            row::event_height(
+                event,
+                width,
+                display_columns,
+                viewport_height.min(MAX_LOG_ROW_LINES),
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -291,13 +438,14 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
     let title = match kind {
         DialogKind::PropertyFilters => "Property filters",
-        DialogKind::MessageFields => "Pinned fields",
+        DialogKind::DisplayFields => "Display fields",
         DialogKind::FilterPresets => "Filter presets",
         DialogKind::Sources => "Sources",
     };
     let empty_item = empty_dialog_item(kind);
     let property_rows;
-    let message_rows;
+    let display_rows;
+    let display_summaries;
     let preset_rows;
     let source_rows;
     let source_summaries;
@@ -319,17 +467,25 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
                 &items[..]
             }
         }
-        DialogKind::MessageFields => {
-            message_rows = app.message_field_rows();
-            if message_rows.is_empty() {
+        DialogKind::DisplayFields => {
+            display_rows = app.display_field_rows();
+            if display_rows.is_empty() {
                 std::slice::from_ref(&empty_item)
             } else {
-                items = message_rows
+                display_summaries = display_rows
                     .iter()
-                    .map(|key| dialog::SelectableListItem {
-                        shortcut: None,
-                        label: key,
-                        description: "Backspace/Delete remove",
+                    .map(|row| {
+                        let status = if row.shown { "shown" } else { "hidden" };
+                        format!("{status}  {} rows", row.count)
+                    })
+                    .collect::<Vec<_>>();
+                items = display_rows
+                    .iter()
+                    .zip(display_summaries.iter())
+                    .map(|(row, summary)| dialog::SelectableListItem {
+                        shortcut: Some(if row.shown { "*" } else { " " }),
+                        label: &row.key,
+                        description: summary,
                     })
                     .collect::<Vec<_>>();
                 &items[..]
@@ -396,10 +552,10 @@ fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
             label: "No property filters",
             description: "Add filters with f, +, or -",
         },
-        DialogKind::MessageFields => dialog::SelectableListItem {
+        DialogKind::DisplayFields => dialog::SelectableListItem {
             shortcut: None,
-            label: "No pinned fields",
-            description: "Add fields with m from details",
+            label: "No property fields",
+            description: "Observed fields appear after logs arrive",
         },
         DialogKind::FilterPresets => dialog::SelectableListItem {
             shortcut: None,
@@ -476,4 +632,46 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(prompt).style(base), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WRAPPED_ROW_WIDTH: usize = 43;
+
+    #[test]
+    fn follow_view_starts_at_visual_tail_for_wrapped_rows() {
+        let mut app = App::new(10);
+        push_wrapping_lines(&mut app, 5);
+
+        assert_eq!(
+            visual_log_start(&app, app.visible_count(), 6, WRAPPED_ROW_WIDTH, &[]),
+            3
+        );
+    }
+
+    #[test]
+    fn paused_view_keeps_selected_wrapped_row_visible() {
+        let mut app = App::new(10);
+        push_wrapping_lines(&mut app, 5);
+
+        app.sync_log_viewport(5);
+        app.move_up(1);
+        app.sync_log_viewport(5);
+
+        assert_eq!(app.selected(), 3);
+        assert_eq!(
+            visual_log_start(&app, app.visible_count(), 6, WRAPPED_ROW_WIDTH, &[]),
+            2
+        );
+    }
+
+    fn push_wrapping_lines(app: &mut App, count: usize) {
+        for index in 0..count {
+            app.push_line(format!(
+                "api | INFO alpha beta gamma delta epsilon zeta eta theta {index}"
+            ));
+        }
+    }
 }
