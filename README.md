@@ -118,6 +118,7 @@ loggle log -i 1 -n 5 --service api
 loggle log -i 1 -n 5 --text database
 loggle log -i 1 -n 5 --property requestId=716d1e62
 loggle log -i 1 -n 5 --level error --format jsonl
+loggle facets -i 1 --property-key tenantId --format jsonl
 loggle --id api -- docker compose up
 loggle start
 loggle start libre
@@ -229,8 +230,77 @@ one physical JSONL line. A query with no matches writes zero bytes and exits 0;
 invalid input, inactive/missing pages, and output failures exit nonzero with
 diagnostics on stderr only.
 
-Cursors, wait/follow, context lines, field projections, and facets are not part
-of this agent-query contract yet.
+Discover useful filters without sampling and counting records yourself:
+
+```sh
+# Human-readable source, level, and property-key counts
+loggle facets -i 1
+
+# Versioned machine-readable groups, including values for one exact key
+loggle facets -i 1 --property-key tenantId --format jsonl
+
+# Facets compose with the same query flags as `loggle log`
+loggle facets -i 1 --source api --level error --property region=eu --records 5000 --limit 10
+```
+
+Facets first fix the newest logical-record window, then apply filters and count
+records. `--records` defaults to `10000`, must be between `1` and `100000`, and
+does not backfill older matches when newer records fail a filter. `--limit`
+defaults to `20`, must be between `1` and `100`, and caps each group's returned
+buckets after deterministic sorting. Neither limit can be disabled.
+
+Every request emits `source`, `level`, and `property_key` groups in that order.
+Adding `--property-key KEY` emits a fourth `property_value` group. CLI input
+trims surrounding whitespace from `KEY`; the resulting key remains exact and
+case-sensitive. Source identity is ASCII lowercase, levels are canonical
+lowercase, and property keys retain their exact case. Source and property
+buckets sort by count descending then value ascending; levels use `fatal`,
+`error`, `warn`, `info`, `debug`, `trace`, `unknown` order.
+
+Facet counts use disjunctive, self-excluding cohorts so alternatives remain
+visible:
+
+- the source group ignores only the active source filter;
+- the level group ignores only the active level filter;
+- the property-key group uses the complete filter;
+- the requested property-value group ignores include/exclude predicates for
+  that exact key while retaining every other predicate.
+
+This is not OR filtering. All retained predicates still compose with AND
+semantics. A property key counts at most once per record, and value counts use
+the first duplicate key, matching exact property filters.
+
+In JSONL, one physical line is one versioned group object:
+
+```json
+{"schema_version":1,"facet":"property_value","property_key":"tenantId","available_records":14237,"window_records":10000,"window_truncated":true,"matched_records":431,"eligible_records":902,"total_buckets":27,"truncated":true,"buckets":[{"value":"tenant-1","count":318,"value_types":["string"]}]}
+```
+
+`available_records` is the retained page's parsed logical-record count;
+`window_records` is the selected newest window; and `window_truncated` reports
+records outside it. `matched_records` uses the complete filter and is identical
+across groups. `eligible_records` is the group-specific self-excluded cohort.
+`total_buckets` is the count before `--limit`, while `truncated` reports bucket
+clipping only. `property_key` is null except on the property-value group.
+
+Property values group by their displayed filter text. `value_types` reports all
+colliding internal types in stable `string`, `number`, `boolean`, `null`,
+`text` order, so (for example) the string `"1"` and number `1` remain visible
+as one textual bucket with both types. JSONL preserves raw key/value text.
+Human table and TUI output escape backslashes and control characters onto one
+line.
+
+In the TUI, use uppercase F to open the searchable facet workflow. It snapshots
+once on open, refreshes when entering a property-value drilldown, and applies
+choices through undoable filters. Uppercase `O` remains the richer live Sources
+status view; it is not replaced by facets.
+
+An active page with no data still succeeds and emits three empty groups (four
+when a property key is requested), preserving window and cohort metadata. A
+missing or inactive page fails nonzero with diagnostics on stderr and empty
+stdout. Facets scan the active retained window; they are not persistent indexes
+and do not expose past sessions. Stable cursors, bounded waits/follow, context
+lines, and field projection remain outside this contract.
 
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the
@@ -331,6 +401,7 @@ loggle pages --format jsonl
 loggle log -i 1 -n 5
 loggle log -i 1 -n 5 --service api --property tenantId=tenant-1
 loggle log -i 1 -n 5 --level error --format jsonl
+loggle facets -i 1 --property-key tenantId --format jsonl
 loggle --id api -- docker compose up
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
@@ -359,6 +430,16 @@ loggle start libre
   `unknown`
 - `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
   properties. Repeat for multiple required predicates
+- `facets -i <ID> [--records <N>] [--limit <N>]`: scans the newest bounded
+  logical-record window and reports source, level, and property-key counts;
+  defaults are 10000 records and 20 buckets per group, with maxima of 100000
+  and 100
+- `facets --property-key <KEY>`: also reports values for one normalized,
+  exact/case-sensitive property key
+- `facets --format <table|jsonl>`: selects the human table (the default) or one
+  versioned group per JSONL line
+- `facets --source/--text/--level/--property/--source-field`: uses the same
+  parsers and filter semantics as `log`
 - `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
@@ -412,6 +493,8 @@ Press `?` to open the in-app command palette:
 - `V`: open searchable saved filter presets
 - `e`: export the current visible rows to `loggle-export.log`
 - `T`: mark or unmark the selected row
+- `F`: open searchable filter facets; select a source/level to apply it or a
+  property key to drill into exact values
 - `O`: open observed source status counts
 
 ### Details and Properties
@@ -425,6 +508,10 @@ Press `?` to open the in-app command palette:
 
 - `M`: open searchable pinned field manager
 - `P`: open searchable property filter manager
+- Facet dialog: type to search the stored snapshot; `Enter` applies a
+  source/level or opens a refreshed property-value drilldown; `Backspace` or
+  `Delete` with empty search returns from values to the refreshed root; `Esc`
+  closes. Facet choices are undoable with `u`
 - `?`: open/close the command palette
 - Message field manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Backspace` or `Delete` removes when search is empty; `Esc` closes
 - Property filter manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` edits; `Backspace` or `Delete` removes when search is empty; `Esc` closes

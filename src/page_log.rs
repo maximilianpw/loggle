@@ -16,6 +16,9 @@ use std::os::fd::AsRawFd;
 
 use crate::{
     buffer::LogBuffer,
+    facet::{
+        FacetGroup, FacetOptions, MAX_FACET_RECORD_LIMIT, MIN_FACET_RECORD_LIMIT, aggregate_facets,
+    },
     filter::{LogFilter, PropertyFilterUpdate},
     model::{Level, LogEvent, LogProperty, PropertyValue, SourceConfig},
 };
@@ -140,6 +143,41 @@ impl std::error::Error for LogPageError {
             | Self::InvalidPropertyFilter(_) => None,
             Self::Io { source, .. } | Self::Output(source) => Some(source),
         }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum FacetQueryError {
+    InvalidRecordWindow { value: usize },
+    Page(LogPageError),
+}
+
+impl fmt::Display for FacetQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRecordWindow { value } => write!(
+                f,
+                "facet record window {value} is outside {}..={}",
+                MIN_FACET_RECORD_LIMIT, MAX_FACET_RECORD_LIMIT
+            ),
+            Self::Page(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FacetQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRecordWindow { .. } => None,
+            Self::Page(error) => Some(error),
+        }
+    }
+}
+
+impl From<LogPageError> for FacetQueryError {
+    fn from(error: LogPageError) -> Self {
+        Self::Page(error)
     }
 }
 
@@ -338,6 +376,20 @@ pub fn query_log_page_records(
     query_log_page_records_from_dirs(id, options, &log_page_registry_dir(), &log_page_dir())
 }
 
+pub fn query_log_page_facets(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+    facet_options: &FacetOptions,
+) -> Result<Vec<FacetGroup>, FacetQueryError> {
+    query_log_page_facets_from_dirs(
+        id,
+        options,
+        facet_options,
+        &log_page_registry_dir(),
+        &log_page_dir(),
+    )
+}
+
 fn print_log_page_tail_from_dirs<W: Write>(
     id: &LogPageId,
     options: &LogPageTailOptions,
@@ -381,6 +433,30 @@ fn query_log_page_records_from_dirs(
             .map(LogPageRecord::from_parsed)
             .collect(),
     )
+}
+
+fn query_log_page_facets_from_dirs(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+    facet_options: &FacetOptions,
+    registry_dir: &Path,
+    page_dir: &Path,
+) -> Result<Vec<FacetGroup>, FacetQueryError> {
+    if !(MIN_FACET_RECORD_LIMIT..=MAX_FACET_RECORD_LIMIT).contains(&options.line_count) {
+        return Err(FacetQueryError::InvalidRecordWindow {
+            value: options.line_count,
+        });
+    }
+
+    let query = resolve_log_page_query(id, options, registry_dir, page_dir)?;
+    let records =
+        parsed_log_page_records_from_path(id, &query.log_path, &query.options.source_config)?;
+    Ok(aggregate_facets(
+        records.iter().map(|record| &record.event),
+        query.options.line_count,
+        &query.filter,
+        facet_options,
+    ))
 }
 
 fn resolve_log_page_query(
@@ -1516,6 +1592,7 @@ fn process_is_active(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facet::{FacetKind, FacetOptions};
 
     fn query_records_from_input(input: &str, options: &LogPageQueryOptions) -> Vec<LogPageRecord> {
         let records = parsed_log_page_records(
@@ -1533,6 +1610,10 @@ mod tests {
 
     fn read_metadata(path: &Path) -> ActiveLogPageMetadata {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn facet_group(groups: &[FacetGroup], kind: FacetKind) -> &FacetGroup {
+        groups.iter().find(|group| group.facet == kind).unwrap()
     }
 
     fn test_metadata(id: &LogPageId, pid: u32, log_file: Option<&str>) -> ActiveLogPageMetadata {
@@ -2062,6 +2143,233 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "INFO ready reader=cli session=server\n"
         );
+        drop(session);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn facet_query_validates_record_window_before_scanning() {
+        let id = LogPageId::parse("missing").unwrap();
+        let registry_dir = Path::new("definitely-missing-registry");
+        let page_dir = Path::new("definitely-missing-pages");
+
+        for value in [0, MAX_FACET_RECORD_LIMIT + 1] {
+            let error = query_log_page_facets_from_dirs(
+                &id,
+                &LogPageQueryOptions::new(value),
+                &FacetOptions::default(),
+                registry_dir,
+                page_dir,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                FacetQueryError::InvalidRecordWindow { value: actual } if actual == value
+            ));
+        }
+
+        let error = query_log_page_facets_from_dirs(
+            &id,
+            &LogPageQueryOptions::new(0),
+            &FacetOptions::default(),
+            registry_dir,
+            page_dir,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "facet record window 0 is outside 1..=100000"
+        );
+    }
+
+    #[test]
+    fn facet_query_propagates_active_page_errors() {
+        let root = env::temp_dir().join(format!(
+            "loggle-facet-orphan-page-test-{}",
+            std::process::id()
+        ));
+        let registry_dir = root.join("active-pages");
+        let page_dir = root.join("pages");
+        let id = LogPageId::parse("api").unwrap();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(legacy_log_page_path_in_dir(&id, &page_dir), "secret\n").unwrap();
+
+        let error = query_log_page_facets_from_dirs(
+            &id,
+            &LogPageQueryOptions::new(10),
+            &FacetOptions::default(),
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FacetQueryError::Page(LogPageError::MissingPage { .. })
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn facet_query_inherits_and_overrides_session_source_fields() {
+        let root = env::temp_dir().join(format!(
+            "loggle-facet-source-fields-test-{}",
+            std::process::id()
+        ));
+        let registry_dir = root.join("active-pages");
+        let page_dir = root.join("pages");
+        let id = LogPageId::parse("api").unwrap();
+        let source_config = SourceConfig::with_fields(["tenant"]);
+        let _ = fs::remove_dir_all(&root);
+        let mut session = PageLogSession::start_in_dirs(
+            Some(id.clone()),
+            "docker compose up",
+            &source_config,
+            100,
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        session
+            .record_line("INFO ready reader=cli tenant=server")
+            .unwrap();
+        session.flush().unwrap();
+
+        let mut inherited = LogPageQueryOptions::new(10);
+        inherited.source = Some("server".to_string());
+        let inherited_groups = query_log_page_facets_from_dirs(
+            &id,
+            &inherited,
+            &FacetOptions::default(),
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            facet_group(&inherited_groups, FacetKind::PropertyKey).matched_records,
+            1
+        );
+
+        let mut overridden = LogPageQueryOptions::new(10);
+        overridden.source = Some("cli".to_string());
+        overridden.source_config = SourceConfig::with_fields(["reader"]);
+        let overridden_groups = query_log_page_facets_from_dirs(
+            &id,
+            &overridden,
+            &FacetOptions::default(),
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            facet_group(&overridden_groups, FacetKind::PropertyKey).matched_records,
+            1
+        );
+
+        drop(session);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn facet_query_fixes_newest_logical_window_before_filters() {
+        let root = env::temp_dir().join(format!(
+            "loggle-facet-newest-window-test-{}",
+            std::process::id()
+        ));
+        let registry_dir = root.join("active-pages");
+        let page_dir = root.join("pages");
+        let id = LogPageId::parse("api").unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let mut session = PageLogSession::start_in_dirs(
+            Some(id.clone()),
+            "docker compose up",
+            &SourceConfig::default(),
+            100,
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        session.record_line("old | ERROR wanted tenant=t1").unwrap();
+        session.record_line("web | INFO ignored tenant=t2").unwrap();
+        session.record_line("api | ERROR wanted tenant=t1").unwrap();
+        session.flush().unwrap();
+
+        let mut options = LogPageQueryOptions::new(2);
+        options.text = Some("wanted".to_string());
+        let groups = query_log_page_facets_from_dirs(
+            &id,
+            &options,
+            &FacetOptions::default(),
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        let source = facet_group(&groups, FacetKind::Source);
+        assert_eq!(source.available_records, 3);
+        assert_eq!(source.window_records, 2);
+        assert!(source.window_truncated);
+        assert_eq!(source.matched_records, 1);
+        assert_eq!(source.buckets[0].value, "api");
+
+        drop(session);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn facet_query_composes_every_query_filter_dimension() {
+        let root = env::temp_dir().join(format!(
+            "loggle-facet-filter-composition-test-{}",
+            std::process::id()
+        ));
+        let registry_dir = root.join("active-pages");
+        let page_dir = root.join("pages");
+        let id = LogPageId::parse("api").unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let mut session = PageLogSession::start_in_dirs(
+            Some(id.clone()),
+            "docker compose up",
+            &SourceConfig::default(),
+            100,
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        for line in [
+            "api | ERROR database tenant=t1 region=eu",
+            "web | ERROR database tenant=t1 region=eu",
+            "api | INFO database tenant=t1 region=eu",
+            "api | ERROR other tenant=t1 region=eu",
+            "api | ERROR database tenant=t2 region=eu",
+            "api | ERROR database tenant=t1 region=us",
+        ] {
+            session.record_line(line).unwrap();
+        }
+        session.flush().unwrap();
+
+        let mut options = LogPageQueryOptions::new(100);
+        options.source = Some("api".to_string());
+        options.text = Some("database".to_string());
+        options.level = Some(Level::Error);
+        options.property_filters = vec!["tenant=t1".to_string(), "region=eu".to_string()];
+        let facet_options = FacetOptions::new(20, Some("tenant".to_string())).unwrap();
+        let groups = query_log_page_facets_from_dirs(
+            &id,
+            &options,
+            &facet_options,
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+
+        assert!(groups.iter().all(|group| group.matched_records == 1));
+        assert_eq!(facet_group(&groups, FacetKind::Source).eligible_records, 2);
+        assert_eq!(facet_group(&groups, FacetKind::Level).eligible_records, 2);
+        assert_eq!(
+            facet_group(&groups, FacetKind::PropertyValue).eligible_records,
+            2
+        );
+
         drop(session);
         let _ = fs::remove_dir_all(root);
     }

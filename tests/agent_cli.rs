@@ -8,7 +8,10 @@ use std::{
 
 use serde_json::Value;
 
-use loggle::{LogLevel, LogPageQueryOptions, LogPageRecord, LogPageTailOptions, SourceConfig};
+use loggle::{
+    FacetGroup, FacetKind, FacetOptions, LogLevel, LogPageQueryOptions, LogPageRecord,
+    LogPageTailOptions, SourceConfig,
+};
 
 static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
 
@@ -89,6 +92,10 @@ fn json_lines(output: &Output) -> Vec<Value> {
         .collect()
 }
 
+fn json_group<'a>(groups: &'a [Value], facet: &str) -> &'a Value {
+    groups.iter().find(|group| group["facet"] == facet).unwrap()
+}
+
 #[test]
 fn public_tail_options_retain_the_legacy_struct_literal_shape() {
     let options = LogPageTailOptions {
@@ -144,6 +151,21 @@ fn public_records_keep_external_field_reads_and_serialization() {
 
     assert_serializable::<LogPageRecord>();
     let _read_public_record_fields: fn(&LogPageRecord) -> (u32, &str) = read_public_record_fields;
+}
+
+#[test]
+fn public_facet_types_keep_external_accessors_and_serialization() {
+    fn assert_serializable<T: serde::Serialize>() {}
+    fn read_public_group_fields(group: &FacetGroup) -> (u32, FacetKind, usize) {
+        (group.schema_version, group.facet, group.matched_records)
+    }
+
+    let options = FacetOptions::new(7, Some("tenantId".to_string())).unwrap();
+    assert_eq!(options.bucket_limit(), 7);
+    assert_eq!(options.property_key(), Some("tenantId"));
+    assert_serializable::<FacetGroup>();
+    let _read_public_group_fields: fn(&FacetGroup) -> (u32, FacetKind, usize) =
+        read_public_group_fields;
 }
 
 #[test]
@@ -361,4 +383,288 @@ fn inactive_page_errors_do_not_contaminate_stdout() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(stderr(&output).contains("no log page found for id 'inactive'"));
+}
+
+#[test]
+fn facets_default_table_has_group_metadata_and_columns() {
+    let state = TestState::new("facets-table");
+    state.add_live_page("api", "api | INFO ready tenant=t1\n");
+
+    let output = state.run(&["facets", "-i", "api"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let output = stdout(&output);
+    assert!(output.contains("source matched=1 eligible=1 window=1/1 shown=1/1"));
+    assert!(output.contains("level matched=1 eligible=1 window=1/1 shown=1/1"));
+    assert!(output.contains("property_key matched=1 eligible=1 window=1/1 shown=1/1"));
+    assert_eq!(output.matches("VALUE\tCOUNT\tTYPES").count(), 3);
+    assert!(output.contains("api\t1\t"));
+}
+
+#[test]
+fn facets_table_escapes_literal_and_control_values_on_one_line() {
+    let state = TestState::new("facets-table-escaping");
+    state.add_live_page(
+        "api",
+        concat!(
+            r#"api | {"message":"literal","value":"\\n"}"#,
+            "\n",
+            r#"api | {"message":"control","value":"\n"}"#,
+            "\n",
+            r#"api | {"message":"bell","value":"bell\u0007"}"#,
+            "\n"
+        ),
+    );
+
+    let output = state.run(&["facets", "-i", "api", "--property-key", "value"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let lines = stdout(&output).lines().collect::<Vec<_>>();
+    assert!(lines.contains(&format!(r"\n{}1{}string", '\t', '\t').as_str()));
+    assert!(lines.contains(&format!(r"\\n{}1{}string", '\t', '\t').as_str()));
+    assert!(lines.contains(&format!(r"bell\u{{0007}}{}1{}string", '\t', '\t').as_str()));
+}
+
+#[test]
+fn facets_jsonl_emits_three_versioned_groups_in_stable_order() {
+    let state = TestState::new("facets-three-jsonl");
+    state.add_live_page("api", "api | INFO ready tenant=t1\n");
+
+    let output = state.run(&["facets", "-i", "api", "--format", "jsonl"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let groups = json_lines(&output);
+    assert_eq!(groups.len(), 3);
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group["facet"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["source", "level", "property_key"]
+    );
+    assert!(groups.iter().all(|group| group["schema_version"] == 1));
+    assert!(groups.iter().all(|group| group["property_key"].is_null()));
+}
+
+#[test]
+fn facets_property_key_adds_value_group_last() {
+    let state = TestState::new("facets-value-jsonl");
+    state.add_live_page("api", "api | INFO ready tenantId=tenant-1\n");
+
+    let output = state.run(&[
+        "facets",
+        "-i",
+        "api",
+        "--property-key",
+        "tenantId",
+        "--format",
+        "jsonl",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let groups = json_lines(&output);
+    assert_eq!(groups.len(), 4);
+    assert_eq!(groups[3]["facet"], "property_value");
+    assert_eq!(groups[3]["property_key"], "tenantId");
+    assert_eq!(groups[3]["buckets"][0]["value"], "tenant-1");
+}
+
+#[test]
+fn facets_fix_newest_record_window_before_filtering() {
+    let state = TestState::new("facets-window-before-filter");
+    state.add_live_page("api", "old | ERROR wanted\nnew | INFO ignored\n");
+
+    let output = state.run(&[
+        "facets",
+        "-i",
+        "api",
+        "--records",
+        "1",
+        "--text",
+        "wanted",
+        "--format",
+        "jsonl",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let groups = json_lines(&output);
+    assert!(groups.iter().all(|group| group["available_records"] == 2));
+    assert!(groups.iter().all(|group| group["window_records"] == 1));
+    assert!(groups.iter().all(|group| group["window_truncated"] == true));
+    assert!(groups.iter().all(|group| group["matched_records"] == 0));
+    assert!(
+        groups
+            .iter()
+            .all(|group| group["buckets"] == serde_json::json!([]))
+    );
+}
+
+#[test]
+fn facets_self_exclude_source_and_level() {
+    let state = TestState::new("facets-source-level-self-exclusion");
+    state.add_live_page(
+        "api",
+        "api | ERROR failed\nweb | ERROR failed\napi | INFO ready\n",
+    );
+
+    let output = state.run(&[
+        "facets", "-i", "api", "--source", "api", "--level", "error", "--format", "jsonl",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let groups = json_lines(&output);
+    let source = json_group(&groups, "source");
+    assert_eq!(source["matched_records"], 1);
+    assert_eq!(source["eligible_records"], 2);
+    assert_eq!(source["buckets"][0]["value"], "api");
+    assert_eq!(source["buckets"][1]["value"], "web");
+    let level = json_group(&groups, "level");
+    assert_eq!(level["eligible_records"], 2);
+    assert_eq!(level["buckets"][0]["value"], "error");
+    assert_eq!(level["buckets"][1]["value"], "info");
+}
+
+#[test]
+fn facets_self_exclude_same_property_key_but_retain_other_predicates() {
+    let state = TestState::new("facets-property-self-exclusion");
+    state.add_live_page(
+        "api",
+        "api | INFO row tenant=one region=eu\napi | INFO row tenant=two region=eu\napi | INFO row tenant=three region=us\n",
+    );
+
+    let output = state.run(&[
+        "facets",
+        "-i",
+        "api",
+        "--property",
+        "tenant=one",
+        "--property",
+        "region=eu",
+        "--property-key",
+        "tenant",
+        "--format",
+        "jsonl",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let groups = json_lines(&output);
+    let values = json_group(&groups, "property_value");
+    assert_eq!(values["matched_records"], 1);
+    assert_eq!(values["eligible_records"], 2);
+    assert_eq!(values["total_buckets"], 2);
+    assert_eq!(values["buckets"][0]["value"], "one");
+    assert_eq!(values["buckets"][1]["value"], "two");
+}
+
+#[test]
+fn facets_use_first_duplicate_and_report_typed_display_collisions() {
+    let state = TestState::new("facets-duplicate-types");
+    state.add_live_page(
+        "api",
+        "api | INFO row value=1 value=2\napi | INFO row value=\"1\"\n",
+    );
+
+    let output = state.run(&[
+        "facets",
+        "-i",
+        "api",
+        "--property-key",
+        "value",
+        "--format",
+        "jsonl",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let groups = json_lines(&output);
+    let values = json_group(&groups, "property_value");
+    assert_eq!(values["total_buckets"], 1);
+    assert_eq!(values["buckets"][0]["value"], "1");
+    assert_eq!(values["buckets"][0]["count"], 2);
+    assert_eq!(
+        values["buckets"][0]["value_types"],
+        serde_json::json!(["string", "number"])
+    );
+}
+
+#[test]
+fn facets_disclose_window_and_bucket_truncation_with_deterministic_ties() {
+    let state = TestState::new("facets-truncation");
+    state.add_live_page("api", "q | INFO old\nz | INFO row\na | INFO row\n");
+
+    let output = state.run(&[
+        "facets",
+        "-i",
+        "api",
+        "--records",
+        "2",
+        "--limit",
+        "1",
+        "--format",
+        "jsonl",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let groups = json_lines(&output);
+    let source = json_group(&groups, "source");
+    assert_eq!(source["available_records"], 3);
+    assert_eq!(source["window_records"], 2);
+    assert_eq!(source["window_truncated"], true);
+    assert_eq!(source["total_buckets"], 2);
+    assert_eq!(source["truncated"], true);
+    assert_eq!(source["buckets"].as_array().unwrap().len(), 1);
+    assert_eq!(source["buckets"][0]["value"], "a");
+}
+
+#[test]
+fn facets_empty_data_emits_empty_groups_successfully() {
+    let state = TestState::new("facets-empty");
+    state.add_live_page("api", "");
+
+    let output = state.run(&["facets", "-i", "api", "--format", "jsonl"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let groups = json_lines(&output);
+    assert_eq!(groups.len(), 3);
+    assert!(groups.iter().all(|group| group["available_records"] == 0));
+    assert!(
+        groups
+            .iter()
+            .all(|group| group["buckets"] == serde_json::json!([]))
+    );
+}
+
+#[test]
+fn facets_invalid_bounds_key_and_level_are_usage_errors() {
+    let state = TestState::new("facets-invalid-options");
+    for args in [
+        vec!["facets", "-i", "api", "--records", "0"],
+        vec!["facets", "-i", "api", "--records", "100001"],
+        vec!["facets", "-i", "api", "--limit", "0"],
+        vec!["facets", "-i", "api", "--limit", "101"],
+        vec!["facets", "-i", "api", "--property-key", "  "],
+        vec!["facets", "-i", "api", "--level", "notice"],
+    ] {
+        let output = state.run(&args);
+        assert_eq!(output.status.code(), Some(2), "args={args:?}");
+        assert!(output.stdout.is_empty(), "args={args:?}");
+        assert!(!output.stderr.is_empty(), "args={args:?}");
+    }
+}
+
+#[test]
+fn facets_missing_and_inactive_pages_fail_without_stdout() {
+    let state = TestState::new("facets-missing-inactive");
+    state.add_page_with_pid("inactive", "secret\n", 0);
+
+    for id in ["missing", "inactive"] {
+        let output = state.run(&["facets", "-i", id, "--format", "jsonl"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(stderr(&output).contains(&format!("no log page found for id '{id}'")));
+    }
 }

@@ -15,6 +15,7 @@ use ratatui::{
 use crate::{
     LogPageId,
     app::{App, DialogKind, Mode, PromptKind},
+    facet::{FacetKind, escape_facet_text},
 };
 
 use theme::THEME;
@@ -294,6 +295,8 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
         DialogKind::MessageFields => "Pinned fields",
         DialogKind::FilterPresets => "Filter presets",
         DialogKind::Sources => "Sources",
+        DialogKind::Facets if app.facet_dialog_is_drilldown() => "Facet values",
+        DialogKind::Facets => "Filter facets",
     };
     let empty_item = empty_dialog_item(kind);
     let property_rows;
@@ -301,6 +304,9 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
     let preset_rows;
     let source_rows;
     let source_summaries;
+    let facet_rows;
+    let facet_labels;
+    let facet_descriptions;
     let items;
     let rendered = match kind {
         DialogKind::PropertyFilters => {
@@ -377,6 +383,46 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
                 &items[..]
             }
         }
+        DialogKind::Facets => {
+            facet_rows = app.facet_dialog_rows();
+            if facet_rows.is_empty() {
+                std::slice::from_ref(&empty_item)
+            } else {
+                facet_labels = facet_rows
+                    .iter()
+                    .map(|row| escape_facet_text(&row.value))
+                    .collect::<Vec<_>>();
+                facet_descriptions = facet_rows
+                    .iter()
+                    .map(|row| {
+                        let types = row
+                            .value_types
+                            .iter()
+                            .map(|value_type| value_type.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        if row.facet == FacetKind::PropertyKey {
+                            format!("{} records  Enter values", row.count)
+                        } else if types.is_empty() {
+                            format!("{} records  Enter apply", row.count)
+                        } else {
+                            format!("{} records  types={}  Enter apply", row.count, types)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                items = facet_rows
+                    .iter()
+                    .zip(facet_labels.iter())
+                    .zip(facet_descriptions.iter())
+                    .map(|((row, label), description)| dialog::SelectableListItem {
+                        shortcut: Some(row.facet.as_str()),
+                        label,
+                        description,
+                    })
+                    .collect::<Vec<_>>();
+                &items[..]
+            }
+        }
     };
 
     dialog::draw_searchable_dialog(
@@ -384,6 +430,7 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
         frame.area(),
         title,
         app.dialog_query(kind),
+        (kind == DialogKind::Facets).then(|| app.facet_dialog_summary()),
         rendered,
         app.selected_dialog_index(kind),
     );
@@ -410,6 +457,11 @@ fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
             shortcut: None,
             label: "No sources",
             description: "Observed sources appear after logs arrive",
+        },
+        DialogKind::Facets => dialog::SelectableListItem {
+            shortcut: None,
+            label: "No facet buckets",
+            description: "Adjust filters or wait for matching logs",
         },
     }
 }
@@ -476,4 +528,90 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(prompt).style(base), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::facet::FacetKind;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn facet_dialog_renders_summary_and_escaped_values() {
+        let mut app = App::new(20);
+        app.push_line(r#"api | {"message":"literal","value":"\\n"}"#.to_string());
+        app.push_line(r#"api | {"message":"control","value":"\n"}"#.to_string());
+        app.open_dialog(DialogKind::Facets);
+        let property_index = app
+            .facet_dialog_rows()
+            .iter()
+            .position(|row| row.facet == FacetKind::PropertyKey && row.value == "value")
+            .unwrap();
+        app.move_dialog_down(DialogKind::Facets, property_index);
+        app.activate_selected_dialog_row(DialogKind::Facets);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, false, None, None))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Facet values"));
+        assert!(rendered.contains("win=2/2"));
+        assert!(rendered.contains(r"\\n"));
+        assert!(rendered.contains(r"\n"));
+        assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn facet_dialog_renders_counts_before_a_truncated_escaped_key() {
+        let property_key = format!("{}{}", r"tenant\\segment".repeat(12), "\n".repeat(12));
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "message".to_string(),
+            serde_json::Value::String("row".to_string()),
+        );
+        object.insert(
+            property_key.clone(),
+            serde_json::Value::String("one".to_string()),
+        );
+
+        let mut app = App::new(20);
+        app.push_line(format!("api | {}", serde_json::Value::Object(object)));
+        app.open_dialog(DialogKind::Facets);
+        let property_index = app
+            .facet_dialog_rows()
+            .iter()
+            .position(|row| row.facet == FacetKind::PropertyKey && row.value == property_key)
+            .unwrap();
+        app.move_dialog_down(DialogKind::Facets, property_index);
+        app.activate_selected_dialog_row(DialogKind::Facets);
+
+        let summary = app.facet_dialog_summary();
+        assert!(summary.starts_with("win=1/1 val=1/1 key="));
+        assert_eq!(summary.chars().count(), 80);
+        assert!(summary.ends_with('~'));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, false, None, None))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("win=1/1 val=1/1 key="));
+        assert!(rendered.contains('~'));
+        assert!(!rendered.contains(&escape_facet_text(&property_key)));
+    }
 }
