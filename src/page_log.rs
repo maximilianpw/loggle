@@ -17,7 +17,7 @@ use std::os::fd::AsRawFd;
 use crate::{
     buffer::LogBuffer,
     filter::{LogFilter, PropertyFilterUpdate},
-    model::{SourceConfig, clean_display_text},
+    model::{Level, LogEvent, LogProperty, PropertyValue, SourceConfig, clean_display_text},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,7 +196,6 @@ struct ResolvedLogPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogPageTailOptions {
     pub line_count: usize,
-    pub clean: bool,
     pub source: Option<String>,
     pub text: Option<String>,
     pub property_filters: Vec<String>,
@@ -207,21 +206,92 @@ impl LogPageTailOptions {
     pub fn new(line_count: usize) -> Self {
         Self {
             line_count,
-            clean: false,
             source: None,
             text: None,
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
         }
     }
+}
 
-    fn has_filters(&self) -> bool {
-        self.source
-            .as_ref()
-            .is_some_and(|source| !source.is_empty())
-            || self.text.as_ref().is_some_and(|text| !text.is_empty())
-            || !self.property_filters.is_empty()
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPageQueryOptions {
+    pub line_count: usize,
+    pub clean: bool,
+    pub source: Option<String>,
+    pub text: Option<String>,
+    pub level: Option<Level>,
+    pub property_filters: Vec<String>,
+    pub source_config: SourceConfig,
+}
+
+impl LogPageQueryOptions {
+    pub fn new(line_count: usize) -> Self {
+        Self {
+            line_count,
+            clean: false,
+            source: None,
+            text: None,
+            level: None,
+            property_filters: Vec::new(),
+            source_config: SourceConfig::default(),
+        }
     }
+}
+
+impl From<&LogPageTailOptions> for LogPageQueryOptions {
+    fn from(options: &LogPageTailOptions) -> Self {
+        Self {
+            line_count: options.line_count,
+            clean: false,
+            source: options.source.clone(),
+            text: options.text.clone(),
+            level: None,
+            property_filters: options.property_filters.clone(),
+            source_config: options.source_config.clone(),
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LogPageRecord {
+    pub schema_version: u32,
+    pub source: String,
+    pub timestamp: Option<String>,
+    pub level: Level,
+    pub message: String,
+    pub properties: BTreeMap<String, serde_json::Value>,
+    pub raw: String,
+}
+
+impl LogPageRecord {
+    const SCHEMA_VERSION: u32 = 1;
+
+    fn from_parsed(record: &ParsedLogPageRecord) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            source: record.event.source.clone(),
+            timestamp: record.event.timestamp.clone(),
+            level: record.event.level,
+            message: record.event.message.clone(),
+            properties: record_properties(&record.event.properties),
+            raw: record.raw.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedLogPageRecord {
+    pub(crate) event: LogEvent,
+    pub(crate) raw: String,
+}
+
+struct ResolvedLogPageQuery {
+    log_path: PathBuf,
+    options: LogPageQueryOptions,
+    filter: LogFilter,
 }
 
 pub fn active_log_pages() -> Result<Vec<ActiveLogPage>, LogPageError> {
@@ -250,6 +320,27 @@ pub fn print_log_page_tail_with_options<W: Write>(
     )
 }
 
+pub fn print_log_page_query<W: Write>(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    print_log_page_query_from_dirs(
+        id,
+        options,
+        writer,
+        &log_page_registry_dir(),
+        &log_page_dir(),
+    )
+}
+
+pub fn query_log_page_records(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+) -> Result<Vec<LogPageRecord>, LogPageError> {
+    query_log_page_records_from_dirs(id, options, &log_page_registry_dir(), &log_page_dir())
+}
+
 fn print_log_page_tail_from_dirs<W: Write>(
     id: &LogPageId,
     options: &LogPageTailOptions,
@@ -257,13 +348,68 @@ fn print_log_page_tail_from_dirs<W: Write>(
     registry_dir: &Path,
     page_dir: &Path,
 ) -> Result<(), LogPageError> {
+    print_log_page_query_from_dirs(
+        id,
+        &LogPageQueryOptions::from(options),
+        writer,
+        registry_dir,
+        page_dir,
+    )
+}
+
+fn print_log_page_query_from_dirs<W: Write>(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+    writer: &mut W,
+    registry_dir: &Path,
+    page_dir: &Path,
+) -> Result<(), LogPageError> {
+    let query = resolve_log_page_query(id, options, registry_dir, page_dir)?;
+    print_resolved_log_page_tail(id, &query, writer)
+}
+
+fn query_log_page_records_from_dirs(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+    registry_dir: &Path,
+    page_dir: &Path,
+) -> Result<Vec<LogPageRecord>, LogPageError> {
+    let query = resolve_log_page_query(id, options, registry_dir, page_dir)?;
+    let records =
+        parsed_log_page_records_from_path(id, &query.log_path, &query.options.source_config)?;
+
+    Ok(
+        tail_matching_records(&records, &query.filter, query.options.line_count)
+            .into_iter()
+            .map(|record| {
+                let mut record = LogPageRecord::from_parsed(record);
+                if query.options.clean {
+                    record.raw = clean_raw_record(&record.raw);
+                }
+                record
+            })
+            .collect(),
+    )
+}
+
+fn resolve_log_page_query(
+    id: &LogPageId,
+    options: &LogPageQueryOptions,
+    registry_dir: &Path,
+    page_dir: &Path,
+) -> Result<ResolvedLogPageQuery, LogPageError> {
     let page = resolve_active_log_page(id, registry_dir, page_dir)?;
     let mut effective_options = options.clone();
     effective_options.source_config = options
         .source_config
         .merged_with_configured_fields(&page.metadata.source_fields);
+    let filter = log_filter_for_options(&effective_options)?;
 
-    print_log_page_tail_from_path(id, &page.log_path, &effective_options, writer)
+    Ok(ResolvedLogPageQuery {
+        log_path: page.log_path,
+        options: effective_options,
+        filter,
+    })
 }
 
 /// List observed sources in the retained page, not Compose service names.
@@ -862,6 +1008,74 @@ fn prepare_active_log_page_claim(
     reap_stale_log_page(&metadata, metadata_path, page_dir)
 }
 
+fn print_resolved_log_page_tail<W: Write>(
+    id: &LogPageId,
+    query: &ResolvedLogPageQuery,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    if !query.filter.has_active_filters() {
+        let file = open_log_page(id, &query.log_path)?;
+        let lines =
+            tail_lines(BufReader::new(file), query.options.line_count).map_err(|source| {
+                LogPageError::Io {
+                    action: "read log page",
+                    path: query.log_path.clone(),
+                    source,
+                }
+            })?;
+
+        for line in lines {
+            write_page_line(writer, &line, query.options.clean)?;
+        }
+        return Ok(());
+    }
+
+    let records =
+        parsed_log_page_records_from_path(id, &query.log_path, &query.options.source_config)?;
+
+    for record in tail_matching_records(&records, &query.filter, query.options.line_count) {
+        for line in record.raw.split('\n') {
+            write_page_line(writer, line, query.options.clean)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_page_line<W: Write>(writer: &mut W, line: &str, clean: bool) -> Result<(), LogPageError> {
+    if clean {
+        writeln!(writer, "{}", clean_display_text(line))
+    } else {
+        writeln!(writer, "{line}")
+    }
+    .map_err(LogPageError::Output)
+}
+
+/// `--clean` is terminal cleanup of returned evidence; it never alters storage
+/// or matching. Clean per line so record line boundaries survive.
+fn clean_raw_record(raw: &str) -> String {
+    raw.split('\n')
+        .map(clean_display_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+fn print_log_page_tail_from_path<W: Write>(
+    id: &LogPageId,
+    path: &Path,
+    options: &LogPageQueryOptions,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    let options = options.clone();
+    let query = ResolvedLogPageQuery {
+        log_path: path.to_path_buf(),
+        filter: log_filter_for_options(&options)?,
+        options,
+    };
+    print_resolved_log_page_tail(id, &query, writer)
+}
+
 fn open_log_page(id: &LogPageId, path: &Path) -> Result<File, LogPageError> {
     File::open(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
@@ -879,46 +1093,24 @@ fn open_log_page(id: &LogPageId, path: &Path) -> Result<File, LogPageError> {
     })
 }
 
-fn print_log_page_tail_from_path<W: Write>(
+fn parsed_log_page_records_from_path(
     id: &LogPageId,
     path: &Path,
-    options: &LogPageTailOptions,
-    writer: &mut W,
-) -> Result<(), LogPageError> {
+    source_config: &SourceConfig,
+) -> Result<Vec<ParsedLogPageRecord>, LogPageError> {
     let file = open_log_page(id, path)?;
-    let reader = BufReader::new(file);
-    let lines = if options.has_filters() {
-        filtered_tail_lines(reader, options, path)?
-    } else {
-        tail_lines(reader, options.line_count).map_err(|source| LogPageError::Io {
-            action: "read log page",
-            path: path.to_path_buf(),
-            source,
-        })?
-    };
-
-    for line in lines {
-        let line = if options.clean {
-            clean_display_text(&line)
-        } else {
-            line
-        };
-        writeln!(writer, "{line}").map_err(LogPageError::Output)?;
-    }
-
-    Ok(())
+    parsed_log_page_records(BufReader::new(file), source_config, path)
 }
 
-fn filtered_tail_lines<R: BufRead>(
+fn parsed_log_page_records<R: BufRead>(
     reader: R,
-    options: &LogPageTailOptions,
+    source_config: &SourceConfig,
     path: &Path,
-) -> Result<Vec<String>, LogPageError> {
-    let mut buffer = LogBuffer::unbounded_with_source_config(options.source_config.clone());
-    // Track the raw lines that compose each event so a filtered match emits the
-    // whole record — header plus any folded multi-line property block — instead
-    // of just the header line. A line that does not start a new event is a
-    // property-block continuation belonging to the most recently started event.
+) -> Result<Vec<ParsedLogPageRecord>, LogPageError> {
+    let mut buffer = LogBuffer::unbounded_with_source_config(source_config.clone());
+    // Keep the complete raw group beside its parsed event. Property blocks can
+    // update a preceding event or replace a deferred header event, so sequence
+    // IDs are the stable association while replay is in progress.
     let mut groups: Vec<Vec<String>> = Vec::new();
     let mut group_of_sequence: HashMap<u64, usize> = HashMap::new();
     let mut current_group: Option<usize> = None;
@@ -944,23 +1136,53 @@ fn filtered_tail_lines<R: BufRead>(
         }
     }
 
-    let filter = log_filter_for_options(options)?;
-    let matching = buffer
+    Ok(buffer
         .events()
         .iter()
-        .filter(|event| filter.matches(event))
-        .map(|event| event.sequence)
+        .filter_map(|event| {
+            let &index = group_of_sequence.get(&event.sequence)?;
+            Some(ParsedLogPageRecord {
+                event: event.clone(),
+                raw: groups[index].join("\n"),
+            })
+        })
+        .collect())
+}
+
+fn tail_matching_records<'a>(
+    records: &'a [ParsedLogPageRecord],
+    filter: &LogFilter,
+    line_count: usize,
+) -> Vec<&'a ParsedLogPageRecord> {
+    let matching = records
+        .iter()
+        .filter(|record| filter.matches(&record.event))
         .collect::<Vec<_>>();
+    let start = matching.len().saturating_sub(line_count);
+    matching.into_iter().skip(start).collect()
+}
 
-    let start = matching.len().saturating_sub(options.line_count);
-    let mut lines = Vec::new();
-    for sequence in &matching[start..] {
-        if let Some(&index) = group_of_sequence.get(sequence) {
-            lines.extend(groups[index].iter().cloned());
-        }
-    }
+#[cfg(test)]
+fn filtered_tail_lines<R: BufRead>(
+    reader: R,
+    options: &LogPageTailOptions,
+    path: &Path,
+) -> Result<Vec<String>, LogPageError> {
+    filtered_query_tail_lines(reader, &LogPageQueryOptions::from(options), path)
+}
 
-    Ok(lines)
+#[cfg(test)]
+fn filtered_query_tail_lines<R: BufRead>(
+    reader: R,
+    options: &LogPageQueryOptions,
+    path: &Path,
+) -> Result<Vec<String>, LogPageError> {
+    let filter = log_filter_for_options(options)?;
+    let records = parsed_log_page_records(reader, &options.source_config, path)?;
+    Ok(tail_matching_records(&records, &filter, options.line_count)
+        .into_iter()
+        .flat_map(|record| record.raw.split('\n').map(str::to_string))
+        .collect())
 }
 
 fn take_removed_group_lines(
@@ -984,7 +1206,7 @@ fn take_removed_group_lines(
         .collect()
 }
 
-fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, LogPageError> {
+fn log_filter_for_options(options: &LogPageQueryOptions) -> Result<LogFilter, LogPageError> {
     let mut filter = LogFilter::default();
     filter.source = options
         .source
@@ -996,6 +1218,7 @@ fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, Log
         .as_ref()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
+    filter.level = options.level;
 
     for property_filter in &options.property_filters {
         let update = PropertyFilterUpdate::parse(property_filter, false)
@@ -1004,6 +1227,34 @@ fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, Log
     }
 
     Ok(filter)
+}
+
+fn record_properties(properties: &[LogProperty]) -> BTreeMap<String, serde_json::Value> {
+    let mut values = BTreeMap::new();
+    for property in properties {
+        values
+            .entry(property.key.clone())
+            .or_insert_with(|| property_json_value(&property.value));
+    }
+    values
+}
+
+fn property_json_value(value: &PropertyValue) -> serde_json::Value {
+    match value {
+        PropertyValue::String(value) | PropertyValue::Text(value) => {
+            serde_json::Value::String(value.clone())
+        }
+        PropertyValue::Number(value) => lossless_json_number(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.clone())),
+        PropertyValue::Bool(value) => serde_json::Value::Bool(*value),
+        PropertyValue::Null => serde_json::Value::Null,
+    }
+}
+
+fn lossless_json_number(value: &str) -> Option<serde_json::Number> {
+    let number = serde_json::from_str::<serde_json::Number>(value).ok()?;
+    (number.to_string() == value).then_some(number)
 }
 
 fn tail_lines<R: BufRead>(reader: R, line_count: usize) -> io::Result<Vec<String>> {
@@ -1366,6 +1617,20 @@ fn process_is_active(_pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn query_records_from_input(input: &str, options: &LogPageQueryOptions) -> Vec<LogPageRecord> {
+        let records = parsed_log_page_records(
+            BufReader::new(input.as_bytes()),
+            &options.source_config,
+            Path::new("test.log"),
+        )
+        .unwrap();
+        let filter = log_filter_for_options(options).unwrap();
+        tail_matching_records(&records, &filter, options.line_count)
+            .into_iter()
+            .map(LogPageRecord::from_parsed)
+            .collect()
+    }
+
     fn read_metadata(path: &Path) -> ActiveLogPageMetadata {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
@@ -1425,7 +1690,7 @@ mod tests {
             .collect::<String>();
         fs::write(&path, &colored).unwrap();
         let id = LogPageId::parse("clean-test").unwrap();
-        let mut options = LogPageTailOptions::new(1);
+        let mut options = LogPageQueryOptions::new(1);
         options
             .property_filters
             .push("requestId=fixture-failed".to_string());
@@ -1501,7 +1766,6 @@ mod tests {
         let input = "api | one\nweb | two\napi | three\n".as_bytes();
         let options = LogPageTailOptions {
             line_count: 2,
-            clean: false,
             source: Some("api".to_string()),
             text: None,
             property_filters: Vec::new(),
@@ -1522,7 +1786,6 @@ mod tests {
         let input = "api | INFO request tenantId=tenant-1\napi | INFO request tenantId=tenant-2\nweb | INFO request tenantId=tenant-1\n".as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
-            clean: false,
             source: Some("api".to_string()),
             text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
@@ -1543,7 +1806,6 @@ mod tests {
         let input = "14:06:58.892 INFO request completed\n[14:06:58.892] INFO (#1):\n  {\n    tenantId: \"tenant-1\"\n  }\n".as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
-            clean: false,
             source: None,
             text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
@@ -1574,7 +1836,6 @@ mod tests {
                 .as_bytes();
         let options = LogPageTailOptions {
             line_count: 2,
-            clean: false,
             source: None,
             text: None,
             property_filters: vec!["tenantId=t1".to_string()],
@@ -1599,7 +1860,6 @@ mod tests {
             .as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
-            clean: false,
             source: Some("api".to_string()),
             text: Some("database".to_string()),
             property_filters: Vec::new(),
@@ -1613,12 +1873,116 @@ mod tests {
     }
 
     #[test]
+    fn page_query_composes_source_text_level_and_property_predicates() {
+        let input = "api | ERROR database failed tenantId=tenant-1\napi | ERROR database failed tenantId=tenant-1 skip=true\napi | INFO database failed tenantId=tenant-1\nweb | ERROR database failed tenantId=tenant-1\n";
+        let options = LogPageQueryOptions {
+            clean: false,
+            line_count: 10,
+            source: Some("api".to_string()),
+            text: Some("database".to_string()),
+            level: Level::parse("ERR"),
+            property_filters: vec!["tenantId=tenant-1".to_string(), "!skip".to_string()],
+            source_config: SourceConfig::default(),
+        };
+
+        let filter = log_filter_for_options(&options).unwrap();
+        assert_eq!(filter.level, Some(Level::Error));
+        let records = query_records_from_input(input, &options);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].raw,
+            "api | ERROR database failed tenantId=tenant-1"
+        );
+    }
+
+    #[test]
+    fn structured_records_preserve_types_with_lossless_numeric_fallback() {
+        let input = "api | INFO values canonical=500 leading=01 trailing=1. huge=18446744073709551616 flag=true missing=null label=\"ok\" text=bare\n";
+        let records = query_records_from_input(input, &LogPageQueryOptions::new(10));
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.schema_version, 1);
+        assert_eq!(record.source, "api");
+        assert_eq!(record.timestamp, None);
+        assert_eq!(record.level, Level::Info);
+        assert_eq!(record.properties["canonical"], serde_json::json!(500));
+        assert_eq!(record.properties["leading"], serde_json::json!("01"));
+        assert_eq!(record.properties["trailing"], serde_json::json!("1."));
+        assert_eq!(
+            record.properties["huge"],
+            serde_json::json!("18446744073709551616")
+        );
+        assert_eq!(record.properties["flag"], serde_json::json!(true));
+        assert_eq!(record.properties["missing"], serde_json::Value::Null);
+        assert_eq!(record.properties["label"], serde_json::json!("ok"));
+        assert_eq!(record.properties["text"], serde_json::json!("bare"));
+    }
+
+    #[test]
+    fn structured_record_has_canonical_level_and_complete_multiline_raw() {
+        let input = "api | 14:06:58.892 ERROR request failed\n[14:06:58.892] ERROR (#1):\n  {\n    retryable: true,\n    statusCode: 500,\n  }\n";
+        let records = query_records_from_input(input, &LogPageQueryOptions::new(10));
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].timestamp.as_deref(), Some("14:06:58.892"));
+        assert_eq!(records[0].level, Level::Error);
+        assert_eq!(records[0].message, "request failed");
+        assert_eq!(records[0].properties["retryable"], serde_json::json!(true));
+        assert_eq!(records[0].properties["statusCode"], serde_json::json!(500));
+        assert_eq!(records[0].raw, input.trim_end());
+
+        let json = serde_json::to_string(&records[0]).unwrap();
+        assert_eq!(json.lines().count(), 1);
+        assert!(json.contains("\"level\":\"error\""));
+        assert!(!json.contains("sequence"));
+    }
+
+    #[test]
+    fn structured_record_uses_first_duplicate_property() {
+        let input = "api | INFO request tenantId=first tenantId=second\n";
+        let records = query_records_from_input(input, &LogPageQueryOptions::new(10));
+
+        assert_eq!(
+            records[0].properties["tenantId"],
+            serde_json::json!("first")
+        );
+    }
+
+    #[test]
+    fn structured_query_returns_last_matching_records_in_original_order() {
+        let input =
+            "api | ERROR first\napi | INFO ignored\napi | ERROR second\napi | ERROR third\n";
+        let mut options = LogPageQueryOptions::new(2);
+        options.level = Some(Level::Error);
+
+        let records = query_records_from_input(input, &options);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+    }
+
+    #[test]
+    fn structured_query_returns_empty_for_no_matches() {
+        let input = "api | INFO ready\n";
+        let mut options = LogPageQueryOptions::new(10);
+        options.level = Some(Level::Error);
+
+        assert!(query_records_from_input(input, &options).is_empty());
+    }
+
+    #[test]
     fn filtered_tail_lines_includes_property_block_that_precedes_summary() {
         let input = "[api] [21:05:37.312] INFO (#140):\n[api] {\n[api] requestId: \"abc-123\",\n[api] statusCode: 200,\n[api] }\n[api] 21:05:37.312 INFO http.request ok\n"
             .as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
-            clean: false,
             source: None,
             text: None,
             property_filters: vec!["requestId=abc-123".to_string()],
@@ -1647,7 +2011,6 @@ mod tests {
         let raw = fixture.lines().collect::<Vec<_>>();
         let mut options = LogPageTailOptions {
             line_count: 100,
-            clean: false,
             source: None,
             text: None,
             property_filters: vec!["requestId=fixture-failed".to_string()],
@@ -1688,7 +2051,6 @@ mod tests {
     fn vev_compose_fixture_replays_buildkit_and_status_filters() {
         let options = LogPageTailOptions {
             line_count: 10,
-            clean: false,
             source: Some("vev-statistics".to_string()),
             text: Some("npm ci".to_string()),
             property_filters: Vec::new(),
