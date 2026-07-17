@@ -202,6 +202,14 @@ filtered tail returns whole matching records — the header line plus any folded
 multi-line property block — and `-n` counts matching records rather than
 individual lines.
 
+Property-block folding is fixed at 256 cleaned body lines or 256 KiB of cleaned
+body text, whichever comes first. Explicitly sourced blocks are associated only
+with the matching source; legacy source-less blocks retain their timestamp/level
+fallback. A clear later record boundary fails open and is parsed normally, while
+an incomplete or oversized block contributes no partial properties. These caps
+apply after a raw input line reaches the parser: they do not bound the size of an
+individual input line, page storage, or persistent history.
+
 Use JSONL when the result will be consumed programmatically:
 
 ```sh
@@ -588,6 +596,20 @@ previous event instead of shown as separate rows:
     durationMs: 96,
   }
 ```
+
+An explicit source on the property header makes this association source-aware,
+using the same case-insensitive source identity as filters. Source-less headers
+keep the legacy immediate-previous or later timestamp/level fallback. A pending
+property block retains at most 256 cleaned lines and 256 KiB, counting one
+logical newline per retained line. Recognizable record boundaries fail open and
+are ingested as ordinary log records, so malformed blocks cannot hide the later
+stream. Incomplete, oversized, and EOF-truncated blocks never apply partial
+properties; complete blocks keep the tolerant property syntax above.
+
+The fold limits bound only parser-owned multiline state. Loggle still receives
+and allocates a raw input line before this check, so a single input line is not
+size-limited by the 256-KiB property-block cap. Page retention and on-disk
+history have their own behavior and are not made fully bounded by this rule.
 
 Inline `key=value` and logfmt-style tokens in the displayed message are also
 parsed as properties. Quoted values such as `service="api server"` are supported

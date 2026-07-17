@@ -339,6 +339,82 @@ fn combined_agent_filters_match_the_same_event() {
 }
 
 #[test]
+fn malformed_interleaved_page_recovers_consistently_for_jsonl_and_facets() {
+    let state = TestState::new("malformed-interleaved-recovery");
+    state.add_live_page(
+        "api",
+        concat!(
+            "[api] 10:00:00.000 INFO api summary\n",
+            "[worker] 10:00:00.000 INFO worker summary\n",
+            "[api] [10:00:00.000] INFO (#1):\n",
+            "[api] {\n",
+            "[api] partial: true,\n",
+            "[api] 10:00:01.000 ERROR recovered cohort=retry\n",
+            "[worker] INFO later cohort=steady\n",
+        ),
+    );
+
+    let log = state.run(&["log", "-i", "api", "-n", "10", "--format", "jsonl"]);
+
+    assert!(log.status.success(), "{}", stderr(&log));
+    assert!(stderr(&log).is_empty());
+    let records = json_lines(&log);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0]["source"], "api");
+    assert_eq!(records[0]["message"], "api summary");
+    assert_eq!(records[1]["source"], "worker");
+    assert_eq!(records[1]["message"], "worker summary");
+    assert_eq!(records[2]["source"], "api");
+    assert_eq!(records[2]["message"], "recovered cohort=retry");
+    assert_eq!(records[3]["source"], "worker");
+    assert_eq!(records[3]["message"], "later cohort=steady");
+    assert!(
+        records
+            .iter()
+            .all(|record| record["properties"].get("partial").is_none())
+    );
+    assert!(
+        records[0]["raw"]
+            .as_str()
+            .unwrap()
+            .contains("[api] partial: true,")
+    );
+    assert!(!records[1]["raw"].as_str().unwrap().contains("partial"));
+
+    let facets = state.run(&[
+        "facets",
+        "-i",
+        "api",
+        "--records",
+        "10",
+        "--property-key",
+        "cohort",
+        "--format",
+        "jsonl",
+    ]);
+
+    assert!(facets.status.success(), "{}", stderr(&facets));
+    assert!(stderr(&facets).is_empty());
+    let groups = json_lines(&facets);
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group["facet"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["source", "level", "property_key", "property_value"]
+    );
+    let source = json_group(&groups, "source");
+    assert_eq!(source["available_records"], 4);
+    assert_eq!(source["buckets"][0]["value"], "api");
+    assert_eq!(source["buckets"][0]["count"], 2);
+    assert_eq!(source["buckets"][1]["value"], "worker");
+    assert_eq!(source["buckets"][1]["count"], 2);
+    let values = json_group(&groups, "property_value");
+    assert_eq!(values["buckets"][0]["value"], "retry");
+    assert_eq!(values["buckets"][1]["value"], "steady");
+}
+
+#[test]
 fn no_matching_logs_are_a_silent_success() {
     let state = TestState::new("empty-match");
     state.add_live_page("api", "api | INFO ready\n");

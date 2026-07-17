@@ -1107,10 +1107,16 @@ fn parsed_log_page_records<R: BufRead>(
             groups.push(group);
             group_of_sequence.insert(sequence, index);
             current_group = Some(index);
+        } else if let Some(index) = change
+            .raw_target
+            .and_then(|sequence| group_of_sequence.get(&sequence).copied())
+        {
+            groups[index].push(line);
         } else if let Some(index) = current_group {
             groups[index].push(line);
         }
     }
+    buffer.finish_input();
 
     Ok(buffer
         .events()
@@ -1902,6 +1908,159 @@ mod tests {
                 "[api] 21:05:37.312 INFO http.request ok".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn page_replay_matches_direct_buffer_after_interleaved_malformed_fold() {
+        let input = concat!(
+            "[api] 10:00:00.000 INFO api summary\n",
+            "[worker] 10:00:00.000 INFO worker summary\n",
+            "[api] [10:00:00.000] INFO (#1):\n",
+            "[api] {\n",
+            "[api] partial: true,\n",
+            "[api] 10:00:01.000 ERROR recovered cohort=retry\n",
+            "[worker] INFO later cohort=steady\n",
+        );
+        let records = parsed_log_page_records(
+            BufReader::new(input.as_bytes()),
+            &SourceConfig::default(),
+            Path::new("test.log"),
+        )
+        .unwrap();
+        let mut direct = LogBuffer::unbounded_with_source_config(SourceConfig::default());
+        for line in input.lines() {
+            direct.push_line(line.to_string());
+        }
+        direct.finish_input();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+            direct.events().iter().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records[0].raw,
+            concat!(
+                "[api] 10:00:00.000 INFO api summary\n",
+                "[api] [10:00:00.000] INFO (#1):\n",
+                "[api] {\n",
+                "[api] partial: true,"
+            )
+        );
+        assert_eq!(records[1].raw, "[worker] 10:00:00.000 INFO worker summary");
+        assert_eq!(
+            records[2].raw,
+            "[api] 10:00:01.000 ERROR recovered cohort=retry"
+        );
+        assert_eq!(records[3].raw, "[worker] INFO later cohort=steady");
+        assert!(records[0].event.property("partial").is_none());
+        assert_eq!(
+            records.iter().flat_map(|record| record.raw.lines()).count(),
+            input.lines().count()
+        );
+    }
+
+    #[test]
+    fn interleaved_after_summary_block_keeps_source_keyed_jsonl_and_raw_group() {
+        let input = concat!(
+            "[api] 10:00:00.000 INFO api summary\n",
+            "[worker] 10:00:00.000 INFO worker summary\n",
+            "[api] [10:00:00.000] INFO (#1):\n",
+            "[api] {\n",
+            "[api] tenant: \"api\",\n",
+            "[api] }\n",
+        );
+        let mut options = LogPageQueryOptions::new(10);
+        options.property_filters = vec!["tenant=api".to_string()];
+        let records = query_records_from_input(input, &options);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, "api");
+        assert_eq!(records[0].properties["tenant"], serde_json::json!("api"));
+        assert_eq!(
+            records[0].raw,
+            concat!(
+                "[api] 10:00:00.000 INFO api summary\n",
+                "[api] [10:00:00.000] INFO (#1):\n",
+                "[api] {\n",
+                "[api] tenant: \"api\",\n",
+                "[api] }"
+            )
+        );
+
+        options.source = Some("worker".to_string());
+        assert!(query_records_from_input(input, &options).is_empty());
+    }
+
+    #[test]
+    fn page_replay_eof_preserves_bounded_raw_fragment_without_partial_properties() {
+        let input = concat!(
+            "[api] 10:00:00.000 INFO api summary stable=true\n",
+            "[worker] 10:00:00.000 INFO worker summary\n",
+            "[api] [10:00:00.000] INFO (#1):\n",
+            "[api] {\n",
+            "[api] partial: true,\n",
+        );
+        let records = parsed_log_page_records(
+            BufReader::new(input.as_bytes()),
+            &SourceConfig::default(),
+            Path::new("test.log"),
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event.source, "api");
+        assert!(records[0].event.property("stable").is_some());
+        assert!(records[0].event.property("partial").is_none());
+        assert_eq!(
+            records[0].raw,
+            concat!(
+                "[api] 10:00:00.000 INFO api summary stable=true\n",
+                "[api] [10:00:00.000] INFO (#1):\n",
+                "[api] {\n",
+                "[api] partial: true,"
+            )
+        );
+        assert_eq!(records[1].raw, "[worker] 10:00:00.000 INFO worker summary");
+    }
+
+    #[test]
+    fn facets_count_the_same_recovered_source_and_property_cohorts() {
+        let input = concat!(
+            "[api] 10:00:00.000 INFO api summary\n",
+            "[worker] 10:00:00.000 INFO worker summary cohort=steady\n",
+            "[api] [10:00:00.000] INFO (#1):\n",
+            "[api] {\n",
+            "[api] partial: true,\n",
+            "[api] 10:00:01.000 ERROR recovered cohort=retry\n",
+        );
+        let records = parsed_log_page_records(
+            BufReader::new(input.as_bytes()),
+            &SourceConfig::default(),
+            Path::new("test.log"),
+        )
+        .unwrap();
+        let groups = aggregate_facets(
+            records.iter().map(|record| &record.event),
+            10,
+            &LogFilter::default(),
+            &FacetOptions::new(20, Some("cohort".to_string())).unwrap(),
+        );
+
+        let source = facet_group(&groups, FacetKind::Source);
+        assert_eq!(source.available_records, 3);
+        assert_eq!(source.buckets[0].value, "api");
+        assert_eq!(source.buckets[0].count, 2);
+        assert_eq!(source.buckets[1].value, "worker");
+        assert_eq!(source.buckets[1].count, 1);
+        let values = facet_group(&groups, FacetKind::PropertyValue);
+        assert_eq!(values.total_buckets, 2);
+        assert_eq!(values.buckets[0].value, "retry");
+        assert_eq!(values.buckets[1].value, "steady");
+        assert!(records[0].event.property("partial").is_none());
     }
 
     #[test]

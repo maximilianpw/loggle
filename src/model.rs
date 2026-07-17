@@ -4,7 +4,7 @@ use std::{borrow::Cow, fmt};
 
 use serde_json::{Map, Value};
 
-pub(crate) use interpret::LogInterpreter;
+pub(crate) use interpret::{LogInterpreter, StructuredLineKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -196,6 +196,7 @@ const JSON_TIMESTAMP_KEYS: &[&str] = &["timestamp", "time", "ts", "@timestamp"];
 pub struct PropertyBlockHeader {
     pub timestamp: String,
     pub level: Level,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,44 +267,69 @@ impl LogEvent {
 }
 
 pub fn parse_compose_line(line: &str) -> ParsedLine {
-    let line = clean_display_text(line);
+    let SourceMessage { source, message } = split_source_message(line);
 
-    if let Some(parsed) = parse_bracket_prefixed_line(&line) {
-        return parsed;
+    if let Some(source) = source {
+        return ParsedLine {
+            source,
+            message,
+            source_explicit: true,
+        };
     }
 
-    if let Some((source, message)) = line.split_once('|') {
-        let source = source.trim().to_string();
-        if !source.is_empty() {
-            return ParsedLine {
-                source,
-                message: message.trim_start().to_string(),
-                source_explicit: true,
-            };
-        }
-    }
-
-    if let Some(parsed) = parse_compose_status_line(&line) {
+    if let Some(parsed) = parse_compose_status_line(&message) {
         return parsed;
     }
 
     ParsedLine {
         source: "unknown".to_string(),
-        message: line,
+        message,
         source_explicit: false,
     }
 }
 
-fn parse_bracket_prefixed_line(line: &str) -> Option<ParsedLine> {
-    let rest = line.strip_prefix('[')?;
-    let (source, message) = rest.split_once(']')?;
-    let source = source.trim().to_string();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceMessage {
+    source: Option<String>,
+    message: String,
+}
 
-    (!source.is_empty()).then(|| ParsedLine {
-        source,
-        message: message.trim_start().to_string(),
-        source_explicit: true,
-    })
+fn split_source_message(line: &str) -> SourceMessage {
+    let line = clean_display_text(line);
+
+    if let Some(rest) = line.strip_prefix('[')
+        && let Some((candidate, message)) = rest.split_once(']')
+    {
+        let candidate = candidate.trim();
+        if looks_like_timestamp(candidate) {
+            return SourceMessage {
+                source: None,
+                message: line,
+            };
+        }
+
+        if !candidate.is_empty() {
+            return SourceMessage {
+                source: Some(candidate.to_string()),
+                message: message.trim_start().to_string(),
+            };
+        }
+    }
+
+    if let Some((source, message)) = line.split_once('|') {
+        let source = source.trim();
+        if !source.is_empty() {
+            return SourceMessage {
+                source: Some(source.to_string()),
+                message: message.trim_start().to_string(),
+            };
+        }
+    }
+
+    SourceMessage {
+        source: None,
+        message: line,
+    }
 }
 
 pub(crate) fn parse_buildkit_step_line(line: &str) -> Option<BuildKitStepLine> {
@@ -482,6 +508,7 @@ pub fn parse_structured_message(message: &str) -> Option<StructuredMessage> {
 }
 
 pub fn parse_property_block_header(line: &str) -> Option<PropertyBlockHeader> {
+    let source = split_source_message(line).source;
     let message = message_without_source_prefix(line);
     let rest = message.trim().strip_prefix('[')?;
     let (timestamp, after_timestamp) = rest.split_once(']')?;
@@ -503,28 +530,61 @@ pub fn parse_property_block_header(line: &str) -> Option<PropertyBlockHeader> {
     Some(PropertyBlockHeader {
         timestamp: timestamp.to_string(),
         level,
+        source,
     })
 }
 
 pub(crate) fn message_without_source_prefix(line: &str) -> String {
-    let line = clean_display_text(line);
+    split_source_message(line).message
+}
 
-    if let Some((source, message)) = line.split_once('|') {
-        if !source.trim().is_empty() {
-            return message.trim_start().to_string();
-        }
+fn is_property_body_line(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return true;
     }
 
-    if let Some(rest) = line.strip_prefix('[') {
-        if let Some((source, message)) = rest.split_once(']') {
-            let source = source.trim();
-            if !source.is_empty() && !looks_like_timestamp(source) {
-                return message.trim_start().to_string();
-            }
-        }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_whitespace() || matches!(ch, '{' | '}' | '[' | ']' | ','))
+    {
+        return true;
     }
 
-    line
+    if parse_property_object(trimmed).is_some() {
+        return true;
+    }
+
+    let scalar = trim_trailing_comma(trimmed);
+    parse_property_entry(scalar).is_some()
+        || is_complete_quoted_scalar(scalar)
+        || is_number_literal(scalar)
+        || matches!(scalar, "true" | "false" | "null")
+}
+
+fn is_complete_quoted_scalar(value: &str) -> bool {
+    let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))
+    else {
+        return false;
+    };
+    if value.len() < 2 || !value.ends_with(quote) {
+        return false;
+    }
+
+    let mut escaped = false;
+    for ch in value[quote.len_utf8()..value.len() - quote.len_utf8()].chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return false;
+        }
+    }
+    !escaped
 }
 
 fn split_first_token(value: &str) -> Option<(&str, &str)> {
@@ -1588,6 +1648,7 @@ mod tests {
 
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
+        assert_eq!(header.source, None);
         assert!(parse_property_block_header("[frontend] VITE ready").is_none());
     }
 
@@ -1597,6 +1658,17 @@ mod tests {
 
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
+        assert_eq!(header.source.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn parses_pipe_prefixed_property_block_header_with_trimmed_source_spelling() {
+        let header =
+            parse_property_block_header("  api worker  | [14:06:58.892] ERROR (#147):").unwrap();
+
+        assert_eq!(header.timestamp, "14:06:58.892");
+        assert_eq!(header.level, Level::Error);
+        assert_eq!(header.source.as_deref(), Some("api worker"));
     }
 
     #[test]
@@ -1607,6 +1679,44 @@ mod tests {
 
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
+        assert_eq!(header.source.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn timestamp_bracket_is_not_misclassified_as_a_source() {
+        let parsed = parse_compose_line("[14:06:58.892] INFO (#147):");
+
+        assert_eq!(parsed.source, "unknown");
+        assert_eq!(parsed.message, "[14:06:58.892] INFO (#147):");
+        assert!(!parsed.source_explicit);
+    }
+
+    #[test]
+    fn bracket_source_precedes_pipe_data_in_property_values() {
+        let parsed = parse_compose_line("[api] value: \"left | right\"");
+
+        assert_eq!(parsed.source, "api");
+        assert_eq!(parsed.message, "value: \"left | right\"");
+        assert_eq!(
+            message_without_source_prefix("[api] value: \"left | right\""),
+            "value: \"left | right\""
+        );
+    }
+
+    #[test]
+    fn colored_bracket_source_and_message_use_the_shared_splitter() {
+        let parsed =
+            parse_compose_line("\u{1b}[36m[api worker ]\u{1b}[0m [14:06:58.892] WARN (#9):");
+        let header = parse_property_block_header(
+            "\u{1b}[36m[api worker ]\u{1b}[0m [14:06:58.892] WARN (#9):",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.source, "api worker");
+        assert_eq!(parsed.message, "[14:06:58.892] WARN (#9):");
+        assert_eq!(header.source.as_deref(), Some("api worker"));
+        assert_eq!(header.timestamp, "14:06:58.892");
+        assert_eq!(header.level, Level::Warn);
     }
 
     #[test]

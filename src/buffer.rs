@@ -2,8 +2,11 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::model::{
     LogEvent, LogInterpreter, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig,
-    parse_buildkit_step_line,
+    StructuredLineKind, parse_buildkit_step_line,
 };
+
+pub(crate) const MAX_PENDING_PROPERTY_LINES: usize = 256;
+pub(crate) const MAX_PENDING_PROPERTY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub struct LogBuffer {
@@ -23,15 +26,25 @@ pub(crate) struct BufferChange {
     pub(crate) appended: Option<u64>,
     pub(crate) removed: Vec<u64>,
     pub(crate) updated: Vec<u64>,
+    pub(crate) raw_target: Option<u64>,
 }
 
 #[derive(Debug)]
 struct PendingPropertyBlock {
     target_sequence: u64,
-    deferred_header: Option<PropertyBlockHeader>,
+    header: PropertyBlockHeader,
+    deferred_header: bool,
     lines: Vec<String>,
+    bytes: usize,
     brace_depth: i32,
     saw_open: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPushResult {
+    Accepted,
+    Complete,
+    AbortAndRetry,
 }
 
 #[derive(Debug)]
@@ -73,27 +86,34 @@ impl LogBuffer {
 
     pub(crate) fn push_line(&mut self, line: String) -> BufferChange {
         let mut change = BufferChange::default();
-        if self.push_pending_property_line(&line, &mut change) {
-            return change;
+        match self.push_pending_property_line(&line, &mut change) {
+            Some(PendingPushResult::Accepted | PendingPushResult::Complete) => return change,
+            Some(PendingPushResult::AbortAndRetry) | None => {}
         }
 
+        self.push_ordinary_line(line, &mut change);
+        change
+    }
+
+    fn push_ordinary_line(&mut self, line: String, change: &mut BufferChange) {
         if let Some(header) = self.interpreter.property_block_header(&line) {
             if let Some(target_sequence) = self.property_target_sequence(&header) {
-                self.pending_properties = Some(PendingPropertyBlock::new(target_sequence, None));
-                return change;
-            }
-
-            if let Some(target_sequence) = self.push_event(line, &mut change) {
+                change.raw_target = Some(target_sequence);
                 self.pending_properties =
-                    Some(PendingPropertyBlock::new(target_sequence, Some(header)));
-                return change;
+                    Some(PendingPropertyBlock::new(target_sequence, header, false));
+                return;
             }
 
-            return change;
+            if let Some(target_sequence) = self.push_event(line, change) {
+                self.pending_properties =
+                    Some(PendingPropertyBlock::new(target_sequence, header, true));
+                return;
+            }
+
+            return;
         }
 
-        self.push_event(line, &mut change);
-        change
+        self.push_event(line, change);
     }
 
     fn push_event(&mut self, line: String, change: &mut BufferChange) -> Option<u64> {
@@ -166,29 +186,48 @@ impl LogBuffer {
         }
     }
 
-    fn push_pending_property_line(&mut self, line: &str, change: &mut BufferChange) -> bool {
-        let Some(mut pending) = self.pending_properties.take() else {
-            return false;
-        };
+    fn push_pending_property_line(
+        &mut self,
+        line: &str,
+        change: &mut BufferChange,
+    ) -> Option<PendingPushResult> {
+        let mut pending = self.pending_properties.take()?;
 
-        if !pending.push_line(line) {
-            return false;
+        let buildkit_source = self.pending_buildkit_source(line);
+        let result = pending.push_line(line, self.interpreter, buildkit_source);
+        match result {
+            PendingPushResult::Accepted => {
+                change.raw_target = Some(pending.target_sequence);
+                self.pending_properties = Some(pending);
+            }
+            PendingPushResult::Complete => {
+                change.raw_target = Some(pending.target_sequence);
+                self.apply_pending_properties(pending, change);
+            }
+            PendingPushResult::AbortAndRetry => {}
         }
 
-        if pending.is_complete() {
-            self.apply_pending_properties(pending, change);
-        } else {
-            self.pending_properties = Some(pending);
-        }
+        Some(result)
+    }
 
-        true
+    fn pending_buildkit_source(&self, line: &str) -> Option<String> {
+        let buildkit = parse_buildkit_step_line(line)?;
+        buildkit
+            .source
+            .or_else(|| self.buildkit_steps.get(&buildkit.step_id).cloned())
     }
 
     fn property_target_sequence(&self, header: &PropertyBlockHeader) -> Option<u64> {
-        let event = self.events.back()?;
-        (event.timestamp.as_deref() == Some(header.timestamp.as_str())
-            && event.level == header.level)
-            .then_some(event.sequence)
+        let event = if let Some(source) = header.source.as_deref() {
+            self.events
+                .iter()
+                .rev()
+                .find(|event| event.source.eq_ignore_ascii_case(source))?
+        } else {
+            self.events.back()?
+        };
+
+        header_matches_event(header, event).then_some(event.sequence)
     }
 
     fn apply_pending_properties(
@@ -210,11 +249,11 @@ impl LogBuffer {
             change.updated.push(pending.target_sequence);
         }
 
-        if let Some(header) = pending.deferred_header {
+        if pending.deferred_header {
             self.completed_property_blocks
                 .push_back(CompletedPropertyBlock {
                     header_sequence: pending.target_sequence,
-                    header,
+                    header: pending.header,
                     properties,
                 });
             self.trim_completed_property_blocks();
@@ -222,23 +261,48 @@ impl LogBuffer {
     }
 
     fn apply_completed_property_block_to_back(&mut self, change: &mut BufferChange) {
-        let Some(event) = self.events.back() else {
+        let Some(event) = self.events.back().cloned() else {
             return;
         };
 
-        let Some(position) = self.completed_property_blocks.iter().position(|block| {
-            event.sequence != block.header_sequence
-                && event.timestamp.as_deref() == Some(block.header.timestamp.as_str())
-                && event.level == block.header.level
-        }) else {
-            return;
-        };
+        let mut retained = VecDeque::with_capacity(self.completed_property_blocks.len());
+        let mut decided = Vec::new();
+        let mut matched_source_less = false;
+        while let Some(block) = self.completed_property_blocks.pop_front() {
+            let is_distinct_event = event.sequence != block.header_sequence;
+            let should_decide = match block.header.source.as_deref() {
+                Some(source) => is_distinct_event && event.source.eq_ignore_ascii_case(source),
+                None => {
+                    is_distinct_event
+                        && !matched_source_less
+                        && header_matches_event(&block.header, &event)
+                }
+            };
 
-        let Some(block) = self.completed_property_blocks.remove(position) else {
-            return;
-        };
-        let target_sequence = event.sequence;
+            if should_decide {
+                if block.header.source.is_none() {
+                    matched_source_less = true;
+                }
+                decided.push(block);
+            } else {
+                retained.push_back(block);
+            }
+        }
+        self.completed_property_blocks = retained;
 
+        for block in decided {
+            if header_matches_event(&block.header, &event) {
+                self.attach_completed_property_block(block, event.sequence, change);
+            }
+        }
+    }
+
+    fn attach_completed_property_block(
+        &mut self,
+        block: CompletedPropertyBlock,
+        target_sequence: u64,
+        change: &mut BufferChange,
+    ) {
         if let Some(event) = self
             .events
             .iter_mut()
@@ -253,10 +317,9 @@ impl LogBuffer {
             .events
             .iter()
             .position(|event| event.sequence == block.header_sequence)
+            && let Some(event) = self.events.remove(position)
         {
-            if let Some(event) = self.events.remove(position) {
-                change.removed.push(event.sequence);
-            }
+            change.removed.push(event.sequence);
         }
     }
 
@@ -287,6 +350,19 @@ impl LogBuffer {
 
         self.events.iter().find(|event| event.sequence == sequence)
     }
+
+    pub(crate) fn finish_input(&mut self) {
+        self.pending_properties = None;
+    }
+}
+
+fn header_matches_event(header: &PropertyBlockHeader, event: &LogEvent) -> bool {
+    event.timestamp.as_deref() == Some(header.timestamp.as_str())
+        && event.level == header.level
+        && header
+            .source
+            .as_deref()
+            .is_none_or(|source| event.source.eq_ignore_ascii_case(source))
 }
 
 fn is_continuation_line(message: &str) -> bool {
@@ -359,26 +435,76 @@ fn looks_like_property_key(key: &str) -> bool {
 }
 
 impl PendingPropertyBlock {
-    fn new(target_sequence: u64, deferred_header: Option<PropertyBlockHeader>) -> Self {
+    fn new(target_sequence: u64, header: PropertyBlockHeader, deferred_header: bool) -> Self {
         Self {
             target_sequence,
+            header,
             deferred_header,
             lines: Vec::new(),
+            bytes: 0,
             brace_depth: 0,
             saw_open: false,
         }
     }
 
-    fn push_line(&mut self, line: &str) -> bool {
-        let line = LogInterpreter.message_without_source_prefix(line);
-        let trimmed = line.trim();
-        if !self.saw_open && !trimmed.is_empty() && !trimmed.starts_with('{') {
-            return false;
+    fn push_line(
+        &mut self,
+        line: &str,
+        interpreter: LogInterpreter,
+        buildkit_source: Option<String>,
+    ) -> PendingPushResult {
+        if interpreter.property_block_header(line).is_some() {
+            return PendingPushResult::AbortAndRetry;
         }
 
-        self.update_brace_depth(&line);
-        self.lines.push(line);
-        true
+        let mut parsed = interpreter.pending_property_line(line);
+        if parsed.source.is_none() {
+            parsed.source = buildkit_source;
+        }
+        if self.header.source.as_deref().is_some_and(|source| {
+            parsed
+                .source
+                .as_deref()
+                .is_some_and(|line_source| !line_source.eq_ignore_ascii_case(source))
+        }) {
+            return PendingPushResult::AbortAndRetry;
+        }
+
+        let trimmed = parsed.message.trim();
+        let track_braces = if !self.saw_open {
+            if !trimmed.is_empty() && !trimmed.starts_with('{') {
+                return PendingPushResult::AbortAndRetry;
+            }
+            true
+        } else {
+            let structured_boundary = parsed.structured == StructuredLineKind::Timestamped
+                || (parsed.structured == StructuredLineKind::LevelOnly && !parsed.is_property_body);
+            if structured_boundary || (parsed.source.is_some() && !parsed.is_property_body) {
+                return PendingPushResult::AbortAndRetry;
+            }
+            parsed.is_property_body
+        };
+
+        let Some(line_bytes) = parsed.message.len().checked_add(1) else {
+            return PendingPushResult::AbortAndRetry;
+        };
+        let Some(bytes) = self.bytes.checked_add(line_bytes) else {
+            return PendingPushResult::AbortAndRetry;
+        };
+        if self.lines.len() >= MAX_PENDING_PROPERTY_LINES || bytes > MAX_PENDING_PROPERTY_BYTES {
+            return PendingPushResult::AbortAndRetry;
+        }
+
+        if track_braces {
+            self.update_brace_depth(&parsed.message);
+        }
+        self.lines.push(parsed.message);
+        self.bytes = bytes;
+        if self.is_complete() {
+            PendingPushResult::Complete
+        } else {
+            PendingPushResult::Accepted
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -773,6 +899,501 @@ mod tests {
         assert_eq!(
             raws,
             vec!["[14:06:58.892] INFO (#147):", "VITE ready in 200 ms"]
+        );
+    }
+
+    #[test]
+    fn sourced_after_summary_block_ignores_interleaved_equal_timestamp_event() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO api summary".to_string());
+        buffer.push_line("[worker] 10:00:00.000 INFO worker summary".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] owner: api,".to_string());
+        buffer.push_line("[api] }".to_string());
+
+        assert_eq!(buffer.events().len(), 2);
+        assert_eq!(buffer.events()[0].source, "api");
+        assert_eq!(
+            buffer.events()[0]
+                .property("owner")
+                .unwrap()
+                .value
+                .to_string(),
+            "api"
+        );
+        assert!(buffer.events()[1].property("owner").is_none());
+    }
+
+    #[test]
+    fn sourced_before_summary_block_ignores_interleaved_equal_timestamp_event() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] owner: api,".to_string());
+        buffer.push_line("[api] }".to_string());
+        buffer.push_line("[worker] 10:00:00.000 INFO worker summary".to_string());
+        buffer.push_line("[api] 10:00:00.000 INFO api summary".to_string());
+
+        assert_eq!(buffer.events().len(), 2);
+        assert_eq!(buffer.events()[0].source, "worker");
+        assert!(buffer.events()[0].property("owner").is_none());
+        assert_eq!(buffer.events()[1].source, "api");
+        assert_eq!(
+            buffer.events()[1]
+                .property("owner")
+                .unwrap()
+                .value
+                .to_string(),
+            "api"
+        );
+    }
+
+    #[test]
+    fn sourced_after_summary_block_does_not_search_past_newer_same_source_mismatch() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO stale target".to_string());
+        buffer.push_line("[api] 10:00:01.000 INFO newer event".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] { owner: \"api\" }".to_string());
+
+        assert_eq!(buffer.events().len(), 3);
+        assert!(buffer.events()[0].property("owner").is_none());
+        assert!(buffer.events()[1].property("owner").is_none());
+        assert_eq!(buffer.events()[2].raw, "[api] [10:00:00.000] INFO (#1):");
+        assert_eq!(
+            buffer.events()[2]
+                .property("owner")
+                .unwrap()
+                .value
+                .to_string(),
+            "api"
+        );
+    }
+
+    #[test]
+    fn sourced_before_summary_block_expires_on_first_same_source_mismatch() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] { owner: api }".to_string());
+        buffer.push_line("[worker] 10:00:00.000 INFO ignored other source".to_string());
+        buffer.push_line("[api] 10:00:01.000 INFO deciding mismatch".to_string());
+        buffer.push_line("[api] 10:00:00.000 INFO too late".to_string());
+
+        assert_eq!(buffer.events().len(), 4);
+        assert_eq!(buffer.events()[0].raw, "[api] [10:00:00.000] INFO (#1):");
+        assert!(buffer.events()[0].property("owner").is_some());
+        assert!(buffer.events()[3].property("owner").is_none());
+    }
+
+    #[test]
+    fn sourced_property_matching_is_ascii_case_insensitive() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[API] 10:00:00.000 INFO summary".to_string());
+        buffer.push_line("api | [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("Api | { requestId: \"one\" }".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        assert_eq!(buffer.events()[0].source, "API");
+        assert_eq!(
+            buffer.events()[0]
+                .property("requestId")
+                .unwrap()
+                .value
+                .to_string(),
+            "one"
+        );
+    }
+
+    #[test]
+    fn sourced_property_matching_uses_promoted_canonical_event_source() {
+        let mut after = LogBuffer::new(10);
+        after.push_line("10:00:00.000 INFO summary service=api".to_string());
+        after.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        after.push_line("[api] { requestId: \"after\" }".to_string());
+
+        assert_eq!(after.events().len(), 1);
+        assert_eq!(after.events()[0].source, "api");
+        assert_eq!(
+            after.events()[0]
+                .property("requestId")
+                .unwrap()
+                .value
+                .to_string(),
+            "after"
+        );
+
+        let mut before = LogBuffer::new(10);
+        before.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        before.push_line("[api] { requestId: \"before\" }".to_string());
+        before.push_line("10:00:00.000 INFO summary service=api".to_string());
+
+        assert_eq!(before.events().len(), 1);
+        assert_eq!(before.events()[0].source, "api");
+        assert_eq!(
+            before.events()[0]
+                .property("requestId")
+                .unwrap()
+                .value
+                .to_string(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn source_less_blocks_preserve_immediate_back_and_skip_mismatch_legacy_rules() {
+        let mut after = LogBuffer::new(10);
+        after.push_line("[api] 10:00:00.000 INFO api summary".to_string());
+        after.push_line("[worker] 10:00:00.000 INFO worker summary".to_string());
+        after.push_line("[10:00:00.000] INFO (#1):".to_string());
+        after.push_line("{ legacy: \"after\" }".to_string());
+
+        assert!(after.events()[0].property("legacy").is_none());
+        assert_eq!(
+            after.events()[1]
+                .property("legacy")
+                .unwrap()
+                .value
+                .to_string(),
+            "after"
+        );
+
+        let mut before = LogBuffer::new(10);
+        before.push_line("[10:00:00.000] INFO (#1):".to_string());
+        before.push_line("{ legacy: \"before\" }".to_string());
+        before.push_line("[api] 10:00:01.000 WARN mismatch".to_string());
+        before.push_line("[worker] 10:00:00.000 INFO eventual target".to_string());
+
+        assert_eq!(before.events().len(), 2);
+        assert_eq!(before.events()[1].source, "worker");
+        assert_eq!(
+            before.events()[1]
+                .property("legacy")
+                .unwrap()
+                .value
+                .to_string(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn malformed_fold_retries_timestamped_summary_once_and_continues() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO original".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] partial: true,".to_string());
+        let change = buffer.push_line("[api] 10:00:01.000 ERROR recovered".to_string());
+        buffer.push_line("[api] INFO later".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.raw_target, None);
+        assert_eq!(buffer.events().len(), 3);
+        assert_eq!(buffer.events()[1].message, "recovered");
+        assert_eq!(buffer.events()[2].message, "later");
+        assert!(buffer.events()[0].property("partial").is_none());
+        assert_eq!(
+            buffer
+                .events()
+                .iter()
+                .filter(|event| event.raw.contains("recovered"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn bracketed_timestamp_record_is_a_pending_boundary() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("10:00:00.000 INFO original".to_string());
+        buffer.push_line("[10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("{".to_string());
+        buffer.push_line("partial: true,".to_string());
+        let change = buffer.push_line("[10:00:01.000] ERROR recovered".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.raw_target, None);
+        assert_eq!(buffer.events().len(), 2);
+        assert_eq!(buffer.events()[1].raw, "[10:00:01.000] ERROR recovered");
+        assert_eq!(buffer.events()[1].level, crate::model::Level::Error);
+        assert!(buffer.events()[0].property("partial").is_none());
+    }
+
+    #[test]
+    fn pending_fold_retries_conflicting_source_and_another_header() {
+        let mut conflict = LogBuffer::new(10);
+        conflict.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        let change = conflict.push_line("[worker] {".to_string());
+        conflict.push_line("[worker] INFO continued".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.raw_target, None);
+        assert_eq!(conflict.events()[1].source, "worker");
+        assert_eq!(conflict.events()[1].message, "{");
+        assert_eq!(conflict.events()[2].message, "continued");
+
+        let mut status = LogBuffer::new(10);
+        status.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        status.push_line("[api] {".to_string());
+        let change = status.push_line("worker Started container".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.raw_target, None);
+        assert_eq!(status.events()[1].source, "worker");
+        assert_eq!(status.events()[1].message, "Started container");
+
+        let mut buildkit = LogBuffer::new(10);
+        buildkit.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buildkit.push_line("[api] {".to_string());
+        let change = buildkit.push_line("#35 [worker internal] load metadata for node".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.raw_target, None);
+        assert_eq!(buildkit.events()[1].source, "worker");
+        assert_eq!(
+            buildkit.events()[1].message,
+            "#35 [internal] load metadata for node"
+        );
+
+        let mut buildkit_continuation = LogBuffer::new(10);
+        buildkit_continuation.push_line("#35 [worker internal] load metadata for node".to_string());
+        buildkit_continuation.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buildkit_continuation.push_line("[api] {".to_string());
+        let change = buildkit_continuation.push_line("#35 DONE 1.4s".to_string());
+
+        assert_eq!(change.appended, Some(2));
+        assert_eq!(change.raw_target, None);
+        assert_eq!(buildkit_continuation.events()[2].source, "worker");
+
+        let mut headers = LogBuffer::new(10);
+        headers.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        let change = headers.push_line("[worker] [10:00:01.000] WARN (#2):".to_string());
+        headers.push_line("[worker] { owner: \"worker\" }".to_string());
+        headers.push_line("[worker] 10:00:01.000 WARN summary".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(headers.events().len(), 2);
+        assert_eq!(headers.events()[0].source, "api");
+        assert_eq!(headers.events()[1].source, "worker");
+        assert_eq!(
+            headers.events()[1]
+                .property("owner")
+                .unwrap()
+                .value
+                .to_string(),
+            "worker"
+        );
+    }
+
+    #[test]
+    fn pending_body_accepts_tolerant_entries_and_scalar_array_elements() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO summary".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] values: [".to_string());
+        buffer.push_line("[api] \"first\",".to_string());
+        buffer.push_line("[api] 7,".to_string());
+        buffer.push_line("[api] true,".to_string());
+        buffer.push_line("[api] null,".to_string());
+        buffer.push_line("[api] ],".to_string());
+        buffer.push_line("[api] [ ],".to_string());
+        buffer.push_line("[api] reason: failed hard,".to_string());
+        buffer.push_line("[api] error: \"failed\",".to_string());
+        buffer.push_line("[api] info: true,".to_string());
+        buffer.push_line("[api] }".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        let event = &buffer.events()[0];
+        assert_eq!(
+            event.property("reason").unwrap().value.to_string(),
+            "failed hard"
+        );
+        assert_eq!(event.property("error").unwrap().value.to_string(), "failed");
+        assert_eq!(event.property("info").unwrap().value.to_string(), "true");
+    }
+
+    #[test]
+    fn prefixed_one_line_object_completes_but_prefixed_recovery_text_does_not_close() {
+        let mut complete = LogBuffer::new(10);
+        complete.push_line("[api] 10:00:00.000 INFO summary".to_string());
+        complete.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        complete.push_line("[api] { requestId: \"one\" }".to_string());
+
+        assert_eq!(complete.events().len(), 1);
+        assert_eq!(
+            complete.events()[0]
+                .property("requestId")
+                .unwrap()
+                .value
+                .to_string(),
+            "one"
+        );
+
+        let mut recovered = LogBuffer::new(10);
+        recovered.push_line("[api] 10:00:00.000 INFO summary".to_string());
+        recovered.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        recovered.push_line("[api] {".to_string());
+        recovered.push_line("[api] partial: true,".to_string());
+        let change = recovered.push_line("[api] } recovered".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(recovered.events().len(), 2);
+        assert_eq!(recovered.events()[1].message, "} recovered");
+        assert!(recovered.events()[0].property("partial").is_none());
+    }
+
+    #[test]
+    fn level_only_boundary_recovers_but_level_named_properties_remain_body_lines() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO summary".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] error: \"failed\",".to_string());
+        buffer.push_line("[api] info: true,".to_string());
+        let change = buffer.push_line("[api] ERROR recovered".to_string());
+
+        assert_eq!(change.appended, Some(1));
+        assert_eq!(buffer.events().len(), 2);
+        assert!(buffer.events()[0].property("error").is_none());
+        assert!(buffer.events()[0].property("info").is_none());
+        assert_eq!(buffer.events()[1].message, "recovered");
+    }
+
+    #[test]
+    fn pending_line_limit_accepts_exact_cap_and_retries_next_line() {
+        let mut exact = LogBuffer::new(10);
+        exact.push_line("10:00:00.000 INFO summary".to_string());
+        exact.push_line("[10:00:00.000] INFO (#1):".to_string());
+        exact.push_line("{".to_string());
+        for _ in 0..(MAX_PENDING_PROPERTY_LINES - 2) {
+            exact.push_line(String::new());
+        }
+        let change = exact.push_line("}".to_string());
+
+        assert_eq!(change.raw_target, Some(0));
+        assert!(exact.pending_properties.is_none());
+        assert_eq!(exact.events().len(), 1);
+
+        let mut overflow = LogBuffer::new(10);
+        overflow.push_line("10:00:00.000 INFO summary".to_string());
+        overflow.push_line("[10:00:00.000] INFO (#1):".to_string());
+        overflow.push_line("{".to_string());
+        for _ in 0..(MAX_PENDING_PROPERTY_LINES - 1) {
+            overflow.push_line(String::new());
+        }
+        let pending = overflow.pending_properties.as_ref().unwrap();
+        assert_eq!(pending.lines.len(), MAX_PENDING_PROPERTY_LINES);
+        assert!(pending.bytes <= MAX_PENDING_PROPERTY_BYTES);
+        let change = overflow.push_line("}".to_string());
+
+        assert_eq!(change.raw_target, None);
+        assert_eq!(change.appended, Some(1));
+        assert!(overflow.pending_properties.is_none());
+        assert_eq!(overflow.events()[1].raw, "}");
+    }
+
+    #[test]
+    fn pending_byte_limit_counts_newlines_blanks_and_utf8_exactly() {
+        let mut measured = LogBuffer::new(10);
+        measured.push_line("[10:00:00.000] INFO (#1):".to_string());
+        measured.push_line("{".to_string());
+        measured.push_line(String::new());
+        measured.push_line("label: \"é\",".to_string());
+        let pending = measured.pending_properties.as_ref().unwrap();
+        assert_eq!(pending.lines, ["{", "", "label: \"é\","]);
+        assert_eq!(
+            pending.bytes,
+            pending
+                .lines
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>()
+        );
+        assert_eq!(pending.bytes, 16);
+
+        let mut exact = LogBuffer::new(10);
+        exact.push_line("10:00:00.000 INFO summary".to_string());
+        exact.push_line("[10:00:00.000] INFO (#1):".to_string());
+        exact.push_line("{".to_string());
+        let entry = format!("key: é{}", "x".repeat(MAX_PENDING_PROPERTY_BYTES - 12));
+        assert_eq!(entry.len(), MAX_PENDING_PROPERTY_BYTES - 5);
+        exact.push_line(entry);
+        let change = exact.push_line("}".to_string());
+
+        assert_eq!(change.raw_target, Some(0));
+        assert!(exact.pending_properties.is_none());
+        assert_eq!(exact.events().len(), 1);
+
+        let mut overflow = LogBuffer::new(10);
+        overflow.push_line("10:00:00.000 INFO summary".to_string());
+        overflow.push_line("[10:00:00.000] INFO (#1):".to_string());
+        overflow.push_line("{".to_string());
+        let oversized = format!("key: {}", "x".repeat(MAX_PENDING_PROPERTY_BYTES - 7));
+        assert_eq!(oversized.len() + 3, MAX_PENDING_PROPERTY_BYTES + 1);
+        let change = overflow.push_line(oversized.clone());
+
+        assert_eq!(change.raw_target, None);
+        assert_eq!(change.appended, Some(1));
+        assert!(overflow.pending_properties.is_none());
+        assert_eq!(overflow.events()[1].raw, oversized);
+        assert!(overflow.events()[0].properties.is_empty());
+    }
+
+    #[test]
+    fn eof_drops_incomplete_fold_without_applying_partial_properties() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO summary stable=true".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] partial: true,".to_string());
+        assert!(buffer.pending_properties.is_some());
+
+        buffer.finish_input();
+
+        assert!(buffer.pending_properties.is_none());
+        assert!(buffer.events()[0].property("stable").is_some());
+        assert!(buffer.events()[0].property("partial").is_none());
+    }
+
+    #[test]
+    fn closed_object_keeps_tolerant_property_parser_semantics() {
+        let mut buffer = LogBuffer::new(10);
+
+        buffer.push_line("[api] 10:00:00.000 INFO summary".to_string());
+        buffer.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] valid: yes,".to_string());
+        buffer.push_line("this line is ignored".to_string());
+        buffer.push_line("[api] another: 2,".to_string());
+        buffer.push_line("[api] }".to_string());
+
+        assert_eq!(buffer.events().len(), 1);
+        assert_eq!(
+            buffer.events()[0]
+                .property("valid")
+                .unwrap()
+                .value
+                .to_string(),
+            "yes"
+        );
+        assert_eq!(
+            buffer.events()[0]
+                .property("another")
+                .unwrap()
+                .value
+                .to_string(),
+            "2"
         );
     }
 }
