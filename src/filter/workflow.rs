@@ -127,6 +127,67 @@ impl FilterWorkflow {
         self.remember_change(previous_filters);
     }
 
+    pub fn replace_source_from_facet(&mut self, source: &str) -> bool {
+        if self
+            .filters
+            .source
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(source))
+        {
+            return false;
+        }
+
+        let previous_filters = self.filters.clone();
+        self.filters.source = Some(source.to_string());
+        self.remember_change(previous_filters);
+        true
+    }
+
+    pub fn replace_level_from_facet(&mut self, level: Level) -> bool {
+        if self.filters.level == Some(level) {
+            return false;
+        }
+
+        let previous_filters = self.filters.clone();
+        self.filters.level = Some(level);
+        self.remember_change(previous_filters);
+        true
+    }
+
+    pub fn replace_property_value_from_facet(&mut self, key: &str, value: &str) -> bool {
+        let matching_includes = self
+            .filters
+            .property_includes
+            .iter()
+            .filter(|predicate| predicate.key == key)
+            .collect::<Vec<_>>();
+        let has_matching_exclude = self
+            .filters
+            .property_excludes
+            .iter()
+            .any(|predicate| predicate.key == key);
+        if !has_matching_exclude
+            && matching_includes.len() == 1
+            && matching_includes[0].value.as_deref() == Some(value)
+        {
+            return false;
+        }
+
+        let previous_filters = self.filters.clone();
+        self.filters
+            .property_includes
+            .retain(|predicate| predicate.key != key);
+        self.filters
+            .property_excludes
+            .retain(|predicate| predicate.key != key);
+        self.filters.add_property_filter(PropertyFilterUpdate {
+            exclude: false,
+            predicate: PropertyPredicate::exact(key, value),
+        });
+        self.remember_change(previous_filters);
+        true
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(filters) = self.history.pop() else {
             return false;
@@ -341,6 +402,60 @@ mod tests {
         assert_eq!(
             workflow.filters().property_includes[0].summary(),
             "tenantId=tenant-1"
+        );
+    }
+
+    #[test]
+    fn facet_source_and_level_replacements_are_undoable_and_semantic_no_ops() {
+        let mut workflow = FilterWorkflow::default();
+        assert!(workflow.replace_source_from_facet("API"));
+        assert_eq!(workflow.history_len(), 1);
+        assert!(!workflow.replace_source_from_facet("api"));
+        assert_eq!(workflow.history_len(), 1);
+
+        assert!(workflow.replace_level_from_facet(Level::Error));
+        assert_eq!(workflow.history_len(), 2);
+        assert!(!workflow.replace_level_from_facet(Level::Error));
+        assert_eq!(workflow.history_len(), 2);
+
+        assert!(workflow.undo());
+        assert_eq!(workflow.filters().level, None);
+        assert_eq!(workflow.filters().source.as_deref(), Some("API"));
+    }
+
+    #[test]
+    fn facet_property_replacement_ignores_vector_order_for_semantic_no_op() {
+        let mut workflow = FilterWorkflow::default();
+        workflow.filters.property_includes = vec![
+            PropertyPredicate::exact("region", "eu"),
+            PropertyPredicate::exact("tenant", "one"),
+            PropertyPredicate::exact("mode", "prod"),
+        ];
+
+        assert!(!workflow.replace_property_value_from_facet("tenant", "one"));
+        assert_eq!(workflow.history_len(), 0);
+
+        workflow
+            .filters
+            .property_excludes
+            .push(PropertyPredicate::exact("tenant", "two"));
+        assert!(workflow.replace_property_value_from_facet("tenant", "one"));
+        assert_eq!(workflow.history_len(), 1);
+        assert_eq!(
+            workflow
+                .filters()
+                .property_includes
+                .iter()
+                .filter(|predicate| predicate.key == "tenant")
+                .collect::<Vec<_>>(),
+            vec![&PropertyPredicate::exact("tenant", "one")]
+        );
+        assert!(
+            workflow
+                .filters()
+                .property_excludes
+                .iter()
+                .all(|predicate| predicate.key != "tenant")
         );
     }
 

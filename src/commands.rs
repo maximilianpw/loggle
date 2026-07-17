@@ -22,6 +22,7 @@ pub enum CommandAction {
     FilterPresets,
     ExportVisibleLogs,
     ToggleMarker,
+    Facets,
     Sources,
     NextMatch,
     PreviousMatch,
@@ -173,6 +174,12 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::ToggleMarker,
     },
     Command {
+        shortcut: "F",
+        label: "Filter facets",
+        description: "Discover and apply source, level, and property filters",
+        action: CommandAction::Facets,
+    },
+    Command {
         shortcut: "O",
         label: "Sources",
         description: "Show observed source counts and recent status",
@@ -266,6 +273,7 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<CommandAction> {
         (KeyCode::Char('V'), _) => Some(CommandAction::FilterPresets),
         (KeyCode::Char('e'), _) => Some(CommandAction::ExportVisibleLogs),
         (KeyCode::Char('T'), _) => Some(CommandAction::ToggleMarker),
+        (KeyCode::Char('F'), _) => Some(CommandAction::Facets),
         (KeyCode::Char('O'), _) => Some(CommandAction::Sources),
         (KeyCode::Char(' ' | 'p'), _) => Some(CommandAction::ToggleFollow),
         (KeyCode::Char('n'), _) => Some(CommandAction::NextMatch),
@@ -330,6 +338,14 @@ mod tests {
         assert_eq!(
             normal_action_for_key(key(KeyCode::Char('P'))),
             Some(CommandAction::PropertyFilters)
+        );
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('F'))),
+            Some(CommandAction::Facets)
+        );
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('f'))),
+            Some(CommandAction::FollowProperty)
         );
         assert_eq!(
             normal_action_for_key(key(KeyCode::Char(' '))),

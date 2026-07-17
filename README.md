@@ -112,10 +112,13 @@ Then run it from any Compose project:
 loggle dc
 loggle -- docker compose up
 loggle pages
+loggle pages --format jsonl
 loggle log -i 1 -n 5
 loggle log -i 1 -n 5 --service api
 loggle log -i 1 -n 5 --text database
 loggle log -i 1 -n 5 --property requestId=716d1e62
+loggle log -i 1 -n 5 --level error --format jsonl
+loggle facets -i 1 --property-key tenantId --format jsonl
 loggle --id api -- docker compose up
 loggle start
 loggle start libre
@@ -150,6 +153,7 @@ running. You can also list active pages from another terminal:
 
 ```sh
 loggle pages
+loggle pages --format jsonl
 ```
 
 Example output:
@@ -158,6 +162,10 @@ Example output:
 ID	PID	AGE	COMMAND
 1	48291	3m	docker compose up
 ```
+
+The default table is intended for humans. `--format jsonl` writes one public
+page-metadata object per line in stable ID order, which avoids parsing the age
+column. With no active pages, JSONL output is empty and the command exits 0.
 
 Another terminal or AI agent can then fetch recent raw lines from that page:
 
@@ -171,15 +179,21 @@ Use `--id` when you want to choose a stable human-readable ID yourself:
 loggle --id api -- docker compose up
 ```
 
-Filter the tail to a service/source, text query, or parsed property:
+Filter the tail to a service/source, text query, level, or parsed property:
 
 ```sh
 loggle log -i 1 -n 5 --service api
 loggle log -i 1 -n 5 --text "database unavailable"
+loggle log -i 1 -n 5 --level error
 loggle log -i 1 -n 5 --source worker --property tenantId=tenant-1
-loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1
+loggle log -i 1 -n 5 --service api --text error --level warn --property tenantId=tenant-1
 loggle log -i 1 -n 5 --property requestId
 ```
+
+`--level` accepts the canonical values `fatal`, `error`, `warn`, `info`,
+`debug`, `trace`, and `unknown`. The parser also accepts `err`, `warning`,
+`log`, and `verbose` as aliases for `error`, `warn`, `info`, and `trace`.
+Structured output always uses the canonical lowercase value.
 
 Text filters match the same event fields as TUI search: raw line, parsed
 message, source, and property keys/values. Property filters use the same syntax
@@ -188,13 +202,124 @@ filtered tail returns whole matching records — the header line plus any folded
 multi-line property block — and `-n` counts matching records rather than
 individual lines.
 
+Property-block folding is fixed at 256 cleaned body lines or 256 KiB of cleaned
+body text, whichever comes first. Explicitly sourced blocks are associated only
+with the matching source; legacy source-less blocks retain their timestamp/level
+fallback. A clear later record boundary fails open and is parsed normally, while
+an incomplete or oversized block contributes no partial properties. These caps
+apply after a raw input line reaches the parser: they do not bound the size of an
+individual input line, page storage, or persistent history.
+
+Use JSONL when the result will be consumed programmatically:
+
+```sh
+loggle log -i 1 -n 5 --level error --format jsonl
+```
+
+Each physical output line is one versioned logical record:
+
+```json
+{"schema_version":1,"source":"api","timestamp":"14:06:58.892","level":"error","message":"request failed","properties":{"retryable":true,"statusCode":500},"raw":"api | ERROR request failed\n{ retryable: true, statusCode: 500 }"}
+```
+
+The fields are `schema_version` (currently numeric `1`), `source`, nullable
+`timestamp`, canonical `level`, parsed `message`, typed `properties`, and the
+complete logical `raw` record. There is no sequence or cursor field. Property
+strings, booleans, nulls, and ordinary JSON numbers retain their types. A
+numeric lexeme that cannot round-trip exactly through `serde_json::Number`
+(for example `01`, `1.`, or an out-of-range integer) is emitted as a string
+instead of being changed to a different number.
+
+`--format raw` is the default. With no filters, raw `-n` retains the historical
+physical-line count and output shape. Filtered raw queries and all JSONL queries
+count the last `N` matching logical records and keep them in original order.
+Because JSON escapes embedded newlines, a multi-line raw record still occupies
+one physical JSONL line. A query with no matches writes zero bytes and exits 0;
+invalid input, inactive/missing pages, and output failures exit nonzero with
+diagnostics on stderr only.
+
+Discover useful filters without sampling and counting records yourself:
+
+```sh
+# Human-readable source, level, and property-key counts
+loggle facets -i 1
+
+# Versioned machine-readable groups, including values for one exact key
+loggle facets -i 1 --property-key tenantId --format jsonl
+
+# Facets compose with the same query flags as `loggle log`
+loggle facets -i 1 --source api --level error --property region=eu --records 5000 --limit 10
+```
+
+Facets first fix the newest logical-record window, then apply filters and count
+records. `--records` defaults to `10000`, must be between `1` and `100000`, and
+does not backfill older matches when newer records fail a filter. `--limit`
+defaults to `20`, must be between `1` and `100`, and caps each group's returned
+buckets after deterministic sorting. Neither limit can be disabled.
+
+Every request emits `source`, `level`, and `property_key` groups in that order.
+Adding `--property-key KEY` emits a fourth `property_value` group. CLI input
+trims surrounding whitespace from `KEY`; the resulting key remains exact and
+case-sensitive. Source identity is ASCII lowercase, levels are canonical
+lowercase, and property keys retain their exact case. Source and property
+buckets sort by count descending then value ascending; levels use `fatal`,
+`error`, `warn`, `info`, `debug`, `trace`, `unknown` order.
+
+Facet counts use disjunctive, self-excluding cohorts so alternatives remain
+visible:
+
+- the source group ignores only the active source filter;
+- the level group ignores only the active level filter;
+- the property-key group uses the complete filter;
+- the requested property-value group ignores include/exclude predicates for
+  that exact key while retaining every other predicate.
+
+This is not OR filtering. All retained predicates still compose with AND
+semantics. A property key counts at most once per record, and value counts use
+the first duplicate key, matching exact property filters.
+
+In JSONL, one physical line is one versioned group object:
+
+```json
+{"schema_version":1,"facet":"property_value","property_key":"tenantId","available_records":14237,"window_records":10000,"window_truncated":true,"matched_records":431,"eligible_records":902,"total_buckets":27,"truncated":true,"buckets":[{"value":"tenant-1","count":318,"value_types":["string"]}]}
+```
+
+`available_records` is the retained page's parsed logical-record count;
+`window_records` is the selected newest window; and `window_truncated` reports
+records outside it. `matched_records` uses the complete filter and is identical
+across groups. `eligible_records` is the group-specific self-excluded cohort.
+`total_buckets` is the count before `--limit`, while `truncated` reports bucket
+clipping only. `property_key` is null except on the property-value group.
+
+Property values group by their displayed filter text. `value_types` reports all
+colliding internal types in stable `string`, `number`, `boolean`, `null`,
+`text` order, so (for example) the string `"1"` and number `1` remain visible
+as one textual bucket with both types. JSONL preserves raw key/value text.
+Human table and TUI output escape backslashes and control characters onto one
+line.
+
+In the TUI, use uppercase F to open the searchable facet workflow. It snapshots
+once on open, refreshes when entering a property-value drilldown, and applies
+choices through undoable filters. Uppercase `O` remains the richer live Sources
+status view; it is not replaced by facets.
+
+An active page with no data still succeeds and emits three empty groups (four
+when a property key is requested), preserving window and cohort metadata. A
+missing or inactive page fails nonzero with diagnostics on stderr and empty
+stdout. Facets scan the active retained window; they are not persistent indexes
+and do not expose past sessions. Stable cursors, bounded waits/follow, context
+lines, and field projection remain outside this contract.
+
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the
 TUI. Each log retains roughly the same window as the in-memory buffer
-(`--buffer-lines`), and a page's log is removed once its session ends and is
-reaped. The page log is best-effort: if it cannot be written, the viewer keeps
-running and shows a notice instead of exiting. Pass `--no-page-log` to opt out
-of writing logs to disk entirely.
+(`--buffer-lines`). `loggle log` reads active sessions only and inherits the
+session's configured source fields. A `loggle log --source-field` value is an
+explicit override and is checked before inherited fields. When the session exits
+cleanly, or if its page recorder fails, Loggle unregisters the page and removes
+its data. The page log is best-effort: if it cannot be written, the viewer keeps
+running and shows a notice instead of exiting. Pass `--no-page-log` to opt out of
+writing logs to disk entirely.
 
 ### Start Configs
 
@@ -280,8 +405,11 @@ loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
 loggle --record session.log -- docker compose up
 loggle pages
+loggle pages --format jsonl
 loggle log -i 1 -n 5
 loggle log -i 1 -n 5 --service api --property tenantId=tenant-1
+loggle log -i 1 -n 5 --level error --format jsonl
+loggle facets -i 1 --property-key tenantId --format jsonl
 loggle --id api -- docker compose up
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
@@ -294,15 +422,32 @@ loggle start libre
 - `--record <PATH>`: writes every raw incoming line to a session log file
 - `--id <ID>` / `-i <ID>`: uses this page ID instead of an auto-generated ID
 - `--no-page-log`: disables the per-session page log used by `loggle log`/`pages`
-- `pages`: lists active Loggle pages with ID, PID, age, and command
+- `pages [--format table|jsonl]`: lists active Loggle pages with ID, PID, age,
+  and command; the default is the human-readable table
 - `--source-field <FIELD>`: promotes matching parsed properties to the source
   column when no explicit prefix exists. Repeat it or pass comma-separated
   fields, e.g. `--source-field service,app`
-- `log -i <ID> -n <N>`: prints the last `N` raw lines from a tagged Loggle page
+- `log -i <ID> -n <N>`: prints the last `N` raw physical lines from a tagged
+  Loggle page when no filter is active
+- `log --format <raw|jsonl>`: selects compatible raw output (the default) or
+  one versioned logical record per JSONL line
 - `log --source <SOURCE>` / `log --service <SERVICE>`: limits page output to a
   parsed source/service
+- `log --level <LEVEL>`: limits output to one parsed level; accepts `fatal`,
+  `error`/`err`, `warn`/`warning`, `info`/`log`, `debug`, `trace`/`verbose`, or
+  `unknown`
 - `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
   properties. Repeat for multiple required predicates
+- `facets -i <ID> [--records <N>] [--limit <N>]`: scans the newest bounded
+  logical-record window and reports source, level, and property-key counts;
+  defaults are 10000 records and 20 buckets per group, with maxima of 100000
+  and 100
+- `facets --property-key <KEY>`: also reports values for one normalized,
+  exact/case-sensitive property key
+- `facets --format <table|jsonl>`: selects the human table (the default) or one
+  versioned group per JSONL line
+- `facets --source/--text/--level/--property/--source-field`: uses the same
+  parsers and filter semantics as `log`
 - `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
@@ -356,6 +501,8 @@ Press `?` to open the in-app command palette:
 - `V`: open searchable saved filter presets
 - `e`: export the current visible rows to `loggle-export.log`
 - `T`: mark or unmark the selected row
+- `F`: open searchable filter facets; select a source/level to apply it or a
+  property key to drill into exact values
 - `O`: open observed source status counts
 
 ### Details and Properties
@@ -369,6 +516,10 @@ Press `?` to open the in-app command palette:
 
 - `M`: open searchable pinned field manager
 - `P`: open searchable property filter manager
+- Facet dialog: type to search the stored snapshot; `Enter` applies a
+  source/level or opens a refreshed property-value drilldown; `Backspace` or
+  `Delete` with empty search returns from values to the refreshed root; `Esc`
+  closes. Facet choices are undoable with `u`
 - `?`: open/close the command palette
 - Message field manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Backspace` or `Delete` removes when search is empty; `Esc` closes
 - Property filter manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` edits; `Backspace` or `Delete` removes when search is empty; `Esc` closes
@@ -445,6 +596,20 @@ previous event instead of shown as separate rows:
     durationMs: 96,
   }
 ```
+
+An explicit source on the property header makes this association source-aware,
+using the same case-insensitive source identity as filters. Source-less headers
+keep the legacy immediate-previous or later timestamp/level fallback. A pending
+property block retains at most 256 cleaned lines and 256 KiB, counting one
+logical newline per retained line. Recognizable record boundaries fail open and
+are ingested as ordinary log records, so malformed blocks cannot hide the later
+stream. Incomplete, oversized, and EOF-truncated blocks never apply partial
+properties; complete blocks keep the tolerant property syntax above.
+
+The fold limits bound only parser-owned multiline state. Loggle still receives
+and allocates a raw input line before this check, so a single input line is not
+size-limited by the 256-KiB property-block cap. Page retention and on-disk
+history have their own behavior and are not made fully bounded by this rule.
 
 Inline `key=value` and logfmt-style tokens in the displayed message are also
 parsed as properties. Quoted values such as `service="api server"` are supported

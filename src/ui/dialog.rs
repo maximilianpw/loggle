@@ -24,7 +24,7 @@ pub(super) fn draw_dialog(
     items: &[SelectableListItem<'_>],
     selected: usize,
 ) {
-    draw_selectable_dialog(frame, area, title, None, items, selected);
+    draw_selectable_dialog(frame, area, title, None, None, items, selected);
 }
 
 pub(super) fn draw_searchable_dialog(
@@ -32,10 +32,11 @@ pub(super) fn draw_searchable_dialog(
     area: Rect,
     title: &str,
     query: &str,
+    summary: Option<&str>,
     items: &[SelectableListItem<'_>],
     selected: usize,
 ) {
-    draw_selectable_dialog(frame, area, title, Some(query), items, selected);
+    draw_selectable_dialog(frame, area, title, Some(query), summary, items, selected);
 }
 
 pub(super) fn command_items(commands: &[Command]) -> Vec<SelectableListItem<'_>> {
@@ -54,6 +55,7 @@ fn draw_selectable_dialog(
     area: Rect,
     title: &str,
     query: Option<&str>,
+    summary: Option<&str>,
     items: &[SelectableListItem<'_>],
     selected: usize,
 ) {
@@ -83,23 +85,28 @@ fn draw_selectable_dialog(
         return;
     }
 
-    let list_area = if let Some(query) = query {
+    let mut list_area = content;
+    if let Some(summary) = summary {
+        let width = list_area.width as usize;
+        let summary_line = Line::from(Span::styled(
+            truncate_tail(summary, width).into_owned(),
+            muted,
+        ));
+        frame.render_widget(Paragraph::new(summary_line).style(base), list_area);
+        list_area.y = list_area.y.saturating_add(1);
+        list_area.height = list_area.height.saturating_sub(1);
+    }
+
+    if let Some(query) = query {
         let query_width = content.width.saturating_sub(9) as usize;
         let query_line = Line::from(vec![
             Span::styled(" search ", muted),
             Span::styled(truncate_tail(query, query_width).into_owned(), base),
         ]);
-        frame.render_widget(Paragraph::new(query_line).style(base), content);
-
-        Rect {
-            x: content.x,
-            y: content.y.saturating_add(1),
-            width: content.width,
-            height: content.height.saturating_sub(1),
-        }
-    } else {
-        content
-    };
+        frame.render_widget(Paragraph::new(query_line).style(base), list_area);
+        list_area.y = list_area.y.saturating_add(1);
+        list_area.height = list_area.height.saturating_sub(1);
+    }
 
     if list_area.height == 0 {
         return;
@@ -198,6 +205,7 @@ fn render_selectable_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn visible_window_tracks_selected_row() {
@@ -227,5 +235,45 @@ mod tests {
         assert!(text.contains("~"));
         assert!(!text.contains("Extremely long command label"));
         assert!(!text.contains("A description that will not fit"));
+    }
+
+    #[test]
+    fn searchable_dialog_renders_optional_summary_above_query_and_rows() {
+        let mut terminal = Terminal::new(TestBackend::new(82, 20)).unwrap();
+        let items = [SelectableListItem {
+            shortcut: Some("source"),
+            label: "api",
+            description: "2 records",
+        }];
+        let summary = "win=100000/100001 clipped src=100/100000 lvl=7/7 key=100/100000";
+
+        terminal
+            .draw(|frame| {
+                draw_searchable_dialog(
+                    frame,
+                    frame.area(),
+                    "Filter facets",
+                    "ap",
+                    Some(summary),
+                    &items,
+                    0,
+                );
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(summary));
+        assert!(rendered.contains("src=100/100000"));
+        assert!(rendered.contains("lvl=7/7"));
+        assert!(rendered.contains("key=100/100000"));
+        assert!(rendered.contains("search ap"));
+        assert!(rendered.contains("source"));
+        assert!(rendered.contains("api"));
     }
 }
