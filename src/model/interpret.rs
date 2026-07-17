@@ -1,8 +1,23 @@
 use super::{
-    LogEvent, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig,
-    message_without_source_prefix, parse_compose_line, parse_property_block_header,
-    parse_property_object,
+    LogEvent, LogProperty, ParsedLine, PropertyBlockHeader, SourceConfig, is_property_body_line,
+    looks_like_timestamp, parse_compose_line, parse_level_token, parse_property_block_header,
+    parse_property_object, parse_structured_message, split_first_token,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuredLineKind {
+    None,
+    LevelOnly,
+    Timestamped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPropertyLine {
+    pub(crate) source: Option<String>,
+    pub(crate) message: String,
+    pub(crate) is_property_body: bool,
+    pub(crate) structured: StructuredLineKind,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LogInterpreter;
@@ -20,8 +35,22 @@ impl LogInterpreter {
         parse_property_object(input)
     }
 
-    pub(crate) fn message_without_source_prefix(self, line: &str) -> String {
-        message_without_source_prefix(line)
+    pub(crate) fn pending_property_line(self, line: &str) -> PendingPropertyLine {
+        let parsed = parse_compose_line(line);
+        let structured = match parse_structured_message(&parsed.message) {
+            Some(message) if message.timestamp.is_some() => StructuredLineKind::Timestamped,
+            Some(_) => StructuredLineKind::LevelOnly,
+            None if is_bracketed_timestamp_structured(&parsed.message) => {
+                StructuredLineKind::Timestamped
+            }
+            None => StructuredLineKind::None,
+        };
+        PendingPropertyLine {
+            is_property_body: is_property_body_line(&parsed.message),
+            source: parsed.source_explicit.then_some(parsed.source),
+            message: parsed.message,
+            structured,
+        }
     }
 
     pub(crate) fn event_from_source_line(
@@ -66,6 +95,21 @@ impl LogInterpreter {
             }
         }
     }
+}
+
+fn is_bracketed_timestamp_structured(message: &str) -> bool {
+    let Some(after_open) = message.trim().strip_prefix('[') else {
+        return false;
+    };
+    let Some((timestamp, after_timestamp)) = after_open.split_once(']') else {
+        return false;
+    };
+    if !looks_like_timestamp(timestamp) {
+        return false;
+    }
+
+    split_first_token(after_timestamp.trim_start())
+        .is_some_and(|(level, _)| parse_level_token(level).is_some())
 }
 
 #[cfg(test)]
