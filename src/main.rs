@@ -5,11 +5,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use loggle::{
-    ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
+    ConfigEnv, LogLevel, LogPageError, LogPageId, LogPageQueryOptions, NamedCommand, RuntimeConfig,
     RuntimeError, RuntimeInput, SourceConfig, active_log_pages, load_named_config,
-    load_project_config, print_log_page_tail_with_options, run,
+    load_project_config, print_log_page_query, query_log_page_records, run,
 };
 
 #[derive(Debug, Parser)]
@@ -17,7 +17,7 @@ use loggle::{
     name = "loggle",
     about = "A terminal log viewer for piped Docker Compose-style logs.",
     dont_delimit_trailing_values = true,
-    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
+    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1\n  loggle log -i 1 -n 5 --level error --format jsonl"
 )]
 struct Cli {
     #[arg(long, default_value_t = 100_000, value_parser = parse_buffer_lines)]
@@ -90,13 +90,34 @@ struct LogCli {
     )]
     text: Option<String>,
 
+    #[arg(long, value_name = "LEVEL", value_parser = parse_level)]
+    level: Option<LogLevel>,
+
+    #[arg(long, value_enum, default_value = "raw")]
+    format: LogOutputFormat,
+
     #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
     source_fields: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
 #[command(name = "loggle pages", about = "List active tagged Loggle pages.")]
-struct PagesCli {}
+struct PagesCli {
+    #[arg(long, value_enum, default_value = "table")]
+    format: PagesOutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogOutputFormat {
+    Raw,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PagesOutputFormat {
+    Table,
+    Jsonl,
+}
 
 fn parse_buffer_lines(input: &str) -> Result<usize, String> {
     let value = input
@@ -141,6 +162,14 @@ fn parse_property_filter(input: &str) -> Result<String, String> {
 
 fn parse_text_filter(input: &str) -> Result<String, String> {
     parse_non_empty(input, "text filter")
+}
+
+fn parse_level(input: &str) -> Result<LogLevel, String> {
+    LogLevel::parse(input).ok_or_else(|| {
+        format!(
+            "invalid level '{input}'; expected one of: fatal, error, warn, info, debug, trace, unknown"
+        )
+    })
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -199,21 +228,45 @@ fn report_command(result: Result<(), LogPageError>) -> Result<(), Box<dyn Error>
 }
 
 fn run_log_command(cli: LogCli) -> Result<(), LogPageError> {
-    let options = LogPageTailOptions {
-        line_count: cli.lines,
-        source: cli.source,
-        text: cli.text,
-        property_filters: cli.property_filters,
-        source_config: SourceConfig::with_fields(cli.source_fields),
-    };
+    let LogCli {
+        id,
+        lines,
+        source,
+        property_filters,
+        text,
+        level,
+        format,
+        source_fields,
+    } = cli;
+    let mut options = LogPageQueryOptions::new(lines);
+    options.source = source;
+    options.text = text;
+    options.level = level;
+    options.property_filters = property_filters;
+    options.source_config = SourceConfig::with_fields(source_fields);
 
     let mut stdout = io::stdout().lock();
-    print_log_page_tail_with_options(&cli.id, &options, &mut stdout)
+    match format {
+        LogOutputFormat::Raw => print_log_page_query(&id, &options, &mut stdout),
+        LogOutputFormat::Jsonl => {
+            for record in query_log_page_records(&id, &options)? {
+                write_json_line(&mut stdout, &record)?;
+            }
+            Ok(())
+        }
+    }
 }
 
-fn run_pages_command(_cli: PagesCli) -> Result<(), LogPageError> {
+fn run_pages_command(cli: PagesCli) -> Result<(), LogPageError> {
     let pages = active_log_pages()?;
     let mut stdout = io::stdout().lock();
+    if cli.format == PagesOutputFormat::Jsonl {
+        for page in pages {
+            write_json_line(&mut stdout, &page)?;
+        }
+        return Ok(());
+    }
+
     if pages.is_empty() {
         writeln!(stdout, "no active loggle pages").map_err(LogPageError::Output)?;
         return Ok(());
@@ -234,6 +287,15 @@ fn run_pages_command(_cli: PagesCli) -> Result<(), LogPageError> {
     }
 
     Ok(())
+}
+
+fn write_json_line<W: Write, T: serde::Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), LogPageError> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(|error| LogPageError::Output(io::Error::other(error)))?;
+    writeln!(writer).map_err(LogPageError::Output)
 }
 
 fn runtime_input_summary(input: &RuntimeInput) -> String {
@@ -600,13 +662,65 @@ api = ["pnpm", "start"]
         assert_eq!(cli.lines, 5);
         assert_eq!(cli.source.as_deref(), Some("api"));
         assert_eq!(cli.text.as_deref(), Some("database"));
+        assert_eq!(cli.level, None);
+        assert_eq!(cli.format, LogOutputFormat::Raw);
         assert_eq!(cli.property_filters, command(&["tenantId=tenant-1"]));
         assert_eq!(cli.source_fields, command(&["service"]));
     }
 
     #[test]
-    fn pages_command_cli_parses() {
-        PagesCli::try_parse_from(command(&["loggle pages"])).unwrap();
+    fn log_command_cli_parses_canonical_level_aliases_and_formats() {
+        for (alias, expected) in [
+            ("fatal", LogLevel::Fatal),
+            ("ERR", LogLevel::Error),
+            ("warning", LogLevel::Warn),
+            ("log", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("verbose", LogLevel::Trace),
+            ("unknown", LogLevel::Unknown),
+        ] {
+            let cli = LogCli::try_parse_from(command(&[
+                "loggle log",
+                "-i",
+                "1",
+                "--level",
+                alias,
+                "--format",
+                "jsonl",
+            ]))
+            .unwrap();
+
+            assert_eq!(cli.level, Some(expected));
+            assert_eq!(cli.format, LogOutputFormat::Jsonl);
+        }
+    }
+
+    #[test]
+    fn log_command_cli_rejects_invalid_level_with_canonical_values() {
+        let error =
+            LogCli::try_parse_from(command(&["loggle log", "-i", "1", "--level", "notice"]))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        let message = error.to_string();
+        assert!(message.contains("invalid level 'notice'"));
+        assert!(message.contains("fatal, error, warn, info, debug, trace, unknown"));
+    }
+
+    #[test]
+    fn command_formats_are_scoped_and_defaulted() {
+        let pages = PagesCli::try_parse_from(command(&["loggle pages"])).unwrap();
+        assert_eq!(pages.format, PagesOutputFormat::Table);
+
+        let pages =
+            PagesCli::try_parse_from(command(&["loggle pages", "--format", "jsonl"])).unwrap();
+        assert_eq!(pages.format, PagesOutputFormat::Jsonl);
+
+        assert!(PagesCli::try_parse_from(command(&["loggle pages", "--format", "raw"])).is_err());
+        assert!(
+            LogCli::try_parse_from(command(&["loggle log", "-i", "1", "--format", "table"]))
+                .is_err()
+        );
     }
 
     #[test]

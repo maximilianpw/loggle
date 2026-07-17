@@ -112,10 +112,12 @@ Then run it from any Compose project:
 loggle dc
 loggle -- docker compose up
 loggle pages
+loggle pages --format jsonl
 loggle log -i 1 -n 5
 loggle log -i 1 -n 5 --service api
 loggle log -i 1 -n 5 --text database
 loggle log -i 1 -n 5 --property requestId=716d1e62
+loggle log -i 1 -n 5 --level error --format jsonl
 loggle --id api -- docker compose up
 loggle start
 loggle start libre
@@ -150,6 +152,7 @@ running. You can also list active pages from another terminal:
 
 ```sh
 loggle pages
+loggle pages --format jsonl
 ```
 
 Example output:
@@ -158,6 +161,10 @@ Example output:
 ID	PID	AGE	COMMAND
 1	48291	3m	docker compose up
 ```
+
+The default table is intended for humans. `--format jsonl` writes one public
+page-metadata object per line in stable ID order, which avoids parsing the age
+column. With no active pages, JSONL output is empty and the command exits 0.
 
 Another terminal or AI agent can then fetch recent raw lines from that page:
 
@@ -171,15 +178,21 @@ Use `--id` when you want to choose a stable human-readable ID yourself:
 loggle --id api -- docker compose up
 ```
 
-Filter the tail to a service/source, text query, or parsed property:
+Filter the tail to a service/source, text query, level, or parsed property:
 
 ```sh
 loggle log -i 1 -n 5 --service api
 loggle log -i 1 -n 5 --text "database unavailable"
+loggle log -i 1 -n 5 --level error
 loggle log -i 1 -n 5 --source worker --property tenantId=tenant-1
-loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1
+loggle log -i 1 -n 5 --service api --text error --level warn --property tenantId=tenant-1
 loggle log -i 1 -n 5 --property requestId
 ```
+
+`--level` accepts the canonical values `fatal`, `error`, `warn`, `info`,
+`debug`, `trace`, and `unknown`. The parser also accepts `err`, `warning`,
+`log`, and `verbose` as aliases for `error`, `warn`, `info`, and `trace`.
+Structured output always uses the canonical lowercase value.
 
 Text filters match the same event fields as TUI search: raw line, parsed
 message, source, and property keys/values. Property filters use the same syntax
@@ -187,6 +200,37 @@ as the TUI property prompt: `key`, `key=value`, `key!=value`, and `!key`. A
 filtered tail returns whole matching records — the header line plus any folded
 multi-line property block — and `-n` counts matching records rather than
 individual lines.
+
+Use JSONL when the result will be consumed programmatically:
+
+```sh
+loggle log -i 1 -n 5 --level error --format jsonl
+```
+
+Each physical output line is one versioned logical record:
+
+```json
+{"schema_version":1,"source":"api","timestamp":"14:06:58.892","level":"error","message":"request failed","properties":{"retryable":true,"statusCode":500},"raw":"api | ERROR request failed\n{ retryable: true, statusCode: 500 }"}
+```
+
+The fields are `schema_version` (currently numeric `1`), `source`, nullable
+`timestamp`, canonical `level`, parsed `message`, typed `properties`, and the
+complete logical `raw` record. There is no sequence or cursor field. Property
+strings, booleans, nulls, and ordinary JSON numbers retain their types. A
+numeric lexeme that cannot round-trip exactly through `serde_json::Number`
+(for example `01`, `1.`, or an out-of-range integer) is emitted as a string
+instead of being changed to a different number.
+
+`--format raw` is the default. With no filters, raw `-n` retains the historical
+physical-line count and output shape. Filtered raw queries and all JSONL queries
+count the last `N` matching logical records and keep them in original order.
+Because JSON escapes embedded newlines, a multi-line raw record still occupies
+one physical JSONL line. A query with no matches writes zero bytes and exits 0;
+invalid input, inactive/missing pages, and output failures exit nonzero with
+diagnostics on stderr only.
+
+Cursors, wait/follow, context lines, field projections, and facets are not part
+of this agent-query contract yet.
 
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the
@@ -283,8 +327,10 @@ loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
 loggle --record session.log -- docker compose up
 loggle pages
+loggle pages --format jsonl
 loggle log -i 1 -n 5
 loggle log -i 1 -n 5 --service api --property tenantId=tenant-1
+loggle log -i 1 -n 5 --level error --format jsonl
 loggle --id api -- docker compose up
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
@@ -297,13 +343,20 @@ loggle start libre
 - `--record <PATH>`: writes every raw incoming line to a session log file
 - `--id <ID>` / `-i <ID>`: uses this page ID instead of an auto-generated ID
 - `--no-page-log`: disables the per-session page log used by `loggle log`/`pages`
-- `pages`: lists active Loggle pages with ID, PID, age, and command
+- `pages [--format table|jsonl]`: lists active Loggle pages with ID, PID, age,
+  and command; the default is the human-readable table
 - `--source-field <FIELD>`: promotes matching parsed properties to the source
   column when no explicit prefix exists. Repeat it or pass comma-separated
   fields, e.g. `--source-field service,app`
-- `log -i <ID> -n <N>`: prints the last `N` raw lines from a tagged Loggle page
+- `log -i <ID> -n <N>`: prints the last `N` raw physical lines from a tagged
+  Loggle page when no filter is active
+- `log --format <raw|jsonl>`: selects compatible raw output (the default) or
+  one versioned logical record per JSONL line
 - `log --source <SOURCE>` / `log --service <SERVICE>`: limits page output to a
   parsed source/service
+- `log --level <LEVEL>`: limits output to one parsed level; accepts `fatal`,
+  `error`/`err`, `warn`/`warning`, `info`/`log`, `debug`, `trace`/`verbose`, or
+  `unknown`
 - `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
   properties. Repeat for multiple required predicates
 - `dc`: shortcut for `docker compose up`
