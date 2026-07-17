@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::{
     app::App,
     model::SourceConfig,
-    page_log::{ActiveLogPageRegistration, LogPageId, PageLogRecorder, claim_active_log_page},
+    page_log::{LogPageId, PageLogSession},
     ui,
 };
 
@@ -178,39 +178,32 @@ fn run_app(
     page_logging: bool,
     children: &mut Vec<Child>,
 ) -> io::Result<()> {
-    let mut app = App::with_source_config(buffer_lines, source_config);
+    let mut app = App::with_source_config(buffer_lines, source_config.clone());
     let mut shutdown: Option<Vec<ChildShutdown>> = None;
     let mut dirty = true;
     let mut recorder = record_path.map(SessionRecorder::create).transpose()?;
     // The page log is an auxiliary, always-on feature; failures disable it with
     // a notice rather than tearing down the viewer the user actually asked for.
-    let mut page_recorder = None;
-    let mut page_id_for_header = None;
-    let mut active_page = None;
+    let mut page_session = None;
     if page_logging {
-        match start_page_log(page_id, &page_command, buffer_lines) {
-            Ok((id, recorder, registration)) => {
-                page_id_for_header = Some(id);
-                page_recorder = Some(recorder);
-                active_page = Some(registration);
-            }
+        match PageLogSession::start(page_id, &page_command, &source_config, buffer_lines) {
+            Ok(session) => page_session = Some(session),
             Err(error) => app.set_notice(format!("page log disabled: {error}")),
         }
     }
-    let _active_page = active_page;
 
     let had_startup_lines = !startup_lines.is_empty();
     for line in startup_lines {
-        ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
+        ingest_line(&mut app, &mut recorder, &mut page_session, line)?;
     }
     if had_startup_lines {
-        flush_page_recorder(&mut app, &mut page_recorder);
+        flush_page_session(&mut app, &mut page_session);
     }
 
     loop {
         let mut received = false;
         while let Ok(line) = rx.try_recv() {
-            ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
+            ingest_line(&mut app, &mut recorder, &mut page_session, line)?;
             received = true;
             dirty = true;
         }
@@ -218,7 +211,7 @@ fn run_app(
         // Flush once per drain instead of per line, so the read command sees
         // fresh data without a syscall on every ingested line.
         if received {
-            flush_page_recorder(&mut app, &mut page_recorder);
+            flush_page_session(&mut app, &mut page_session);
         }
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
@@ -238,7 +231,7 @@ fn run_app(
             }
 
             if all_exited {
-                flush_recorders(&mut recorder, &mut page_recorder)?;
+                flush_recorders(&mut app, &mut recorder, &mut page_session)?;
                 children.clear();
                 return Ok(());
             }
@@ -251,7 +244,7 @@ fn run_app(
                     &mut app,
                     color_enabled,
                     shutdown.as_deref().map(closing_message),
-                    page_id_for_header.as_ref(),
+                    page_session.as_ref().map(PageLogSession::id),
                 )
             })?;
             dirty = false;
@@ -277,7 +270,7 @@ fn run_app(
                     if requested_quit {
                         match shutdown.as_mut() {
                             _ if children.is_empty() => {
-                                flush_recorders(&mut recorder, &mut page_recorder)?;
+                                flush_recorders(&mut app, &mut recorder, &mut page_session)?;
                                 return Ok(());
                             }
                             None => {
@@ -312,28 +305,33 @@ fn run_app(
 fn ingest_line(
     app: &mut App,
     recorder: &mut Option<SessionRecorder>,
-    page_recorder: &mut Option<PageLogRecorder>,
+    page_session: &mut Option<PageLogSession>,
     line: String,
 ) -> io::Result<()> {
     if let Some(recorder) = recorder.as_mut() {
         recorder.record_line(&line)?;
     }
-    if let Some(active_recorder) = page_recorder.as_mut() {
-        if let Err(error) = active_recorder.record_line(&line) {
-            app.set_notice(format!("page log disabled: {error}"));
-            *page_recorder = None;
-        }
-    }
+    let page_result = page_session
+        .as_mut()
+        .map(|session| session.record_line(&line));
+    handle_page_log_result(app, page_session, page_result);
     app.push_line(line);
     Ok(())
 }
 
-fn flush_page_recorder(app: &mut App, page_recorder: &mut Option<PageLogRecorder>) {
-    if let Some(active_recorder) = page_recorder.as_mut() {
-        if let Err(error) = active_recorder.flush() {
-            app.set_notice(format!("page log disabled: {error}"));
-            *page_recorder = None;
-        }
+fn flush_page_session(app: &mut App, page_session: &mut Option<PageLogSession>) {
+    let page_result = page_session.as_mut().map(PageLogSession::flush);
+    handle_page_log_result(app, page_session, page_result);
+}
+
+fn handle_page_log_result(
+    app: &mut App,
+    page_session: &mut Option<PageLogSession>,
+    result: Option<io::Result<()>>,
+) {
+    if let Some(Err(error)) = result {
+        app.set_notice(format!("page log disabled: {error}"));
+        *page_session = None;
     }
 }
 
@@ -357,29 +355,17 @@ impl SessionRecorder {
     }
 }
 
-fn start_page_log(
-    page_id: Option<LogPageId>,
-    page_command: &str,
-    buffer_lines: usize,
-) -> io::Result<(LogPageId, PageLogRecorder, ActiveLogPageRegistration)> {
-    let (id, registration) =
-        claim_active_log_page(page_id, page_command).map_err(io::Error::other)?;
-    let recorder = PageLogRecorder::create(&id, buffer_lines).map_err(io::Error::other)?;
-    Ok((id, recorder, registration))
-}
-
 fn flush_recorders(
+    app: &mut App,
     recorder: &mut Option<SessionRecorder>,
-    page_recorder: &mut Option<PageLogRecorder>,
+    page_session: &mut Option<PageLogSession>,
 ) -> io::Result<()> {
     if let Some(recorder) = recorder.as_mut() {
         recorder.flush()?;
     }
-    // Best-effort: a failure flushing the auxiliary page log must not fail the
-    // session's clean shutdown.
-    if let Some(page_recorder) = page_recorder.as_mut() {
-        let _ = page_recorder.flush();
-    }
+    // Best-effort: a failure flushing the auxiliary page log disables and
+    // cleans it up without failing the session's clean shutdown.
+    flush_page_session(app, page_session);
     Ok(())
 }
 
@@ -432,5 +418,45 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(output, "api | one\nweb | two\n");
+    }
+
+    #[test]
+    fn page_log_failure_drops_session_registration_and_data() {
+        let root = std::env::temp_dir().join(format!(
+            "loggle-terminal-page-failure-test-{}",
+            std::process::id()
+        ));
+        let registry_dir = root.join("active-pages");
+        let page_dir = root.join("pages");
+        let id = LogPageId::parse("api").unwrap();
+        let metadata_path = registry_dir.join("api.json");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = PageLogSession::start_for_test(
+            Some(id),
+            "docker compose up",
+            &SourceConfig::default(),
+            100,
+            &registry_dir,
+            &page_dir,
+        )
+        .unwrap();
+        let mut page_session = Some(session);
+        let mut app = App::new(100);
+
+        handle_page_log_result(
+            &mut app,
+            &mut page_session,
+            Some(Err(io::Error::other("simulated recorder failure"))),
+        );
+
+        assert!(page_session.is_none());
+        assert_eq!(
+            app.notice(),
+            Some("page log disabled: simulated recorder failure")
+        );
+        assert!(!metadata_path.exists());
+        assert_eq!(std::fs::read_dir(&page_dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -92,6 +92,7 @@ pub struct LogProperty {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceConfig {
+    configured_fields: Vec<String>,
     fields: Vec<String>,
 }
 
@@ -101,27 +102,50 @@ impl SourceConfig {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut config = Self { fields: Vec::new() };
+        let mut configured_fields = Vec::new();
         for field in fields {
-            config.push_field(field.as_ref());
+            Self::push_unique_field(&mut configured_fields, field.as_ref());
         }
+
+        let mut fields = configured_fields.clone();
         for field in DEFAULT_SOURCE_FIELDS {
-            config.push_field(field);
+            Self::push_unique_field(&mut fields, field);
         }
-        config
+
+        Self {
+            configured_fields,
+            fields,
+        }
+    }
+
+    pub(crate) fn configured_fields(&self) -> &[String] {
+        &self.configured_fields
     }
 
     pub(crate) fn fields(&self) -> &[String] {
         &self.fields
     }
 
-    fn push_field(&mut self, field: &str) {
+    pub(crate) fn merged_with_configured_fields<I, S>(&self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut merged = self.configured_fields.clone();
+        for field in fields {
+            Self::push_unique_field(&mut merged, field.as_ref());
+        }
+
+        Self::with_fields(merged)
+    }
+
+    fn push_unique_field(fields: &mut Vec<String>, field: &str) {
         let field = field.trim();
-        if field.is_empty() || self.fields.iter().any(|existing| existing == field) {
+        if field.is_empty() || fields.iter().any(|existing| existing == field) {
             return;
         }
 
-        self.fields.push(field.to_string());
+        fields.push(field.to_string());
     }
 }
 
@@ -1116,6 +1140,65 @@ fn level_priority(level: Level) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_config_equality_preserves_configured_field_precedence() {
+        let defaults = SourceConfig::default();
+        let explicit_default = SourceConfig::with_fields(["source"]);
+
+        assert_ne!(defaults, explicit_default);
+
+        let default_reader = defaults.merged_with_configured_fields(["session"]);
+        let explicit_reader = explicit_default.merged_with_configured_fields(["session"]);
+        assert_eq!(&default_reader.fields()[..2], ["session", "source"]);
+        assert_eq!(&explicit_reader.fields()[..2], ["source", "session"]);
+    }
+
+    #[test]
+    fn source_config_distinguishes_configured_fields_from_defaults() {
+        let config = SourceConfig::with_fields(["tenant", "service", "tenant", " "]);
+
+        assert_eq!(config.configured_fields(), ["tenant", "service"]);
+        assert_eq!(
+            config.fields(),
+            [
+                "tenant",
+                "service",
+                "source",
+                "app",
+                "logger",
+                "target",
+                "component",
+            ]
+        );
+        assert!(SourceConfig::default().configured_fields().is_empty());
+    }
+
+    #[test]
+    fn source_config_merges_reader_fields_before_persisted_fields() {
+        let reader = SourceConfig::with_fields(["reader", "shared"]);
+        let merged =
+            reader.merged_with_configured_fields(["session", "shared", "source", "session"]);
+
+        assert_eq!(
+            merged.configured_fields(),
+            ["reader", "shared", "session", "source"]
+        );
+        assert_eq!(
+            merged.fields(),
+            [
+                "reader",
+                "shared",
+                "session",
+                "source",
+                "service",
+                "app",
+                "logger",
+                "target",
+                "component",
+            ]
+        );
+    }
 
     #[test]
     fn parses_compose_line_with_standard_spacing() {

@@ -191,10 +191,13 @@ individual lines.
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the
 TUI. Each log retains roughly the same window as the in-memory buffer
-(`--buffer-lines`), and a page's log is removed once its session ends and is
-reaped. The page log is best-effort: if it cannot be written, the viewer keeps
-running and shows a notice instead of exiting. Pass `--no-page-log` to opt out
-of writing logs to disk entirely.
+(`--buffer-lines`). `loggle log` reads active sessions only and inherits the
+session's configured source fields. A `loggle log --source-field` value is an
+explicit override and is checked before inherited fields. When the session exits
+cleanly, or if its page recorder fails, Loggle unregisters the page and removes
+its data. The page log is best-effort: if it cannot be written, the viewer keeps
+running and shows a notice instead of exiting. Pass `--no-page-log` to opt out of
+writing logs to disk entirely.
 
 ### Start Configs
 
