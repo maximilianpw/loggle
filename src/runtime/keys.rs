@@ -154,6 +154,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
             let _ = app.export_visible_logs_default();
         }
         CommandAction::ToggleMarker => app.toggle_selected_marker(),
+        CommandAction::Facets => app.open_dialog(DialogKind::Facets),
         CommandAction::Sources => app.open_dialog(DialogKind::Sources),
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
@@ -180,6 +181,7 @@ fn copy_outcome(yanked: Option<YankedLines>) -> KeyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facet::FacetKind;
     use crate::model::Level;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -313,6 +315,28 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('O')), 5);
 
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Sources));
+    }
+
+    #[test]
+    fn capital_f_opens_facets_and_empty_backspace_returns_from_drilldown() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO row tenant=one".to_string());
+
+        handle_key(&mut app, key(KeyCode::Char('F')), 5);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Facets));
+
+        let property_index = app
+            .facet_dialog_rows()
+            .iter()
+            .position(|row| row.facet == FacetKind::PropertyKey && row.value == "tenant")
+            .unwrap();
+        app.move_dialog_down(DialogKind::Facets, property_index);
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+        assert!(app.facet_dialog_is_drilldown());
+
+        handle_key(&mut app, key(KeyCode::Backspace), 5);
+        assert!(!app.facet_dialog_is_drilldown());
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Facets));
     }
 
     #[test]
