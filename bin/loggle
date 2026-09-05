@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Port executables have no controlling terminal. Resolve its device before BEAM.
+TTY_NAME=$(ps -o tty= -p $$ | tr -d ' ')
+LOGGLE_TTY="/dev/$TTY_NAME"
+export LOGGLE_TTY
+if [ -x "$ROOT/bin/loggle_runtime" ]; then
+  VERSION=$(cut -d ' ' -f2 "$ROOT/releases/start_erl.data")
+  REL="$ROOT/releases/$VERSION"
+  exec "$REL/elixir" --boot "$REL/start_clean" --boot-var RELEASE_LIB "$ROOT/lib" \
+    --erl-config "$REL/sys" -e 'Loggle.CLI.main(System.argv())' -- "$@" </dev/null
+else
+  exec mix run --no-start -e 'Loggle.CLI.main(System.argv())' -- "$@" </dev/null
+fi

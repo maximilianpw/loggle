@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This local-only CLI needs no authentication or services on wake. The login
-# profile installed by setup restores the complete Nix development environment.
+# This local-only CLI needs no authentication or services on wake.

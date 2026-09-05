@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
-SECONDS=0
-
-echo '==> Ensuring Nix prerequisites'
 missing=()
-for package in ca-certificates curl xz-utils; do
+for package in elixir erlang-dev build-essential python3; do
   if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
     missing+=("$package")
   fi
@@ -16,43 +12,7 @@ if ((${#missing[@]})); then
   sudo apt-get update
   sudo apt-get install -y "${missing[@]}"
 fi
-
-echo "==> Installing Nix if missing (${SECONDS}s)"
-if [[ ! -x "$HOME/.nix-profile/bin/nix" ]] && ! command -v nix >/dev/null; then
-  sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /nix
-  installer="$(mktemp)"
-  trap 'rm -f "$installer"' EXIT
-  curl --proto '=https' --tlsv1.2 -fsSL https://nixos.org/nix/install -o "$installer"
-  sh "$installer" --no-daemon --yes --no-modify-profile
-  rm -f "$installer"
-  trap - EXIT
-fi
-if [[ -f "$HOME/.nix-profile/etc/profile.d/nix.sh" ]]; then
-  # shellcheck disable=SC1091
-  source "$HOME/.nix-profile/etc/profile.d/nix.sh"
-fi
-nix_bin="$(command -v nix)"
-
-echo "==> Realizing the locked development environment (${SECONDS}s)"
-# Export the entire shell, including linker paths and Cargo's target directory.
-dev_env="$("$nix_bin" --extra-experimental-features 'nix-command flakes' print-dev-env --no-update-lock-file "$repo_root")"
-eval "$dev_env"
-
-echo "==> Persisting repository-scoped login environment (${SECONDS}s)"
-marker='# Loggle orb development environment'
-if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
-  cat >> "$HOME/.bash_profile" <<EOF
-
-$marker
-if [[ -z "\${LOGGLE_ORB_ENV:-}" && ( "\$PWD" == "$repo_root" || "\$PWD" == "$repo_root/"* ) ]]; then
-  export LOGGLE_ORB_ENV=1
-  eval "\$("$nix_bin" --extra-experimental-features 'nix-command flakes' print-dev-env --no-update-lock-file "$repo_root")"
-fi
-EOF
-fi
-
-echo "==> Fetching locked Cargo dependencies (${SECONDS}s)"
-cargo fetch --locked
-echo "==> Warming debug and test builds, including the performance harness (${SECONDS}s)"
-cargo build --locked --all-targets --all-features
-echo "==> Setup complete (${SECONDS}s)"
+echo '==> Elixir dependencies and native pipe helper'
+if ! mix hex.info >/dev/null 2>&1; then mix local.hex --force; fi
+mix deps.get --check-locked
+mix compile --warnings-as-errors

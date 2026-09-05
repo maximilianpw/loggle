@@ -1,90 +1,23 @@
-name: CI
-
+name: Elixir milestone
 on:
   push:
-    branches:
-      - main
+    branches: [main, elixir-rewrite]
   pull_request:
-    branches:
-      - main
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  lint:
-    name: Format, check, and lint
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        id: toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-
-            cargo-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check crate
-        run: cargo check --locked --all-targets
-
-      - name: Run clippy
-        run: cargo clippy --locked --all-targets
-
   test:
-    name: Test (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        runner:
-          - ubuntu-24.04
-          - macos-15
-
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        id: toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
         with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-
-            cargo-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Run tests
-        run: cargo test --locked --all-targets
+          otp-version: '25.3'
+          elixir-version: '1.14.5'
+      - run: mix deps.get --check-locked
+      - run: mix format --check-formatted
+      - run: mix test --warnings-as-errors
+      - run: MIX_ENV=prod mix release --overwrite
+      - run: python3 test/pty_test.py _build/prod/rel/loggle/bin/loggle
+      # Deliberately no tags, uploads, credentials, or publishing jobs.
