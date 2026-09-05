@@ -804,6 +804,48 @@ mod tests {
     }
 
     #[test]
+    fn mixed_service_fixture_replays_exact_correlations_and_whole_records() {
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        let raw = fixture.lines().collect::<Vec<_>>();
+        let mut options = LogPageTailOptions {
+            line_count: 100,
+            source: None,
+            text: None,
+            property_filters: vec!["requestId=fixture-failed".to_string()],
+            source_config: SourceConfig::default(),
+        };
+        let replay = |options: &LogPageTailOptions| {
+            filtered_tail_lines(
+                BufReader::new(fixture.as_bytes()),
+                options,
+                Path::new("fixtures/mixed-service-investigation.log"),
+            )
+            .unwrap()
+        };
+
+        // Five failed-request records, including the entire seven-line API error.
+        // The interleaved prefix-collision ID and the later success are excluded.
+        assert_eq!(replay(&options), [&raw[1..3], &raw[4..13]].concat());
+        options.line_count = 1;
+        assert_eq!(replay(&options), raw[6..13]);
+        options.line_count = 100;
+        options.source = Some("database".to_string());
+        options.text = Some("job insert rejected".to_string());
+        assert_eq!(replay(&options), raw[4..5]);
+        options.source = None;
+        options.text = None;
+        options.property_filters = vec!["requestId=fixture-success".to_string()];
+        assert_eq!(replay(&options), raw[13..18]);
+        options.property_filters = vec!["requestId=fixture-failed-extra".to_string()];
+        assert_eq!(replay(&options), raw[3..4]);
+        options.property_filters = vec!["requestId=fixture".to_string()];
+        assert!(replay(&options).is_empty());
+        options.property_filters.clear();
+        options.source = Some("minio-init".to_string());
+        assert_eq!(replay(&options), raw[0..1]);
+    }
+
+    #[test]
     fn vev_compose_fixture_replays_buildkit_and_status_filters() {
         let options = LogPageTailOptions {
             line_count: 10,

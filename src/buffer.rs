@@ -431,6 +431,94 @@ mod tests {
     }
 
     #[test]
+    fn mixed_service_fixture_preserves_sources_properties_and_raw_summaries() {
+        use crate::filter::{LogFilter, PropertyPredicate};
+        use crate::model::Level;
+
+        let lines = include_str!("../fixtures/mixed-service-investigation.log")
+            .lines()
+            .collect::<Vec<_>>();
+        let mut buffer = LogBuffer::new(100);
+        for line in &lines {
+            buffer.push_line((*line).to_string());
+        }
+
+        assert_eq!(
+            sources(&buffer),
+            vec![
+                "minio-init",
+                "api",
+                "worker",
+                "api",
+                "database",
+                "worker",
+                "api",
+                "api",
+                "worker",
+                "database",
+                "worker",
+                "api",
+            ]
+        );
+        // Only the property block folds; every other raw line remains unchanged.
+        assert_eq!(
+            buffer
+                .events()
+                .iter()
+                .map(|event| event.raw.as_str())
+                .collect::<Vec<_>>(),
+            [&lines[..7], &lines[13..]].concat()
+        );
+        for (request_id, expected_sequences) in [
+            ("fixture-failed", vec![1, 2, 4, 5, 6]),
+            ("fixture-success", vec![7, 8, 9, 10, 11]),
+            ("fixture-failed-extra", vec![3]),
+        ] {
+            let filter = LogFilter {
+                property_includes: vec![PropertyPredicate::exact("requestId", request_id)],
+                ..LogFilter::default()
+            };
+            assert_eq!(
+                buffer
+                    .events()
+                    .iter()
+                    .filter(|event| filter.matches(event))
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                expected_sequences
+            );
+        }
+        let database_error = &buffer.events()[4];
+        assert_eq!(database_error.message, "job insert rejected");
+        assert_eq!(database_error.level, Level::Error);
+        assert_eq!(
+            database_error
+                .property("errorCode")
+                .unwrap()
+                .value
+                .to_string(),
+            "23503"
+        );
+        let failure = &buffer.events()[6];
+        assert_eq!(failure.message, "request failed");
+        assert_eq!(failure.level, Level::Error);
+        assert_eq!(
+            failure.property("statusCode").unwrap().value.to_string(),
+            "500"
+        );
+        assert_eq!(
+            failure.property("cause").unwrap().value.to_string(),
+            "job insert rejected: missing synthetic parent"
+        );
+        let success = buffer.events().back().unwrap();
+        assert_eq!(success.level, Level::Info);
+        assert_eq!(
+            success.property("statusCode").unwrap().value.to_string(),
+            "201"
+        );
+    }
+
+    #[test]
     fn retains_only_the_configured_number_of_lines() {
         let mut buffer = LogBuffer::new(3);
 

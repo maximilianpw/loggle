@@ -1,0 +1,18 @@
+minio-init | INFO synthetic bucket initialization completed exitCode=0
+[api] 10:00:00.000 INFO request started requestId=fixture-failed method=POST path=/jobs
+[worker] INFO job started requestId=fixture-failed jobId=job-001
+[api] INFO unrelated request completed requestId=fixture-failed-extra statusCode=200
+database | {"level":"error","message":"job insert rejected","requestId":"fixture-failed","errorCode":"23503","table":"jobs"}
+[worker] ERROR job failed requestId=fixture-failed errorCode=23503
+[api] 10:00:00.050 ERROR request failed
+[api] [10:00:00.050] ERROR (#1):
+[api] {
+[api]   requestId: "fixture-failed",
+[api]   statusCode: 500,
+[api]   cause: "job insert rejected: missing synthetic parent",
+[api] }
+[api] 10:00:01.000 INFO request started requestId=fixture-success method=POST path=/jobs
+[worker] INFO job started requestId=fixture-success jobId=job-002
+database | {"level":"info","message":"job inserted","requestId":"fixture-success","rows":1,"table":"jobs"}
+[worker] INFO job completed requestId=fixture-success jobId=job-002
+[api] INFO request completed requestId=fixture-success statusCode=201

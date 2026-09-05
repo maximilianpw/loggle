@@ -475,6 +475,47 @@ Run tests:
 cargo test
 ```
 
+### Synthetic Investigation Regression
+
+`fixtures/mixed-service-investigation.log` is a Loggle-owned, deterministic
+synthetic scenario, not a recording from a real application. It needs no Docker,
+network, private repository, secrets, or service installations. Replay it locally:
+
+```sh
+cargo run -- --id fixture -- cat fixtures/mixed-service-investigation.log
+```
+
+While the page remains open, query it from another terminal:
+
+```sh
+cargo run -- log -i fixture -n 10 --property requestId=fixture-failed
+cargo run -- log -i fixture -n 1 --property requestId=fixture-failed
+cargo run -- log -i fixture -n 10 --service database --property requestId=fixture-failed
+cargo run -- log -i fixture -n 10 --property requestId=fixture-success
+```
+
+Expected evidence: 18 raw lines become 12 events. `fixture-failed` selects five
+API/worker/database events: job insert rejection (`23503`), worker failure, and
+API status `500`. The last matching record includes all seven lines of the API
+summary/property block, including the synthetic cause. The interleaved
+`fixture-failed-extra` request must not match that exact property filter.
+`fixture-success` selects five events for a second POST `/jobs` attempt, ending
+with a database insert, worker completion, and API status `201`.
+
+Bracket-prefixed API/worker output and Compose-style database output use existing
+Loggle formats. The separately sourced `minio-init` line represents one-shot
+initialization output; it does not test capturing an actual `--rm` container.
+Database correlation is synthetic instrumentation, not a claim that native
+database logs automatically contain application request IDs.
+
+Run the focused regression with `cargo test --locked mixed_service_fixture` and
+the full suite with `cargo test --locked --all-targets --all-features` (inside
+`nix develop` in an orb). Tests cover source identity, exact property correlation,
+raw summary preservation, whole multiline page-log evidence, and exclusion of
+unrelated traffic. This supports the PRS-293 reproducibility baseline only:
+real-app failure reproduction and user acceptance remain unproven. It is **not
+proof of real-app acceptance**, Stocket source framing, or live service capture.
+
 Check compilation:
 
 ```sh
