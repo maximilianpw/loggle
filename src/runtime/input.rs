@@ -5,7 +5,7 @@ use std::{
     os::fd::FromRawFd,
     os::unix::process::CommandExt,
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child as ProcessChild, Command, Stdio},
     sync::mpsc as std_mpsc,
     thread,
     time::{Duration, Instant},
@@ -16,6 +16,33 @@ use tokio::sync::mpsc;
 use super::{NamedCommand, ReadySpec, StartCommand, StartPlan};
 
 pub(super) const LINE_CHANNEL_CAPACITY: usize = 1024;
+
+/// Own the process group as well as its leader, including across early returns.
+/// Waiting for the leader alone does not guarantee that its descendants exited.
+#[derive(Debug)]
+pub(super) struct Child {
+    process: ProcessChild,
+}
+
+impl std::ops::Deref for Child {
+    type Target = ProcessChild;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
+}
+
+impl std::ops::DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.process
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        force_kill_child_group(self);
+    }
+}
 
 pub(super) fn stdin_is_terminal() -> bool {
     io::stdin().is_terminal()
@@ -41,15 +68,7 @@ pub(super) fn spawn_named_commands(
     let mut children = Vec::with_capacity(commands.len());
 
     for command in commands {
-        match spawn_named_command(command, tx.clone()) {
-            Ok(child) => children.push(child),
-            Err(error) => {
-                for child in &mut children {
-                    force_kill_child_group(child);
-                }
-                return Err(error);
-            }
-        }
+        children.push(spawn_named_command(command, tx.clone())?);
     }
 
     Ok(children)
@@ -144,7 +163,7 @@ fn spawn_child_with_env(
         });
     }
 
-    command_builder.spawn()
+    command_builder.spawn().map(|process| Child { process })
 }
 
 fn spawn_probe(
@@ -281,20 +300,8 @@ impl<'a> StartScheduler<'a> {
     ) -> io::Result<Vec<Child>> {
         while !self.all_ready() {
             let now = Instant::now();
-            let mut progressed = match self.spawn_unblocked(now) {
-                Ok(progressed) => progressed,
-                Err(error) => {
-                    self.kill_started_children();
-                    return Err(error);
-                }
-            };
-            progressed |= match self.check_readiness(now) {
-                Ok(progressed) => progressed,
-                Err(error) => {
-                    self.kill_started_children();
-                    return Err(error);
-                }
-            };
+            let mut progressed = self.spawn_unblocked(now)?;
+            progressed |= self.check_readiness(now)?;
 
             if !progressed {
                 thread::sleep(Duration::from_millis(10));
@@ -429,12 +436,6 @@ impl<'a> StartScheduler<'a> {
         }
 
         Ok(progressed)
-    }
-
-    fn kill_started_children(&mut self) {
-        for child in self.children.iter_mut().flatten() {
-            force_kill_child_group(child);
-        }
     }
 }
 
@@ -1172,21 +1173,37 @@ mod tests {
 
     #[test]
     fn shutdown_interrupt_stops_spawned_process_group() {
-        let (tx, _rx) = mpsc::channel(4);
-        let mut child = spawn_command(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "trap 'exit 42' INT; while true; do sleep 1; done".to_string(),
-            ],
-            tx,
-        )
-        .unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap 'exit 42' INT; echo ready; while true; do sleep 1; done",
+            ])
+            .stdout(Stdio::piped())
+            .process_group(0);
+        // An ignored SIGINT survives exec; a shell cannot install an INT trap
+        // in that case. Set this fixture's disposition without changing the
+        // multithreaded test runner's process-wide signal handlers.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut child = Child {
+            process: command.spawn().unwrap(),
+        };
+        let mut ready = String::new();
+        io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
         let mut shutdown = ChildShutdown::start(&child, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
             if shutdown.tick(&mut child, Instant::now()).unwrap() == ShutdownStatus::Exited {
+                assert_eq!(child.wait().unwrap().code(), Some(42));
                 return;
             }
             thread::sleep(Duration::from_millis(25));

@@ -2,7 +2,6 @@ use std::{
     fs::File,
     io::{self, BufWriter, Write},
     path::PathBuf,
-    process::Child,
     time::{Duration, Instant},
 };
 
@@ -24,7 +23,7 @@ use crate::{
 
 use super::{
     clipboard,
-    input::{self, ChildShutdown, ShutdownSignal, ShutdownStatus},
+    input::{self, Child, ChildShutdown, ShutdownSignal, ShutdownStatus},
     keys::{self, KeyOutcome},
 };
 
@@ -55,11 +54,7 @@ pub(super) fn run(
         &mut children,
     );
 
-    if result.is_err() {
-        for child in &mut children {
-            input::force_kill_child_group(child);
-        }
-    }
+    drop(children);
 
     let cleanup_result = terminal.restore();
     match (result, cleanup_result) {
@@ -78,8 +73,10 @@ impl TerminalSession {
     fn enter() -> io::Result<Self> {
         let mut mode = TerminalModeGuard::enter_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        // A write can fail after entering the alternate screen. Arm restoration
+        // before attempting any output, not only after the entire write succeeds.
         mode.mark_alternate_screen_entered();
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
 
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;

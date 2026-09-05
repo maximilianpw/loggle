@@ -3,13 +3,16 @@ mod input;
 mod keys;
 mod start_plan;
 mod terminal;
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
 
-use std::{collections::BTreeMap, fmt, io, path::PathBuf, process::Child, time::Duration};
+use std::{collections::BTreeMap, fmt, io, path::PathBuf, time::Duration};
 
 use tokio::sync::mpsc;
 
 use crate::{model::SourceConfig, page_log::LogPageId};
 
+use input::Child;
 pub(crate) use start_plan::StartPlan;
 
 #[derive(Debug, Clone)]
