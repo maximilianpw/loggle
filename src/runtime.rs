@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::{model::SourceConfig, page_log::LogPageId};
 
+use crate::model::InputLine;
 use input::Child;
 pub(crate) use start_plan::StartPlan;
 
@@ -118,13 +119,13 @@ pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
 
 struct StartedInput {
     children: Vec<Child>,
-    startup_lines: Vec<String>,
+    startup_lines: Vec<InputLine>,
 }
 
 fn start_input(
     input_mode: &RuntimeInput,
-    tx: mpsc::Sender<String>,
-    rx: &mut mpsc::Receiver<String>,
+    tx: mpsc::Sender<InputLine>,
+    rx: &mut mpsc::Receiver<InputLine>,
     startup_line_capacity: usize,
 ) -> Result<StartedInput, RuntimeError> {
     match input_mode {

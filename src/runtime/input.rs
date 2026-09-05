@@ -13,9 +13,12 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use super::{NamedCommand, ReadySpec, StartCommand, StartPlan};
+use super::{InputLine, NamedCommand, ReadySpec, StartCommand, StartPlan};
 
 pub(super) const LINE_CHANNEL_CAPACITY: usize = 1024;
+pub(super) const BATCH_RECORDS: usize = 256;
+pub(super) const BATCH_TIME: Duration = Duration::from_millis(4);
+pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Own the process group as well as its leader, including across early returns.
 /// Waiting for the leader alone does not guarantee that its descendants exited.
@@ -48,13 +51,13 @@ pub(super) fn stdin_is_terminal() -> bool {
     io::stdin().is_terminal()
 }
 
-pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<String>) -> io::Result<()> {
+pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<InputLine>) -> io::Result<()> {
     let input = prepare_terminal_input()?;
     spawn_line_reader(input, tx, LineReaderConfig::default());
     Ok(())
 }
 
-pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io::Result<Child> {
+pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<InputLine>) -> io::Result<Child> {
     let mut child = spawn_child(command, None)?;
     spawn_output_readers(&mut child, tx, LineReaderConfig::default());
 
@@ -63,7 +66,7 @@ pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io:
 
 pub(super) fn spawn_named_commands(
     commands: &[NamedCommand],
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<InputLine>,
 ) -> io::Result<Vec<Child>> {
     let mut children = Vec::with_capacity(commands.len());
 
@@ -77,7 +80,7 @@ pub(super) fn spawn_named_commands(
 #[cfg(test)]
 pub(super) fn spawn_start_commands(
     commands: &[StartCommand],
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<InputLine>,
 ) -> io::Result<Vec<Child>> {
     let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
     StartScheduler::new(plan, tx).run(None, None)
@@ -85,17 +88,17 @@ pub(super) fn spawn_start_commands(
 
 pub(super) fn spawn_start_commands_draining(
     commands: &[StartCommand],
-    tx: mpsc::Sender<String>,
-    rx: &mut mpsc::Receiver<String>,
+    tx: mpsc::Sender<InputLine>,
+    rx: &mut mpsc::Receiver<InputLine>,
     retained_lines: usize,
-) -> io::Result<(Vec<String>, Vec<Child>)> {
+) -> io::Result<(Vec<InputLine>, Vec<Child>)> {
     let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
     let mut startup_lines = StartupLineBuffer::new(retained_lines);
     let children = StartScheduler::new(plan, tx).run(Some(rx), Some(&mut startup_lines))?;
     Ok((startup_lines.into_vec(), children))
 }
 
-fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
+fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<InputLine>) -> io::Result<Child> {
     let mut child = spawn_child(&command.command, command.cwd.as_deref())?;
     spawn_output_readers(
         &mut child,
@@ -108,7 +111,7 @@ fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::
 
 fn spawn_start_command(
     command: &StartCommand,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<InputLine>,
 ) -> io::Result<SpawnedStartCommand> {
     let mut child = spawn_child_with_env(&command.argv, command.cwd.as_deref(), &command.env)?;
     let ready_line = match &command.ready {
@@ -212,7 +215,7 @@ impl LineReaderConfig {
     }
 }
 
-fn spawn_output_readers(child: &mut Child, tx: mpsc::Sender<String>, config: LineReaderConfig) {
+fn spawn_output_readers(child: &mut Child, tx: mpsc::Sender<InputLine>, config: LineReaderConfig) {
     if let Some(stdout) = child.stdout.take() {
         spawn_line_reader(stdout, tx.clone(), config.clone());
     }
@@ -221,34 +224,38 @@ fn spawn_output_readers(child: &mut Child, tx: mpsc::Sender<String>, config: Lin
     }
 }
 
-fn spawn_line_reader<R>(input: R, tx: mpsc::Sender<String>, config: LineReaderConfig)
+fn spawn_line_reader<R>(input: R, tx: mpsc::Sender<InputLine>, config: LineReaderConfig)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || read_lines(input, tx, config));
 }
 
-fn read_lines<R>(input: R, tx: mpsc::Sender<String>, config: LineReaderConfig)
+fn read_lines<R>(input: R, tx: mpsc::Sender<InputLine>, config: LineReaderConfig)
 where
     R: Read,
 {
-    let reader = io::BufReader::new(input);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_STREAM: AtomicU64 = AtomicU64::new(1);
+    let stream = NEXT_STREAM.fetch_add(1, Ordering::Relaxed);
+    let mut reader = io::BufReader::new(input);
     let mut signaled_ready = false;
 
-    for line in reader.lines() {
-        match line {
-            Ok(line) => {
+    loop {
+        match bounded_line(&mut reader) {
+            Ok(Some(line)) => {
                 let matches_ready = config
                     .ready_line
                     .as_ref()
                     .is_some_and(|ready_line| line.contains(ready_line));
-                let line = config
-                    .source
-                    .as_ref()
-                    .map(|source| format!("[{source}] {line}"))
-                    .unwrap_or(line);
-
-                if tx.blocking_send(line).is_err() {
+                if tx
+                    .blocking_send(InputLine {
+                        stream,
+                        source: config.source.clone(),
+                        text: line,
+                    })
+                    .is_err()
+                {
                     break;
                 }
 
@@ -259,9 +266,54 @@ where
                     signaled_ready = true;
                 }
             }
-            Err(_) => break,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = tx.blocking_send(InputLine {
+                    stream,
+                    source: config.source.clone(),
+                    text: format!("ERROR loggle input read failed: {error}"),
+                });
+                break;
+            }
         }
     }
+}
+
+/// Discard the tail of an oversized physical line without allocating it. Invalid
+/// UTF-8 is replaced explicitly; malformed input never silently closes a stream.
+fn bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if bytes.is_empty() && !truncated {
+                return Ok(None);
+            }
+            break;
+        }
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let count = end.unwrap_or(available.len());
+        let keep = count.min(MAX_LINE_BYTES.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&available[..keep]);
+        truncated |= keep < count;
+        reader.consume(count + usize::from(end.is_some()));
+        if end.is_some() {
+            break;
+        }
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    let invalid = std::str::from_utf8(&bytes).is_err();
+    let mut line = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        line.push_str(" [loggle: line truncated at 65536 bytes]");
+    }
+    if invalid {
+        line.push_str(" [loggle: invalid UTF-8 replaced]");
+    }
+    Ok(Some(line))
 }
 
 #[derive(Debug)]
@@ -272,7 +324,7 @@ struct SpawnedStartCommand {
 
 struct StartScheduler<'a> {
     plan: StartPlan<'a>,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<InputLine>,
     states: Vec<StartState>,
     children: Vec<Option<Child>>,
     line_ready: Vec<Option<std_mpsc::Receiver<()>>>,
@@ -280,7 +332,7 @@ struct StartScheduler<'a> {
 }
 
 impl<'a> StartScheduler<'a> {
-    fn new(plan: StartPlan<'a>, tx: mpsc::Sender<String>) -> Self {
+    fn new(plan: StartPlan<'a>, tx: mpsc::Sender<InputLine>) -> Self {
         let len = plan.len();
 
         Self {
@@ -295,7 +347,7 @@ impl<'a> StartScheduler<'a> {
 
     fn run(
         mut self,
-        mut startup_rx: Option<&mut mpsc::Receiver<String>>,
+        mut startup_rx: Option<&mut mpsc::Receiver<InputLine>>,
         mut startup_lines: Option<&mut StartupLineBuffer>,
     ) -> io::Result<Vec<Child>> {
         while !self.all_ready() {
@@ -440,7 +492,7 @@ impl<'a> StartScheduler<'a> {
 }
 
 fn drain_startup_lines(
-    startup_rx: &mut Option<&mut mpsc::Receiver<String>>,
+    startup_rx: &mut Option<&mut mpsc::Receiver<InputLine>>,
     startup_lines: &mut Option<&mut StartupLineBuffer>,
 ) {
     let Some(rx) = startup_rx.as_deref_mut() else {
@@ -455,8 +507,9 @@ fn drain_startup_lines(
 
 #[derive(Debug)]
 struct StartupLineBuffer {
-    lines: VecDeque<String>,
+    lines: VecDeque<InputLine>,
     capacity: usize,
+    bytes: usize,
 }
 
 impl StartupLineBuffer {
@@ -464,11 +517,16 @@ impl StartupLineBuffer {
         Self {
             lines: VecDeque::with_capacity(capacity.min(LINE_CHANNEL_CAPACITY)),
             capacity,
+            bytes: 0,
         }
     }
 
-    fn drain(&mut self, rx: &mut mpsc::Receiver<String>) {
-        loop {
+    fn drain(&mut self, rx: &mut mpsc::Receiver<InputLine>) {
+        let started = Instant::now();
+        for _ in 0..BATCH_RECORDS {
+            if started.elapsed() >= BATCH_TIME {
+                break;
+            }
             match rx.try_recv() {
                 Ok(line) => self.push(line),
                 Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
@@ -478,18 +536,23 @@ impl StartupLineBuffer {
         }
     }
 
-    fn push(&mut self, line: String) {
+    fn push(&mut self, line: InputLine) {
         if self.capacity == 0 {
             return;
         }
 
-        while self.lines.len() >= self.capacity {
-            self.lines.pop_front();
+        let bytes = line.text.len() + line.source.as_ref().map_or(0, String::len);
+        while !self.lines.is_empty()
+            && (self.lines.len() >= self.capacity || self.bytes + bytes > 8 * 1024 * 1024)
+        {
+            let removed = self.lines.pop_front().unwrap();
+            self.bytes -= removed.text.len() + removed.source.as_ref().map_or(0, String::len);
         }
+        self.bytes += bytes;
         self.lines.push_back(line);
     }
 
-    fn into_vec(self) -> Vec<String> {
+    fn into_vec(self) -> Vec<InputLine> {
         self.lines.into_iter().collect()
     }
 }
@@ -707,8 +770,14 @@ fn run_probe_with_deadline(
         thread::sleep(Duration::from_millis(10));
     }
 
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    // A successful probe leader can leave descendants holding its pipes open.
+    force_kill_child_group(&mut child);
+    let stdout = stdout
+        .join()
+        .map_err(|_| io::Error::other("probe stdout reader panicked"))??;
+    let stderr = stderr
+        .join()
+        .map_err(|_| io::Error::other("probe stderr reader panicked"))??;
 
     Ok(ProbeRun {
         success,
@@ -718,14 +787,25 @@ fn run_probe_with_deadline(
     })
 }
 
-fn read_pipe_in_thread<R>(mut input: R) -> thread::JoinHandle<Vec<u8>>
+fn read_pipe_in_thread<R>(mut input: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut output = Vec::new();
-        let _ = input.read_to_end(&mut output);
-        output
+        let mut chunk = [0; 8192];
+        loop {
+            match input.read(&mut chunk) {
+                Ok(0) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+                Ok(count) => {
+                    let keep = count.min(MAX_LINE_BYTES.saturating_sub(output.len()));
+                    output.extend_from_slice(&chunk[..keep]);
+                }
+            }
+        }
+        Ok(output)
     })
 }
 
@@ -882,13 +962,13 @@ mod tests {
         }
     }
 
-    fn recv_lines(rx: &mut mpsc::Receiver<String>, count: usize) -> Vec<String> {
+    fn recv_lines(rx: &mut mpsc::Receiver<InputLine>, count: usize) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut lines = Vec::new();
 
         while lines.len() < count && Instant::now() < deadline {
             match rx.try_recv() {
-                Ok(line) => lines.push(line),
+                Ok(line) => lines.push(line.recorded_text()),
                 Err(mpsc::error::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
@@ -915,9 +995,82 @@ mod tests {
 
         read_lines("one\ntwo\n".as_bytes(), tx, LineReaderConfig::default());
 
-        assert_eq!(rx.blocking_recv(), Some("one".to_string()));
-        assert_eq!(rx.blocking_recv(), Some("two".to_string()));
-        assert_eq!(rx.blocking_recv(), None);
+        assert_eq!(rx.blocking_recv().unwrap().text, "one");
+        assert_eq!(rx.blocking_recv().unwrap().text, "two");
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn malformed_lines_are_bounded_and_reader_recovers() {
+        let mut input = vec![b'x'; MAX_LINE_BYTES * 4];
+        input.extend_from_slice(b"\n\xff\nlast\r\n");
+        let mut reader = io::BufReader::with_capacity(17, input.as_slice());
+        let line = bounded_line(&mut reader).unwrap().unwrap();
+        assert!(line.len() < MAX_LINE_BYTES + 100);
+        assert!(line.ends_with("[loggle: line truncated at 65536 bytes]"));
+        assert!(
+            bounded_line(&mut reader)
+                .unwrap()
+                .unwrap()
+                .contains("invalid UTF-8 replaced")
+        );
+        assert_eq!(bounded_line(&mut reader).unwrap().as_deref(), Some("last"));
+        assert!(bounded_line(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_failure_is_reported_as_a_diagnostic() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("fixture read failure"))
+            }
+        }
+        let (tx, mut rx) = mpsc::channel(2);
+        read_lines(Broken, tx, LineReaderConfig::default());
+        assert!(
+            rx.blocking_recv()
+                .unwrap()
+                .text
+                .contains("input read failed: fixture read failure")
+        );
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn startup_drain_yields_before_a_full_channel_is_empty() {
+        let (tx, mut rx) = mpsc::channel(LINE_CHANNEL_CAPACITY);
+        for _ in 0..LINE_CHANNEL_CAPACITY {
+            tx.try_send(InputLine {
+                stream: 1,
+                source: None,
+                text: "line".into(),
+            })
+            .unwrap();
+        }
+        let mut buffer = StartupLineBuffer::new(10);
+        buffer.drain(&mut rx);
+        assert!(rx.len() >= LINE_CHANNEL_CAPACITY - BATCH_RECORDS);
+        assert!(buffer.lines.len() <= 10);
+    }
+
+    #[test]
+    fn physical_readers_have_distinct_identity() {
+        let (tx, mut rx) = mpsc::channel(4);
+        read_lines(
+            b"stdout\n".as_slice(),
+            tx.clone(),
+            LineReaderConfig::with_source("api".into()),
+        );
+        read_lines(
+            b"stderr\n".as_slice(),
+            tx,
+            LineReaderConfig::with_source("api".into()),
+        );
+        let first = rx.blocking_recv().unwrap();
+        let second = rx.blocking_recv().unwrap();
+        assert_ne!(first.stream, second.stream);
+        assert_eq!(first.source, second.source);
     }
 
     #[test]
@@ -930,9 +1083,13 @@ mod tests {
             LineReaderConfig::with_source("api".to_string()),
         );
 
-        assert_eq!(rx.blocking_recv(), Some("[api] one".to_string()));
-        assert_eq!(rx.blocking_recv(), Some("[api] two".to_string()));
-        assert_eq!(rx.blocking_recv(), None);
+        let first = rx.blocking_recv().unwrap();
+        let second = rx.blocking_recv().unwrap();
+        assert_eq!(first.source.as_deref(), Some("api"));
+        assert_eq!(first.text, "one");
+        assert_eq!(second.text, "two");
+        assert_eq!(first.stream, second.stream);
+        assert!(rx.blocking_recv().is_none());
     }
 
     #[test]
@@ -954,7 +1111,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rx.blocking_recv(), Some("[api] cwd-ok".to_string()));
+        assert_eq!(rx.blocking_recv().unwrap().recorded_text(), "[api] cwd-ok");
         assert!(children.pop().unwrap().wait().unwrap().success());
         let _ = fs::remove_dir_all(cwd);
     }
@@ -1067,18 +1224,39 @@ mod tests {
     fn startup_line_buffer_drains_channel_and_keeps_tail() {
         let (tx, mut rx) = mpsc::channel(4);
         for index in 0..4 {
-            tx.try_send(format!("line {index}")).unwrap();
+            tx.try_send(InputLine {
+                stream: 0,
+                source: None,
+                text: format!("line {index}"),
+            })
+            .unwrap();
         }
-        assert!(tx.try_send("would-block".to_string()).is_err());
+        assert!(
+            tx.try_send(InputLine {
+                stream: 0,
+                source: None,
+                text: "would-block".into()
+            })
+            .is_err()
+        );
 
         let mut buffer = StartupLineBuffer::new(2);
         buffer.drain(&mut rx);
 
         assert_eq!(
-            buffer.into_vec(),
+            buffer
+                .into_vec()
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>(),
             vec!["line 2".to_string(), "line 3".to_string()]
         );
-        tx.try_send("line 4".to_string()).unwrap();
+        tx.try_send(InputLine {
+            stream: 0,
+            source: None,
+            text: "line 4".into(),
+        })
+        .unwrap();
     }
 
     #[test]

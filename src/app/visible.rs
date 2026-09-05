@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::{
     buffer::{BufferChange, LogBuffer},
     filter::LogFilter,
@@ -6,7 +8,7 @@ use crate::{
 
 #[derive(Debug, Default)]
 pub(super) struct VisibleLogView {
-    cache: Vec<u64>,
+    cache: VecDeque<u64>,
     selected: usize,
     viewport_start: usize,
     follow: bool,
@@ -257,7 +259,12 @@ impl VisibleLogView {
         }
 
         if let Some(sequence) = change.appended {
-            self.refresh_sequence(sequence, buffer, filters);
+            if buffer
+                .event_by_sequence(sequence)
+                .is_some_and(|event| filters.matches(event))
+            {
+                self.cache.push_back(sequence);
+            }
         }
 
         for sequence in &change.updated {
@@ -296,12 +303,55 @@ impl VisibleLogView {
     }
 
     fn remove_sequence(&mut self, sequence: u64) {
-        if let Some(index) = self
-            .cache
-            .iter()
-            .position(|cached_sequence| *cached_sequence == sequence)
-        {
+        let Some(&first) = self.cache.front() else {
+            return;
+        };
+        if sequence <= first {
+            if sequence == first {
+                self.cache.pop_front();
+            }
+            return;
+        }
+        if let Ok(index) = self.cache.binary_search(&sequence) {
             self.cache.remove(index);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_filter_cache_matches_scan_during_sustained_eviction_and_updates() {
+        let mut buffer = LogBuffer::new(127);
+        let mut view = VisibleLogView::new();
+        let mut filter = LogFilter::default();
+        filter.text = Some("tenant".into());
+        for index in 0..10_000 {
+            let line = match index % 6 {
+                0 => "api | [14:06:58.892] INFO (#1):".into(),
+                1 => "api | {".into(),
+                2 => "api | tenant: \"a\"".into(),
+                3 => "api | }".into(),
+                4 => "api | 14:06:58.892 INFO request".into(),
+                _ => format!("web | INFO tenant {index}"),
+            };
+            let change = buffer.push_line(line);
+            view.on_line_received(&change, &buffer, &filter);
+            let expected: Vec<_> = buffer
+                .events()
+                .iter()
+                .filter(|event| filter.matches(event))
+                .map(|event| event.sequence)
+                .collect();
+            assert_eq!(view.cache.iter().copied().collect::<Vec<_>>(), expected);
+            for (index, sequence) in expected.iter().enumerate() {
+                assert_eq!(
+                    view.event_at(&buffer, &filter, index).unwrap().sequence,
+                    *sequence
+                );
+            }
         }
     }
 }

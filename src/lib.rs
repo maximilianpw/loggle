@@ -5,6 +5,7 @@ mod config;
 mod filter;
 mod model;
 mod page_log;
+mod recording;
 mod runtime;
 mod ui;
 

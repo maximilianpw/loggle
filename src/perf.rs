@@ -1,10 +1,15 @@
-use std::time::{Duration, Instant};
+use std::{
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use ratatui::{Terminal, backend::TestBackend};
 
 use crate::{
     app::{App, PromptKind},
     model::SourceConfig,
+    recording::Recorder,
     ui,
 };
 
@@ -43,6 +48,8 @@ impl BenchFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchConfig {
     pub lines: usize,
+    pub retained_lines: usize,
+    pub record_path: Option<PathBuf>,
     pub filter: BenchFilter,
     pub iterations: usize,
     pub viewport_width: u16,
@@ -53,6 +60,8 @@ impl Default for BenchConfig {
     fn default() -> Self {
         Self {
             lines: 100_000,
+            retained_lines: 10_000,
+            record_path: None,
             filter: BenchFilter::None,
             iterations: 20,
             viewport_width: 120,
@@ -69,23 +78,53 @@ pub struct BenchReport {
     pub retained: usize,
     pub visible: usize,
     pub ingest: Duration,
+    pub max_batch: Duration,
+    pub io_flush: Duration,
     pub filter_apply: Duration,
     pub visible_count: Duration,
     pub viewport_iteration: Duration,
     pub draw: Duration,
 }
 
-pub fn run_benchmark(config: &BenchConfig) -> BenchReport {
-    let started = Instant::now();
-    let mut app = App::with_source_config(config.lines.max(1), SourceConfig::default());
-    for index in 0..config.lines {
-        app.push_line(synthetic_line(index));
-    }
-    let ingest = started.elapsed();
-
+pub fn run_benchmark(config: &BenchConfig) -> io::Result<BenchReport> {
+    let mut app = App::with_source_config(config.retained_lines.max(1), SourceConfig::default());
     let started = Instant::now();
     apply_filter(&mut app, config.filter);
     let filter_apply = started.elapsed();
+
+    let mut recorder = config
+        .record_path
+        .clone()
+        .map(Recorder::create)
+        .transpose()?;
+    let mut terminal = Terminal::new(TestBackend::new(
+        config.viewport_width,
+        config.viewport_height,
+    ))?;
+    let started = Instant::now();
+    let mut max_batch = Duration::ZERO;
+    for start in (0..config.lines).step_by(256) {
+        let batch = Instant::now();
+        for index in start..(start + 256).min(config.lines) {
+            let line = synthetic_line(index);
+            if let Some(recorder) = &mut recorder {
+                recorder.record_line(&line)?;
+            }
+            app.push_line(line);
+        }
+        // Exercise navigation, filtered viewport lookup and rendering while
+        // eviction and recording are active, not just after ingestion stops.
+        app.move_up(1);
+        app.jump_bottom();
+        terminal.draw(|frame| ui::draw(frame, &mut app, true, None, None))?;
+        max_batch = max_batch.max(batch.elapsed());
+    }
+    let ingest = started.elapsed();
+    let started = Instant::now();
+    if let Some(recorder) = &mut recorder {
+        recorder.finish()?;
+    }
+    let io_flush = started.elapsed();
 
     let started = Instant::now();
     let mut visible = 0;
@@ -117,18 +156,20 @@ pub fn run_benchmark(config: &BenchConfig) -> BenchReport {
     }
     let draw = started.elapsed();
 
-    BenchReport {
+    Ok(BenchReport {
         lines: config.lines,
         filter: config.filter,
         iterations: config.iterations,
         retained: app.retained_len(),
         visible,
         ingest,
+        max_batch,
+        io_flush,
         filter_apply,
         visible_count,
         viewport_iteration,
         draw,
-    }
+    })
 }
 
 fn apply_filter(app: &mut App, filter: BenchFilter) {
@@ -181,13 +222,16 @@ mod tests {
     fn benchmark_harness_exercises_filtered_draw_path() {
         let report = run_benchmark(&BenchConfig {
             lines: 256,
+            retained_lines: 64,
+            record_path: None,
             filter: BenchFilter::Property,
             iterations: 2,
             viewport_width: 80,
             viewport_height: 20,
-        });
+        })
+        .unwrap();
 
-        assert_eq!(report.retained, 256);
+        assert_eq!(report.retained, 64);
         assert!(report.visible > 0);
         assert!(report.visible < report.retained);
     }

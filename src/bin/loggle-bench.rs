@@ -1,4 +1,4 @@
-use std::{error::Error, time::Duration};
+use std::{error::Error, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use loggle::perf::{BenchConfig, BenchFilter, BenchReport, run_benchmark};
@@ -12,6 +12,15 @@ use serde::Serialize;
 struct Cli {
     #[arg(long, default_value_t = 100_000)]
     lines: usize,
+
+    #[arg(long, default_value_t = 10_000)]
+    retained_lines: usize,
+
+    #[arg(
+        long,
+        help = "Record through the bounded disk writer (truncates this file)"
+    )]
+    record: Option<PathBuf>,
 
     #[arg(long, default_value = "none", value_parser = parse_filter)]
     filter: BenchFilter,
@@ -38,12 +47,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let config = BenchConfig {
         lines: cli.lines,
+        retained_lines: cli.retained_lines,
+        record_path: cli.record,
         filter: cli.filter,
         iterations: cli.iterations,
         viewport_width: cli.width,
         viewport_height: cli.height,
     };
-    let report = run_benchmark(&config);
+    let report = run_benchmark(&config)?;
 
     if cli.json {
         print_json_report(&report, &config)?;
@@ -61,6 +72,8 @@ fn print_human_report(report: &BenchReport) {
     println!("retained: {}", report.retained);
     println!("visible: {}", report.visible);
     println!("ingest: {}", format_duration(report.ingest));
+    println!("max_batch: {}", format_duration(report.max_batch));
+    println!("io_flush: {}", format_duration(report.io_flush));
     println!("filter_apply: {}", format_duration(report.filter_apply));
     println!("visible_count: {}", format_duration(report.visible_count));
     println!(
@@ -80,6 +93,7 @@ fn print_json_report(report: &BenchReport, config: &BenchConfig) -> Result<(), s
 #[derive(Debug, Serialize)]
 struct JsonBenchReport<'a> {
     lines: usize,
+    recording: bool,
     filter: &'a str,
     iterations: usize,
     viewport_width: u16,
@@ -92,6 +106,8 @@ struct JsonBenchReport<'a> {
 #[derive(Debug, Serialize)]
 struct JsonBenchTimings {
     ingest: u64,
+    max_batch: u64,
+    io_flush: u64,
     filter_apply: u64,
     visible_count: u64,
     viewport_iteration: u64,
@@ -102,6 +118,7 @@ impl<'a> JsonBenchReport<'a> {
     fn from_report(report: &'a BenchReport, config: &BenchConfig) -> Self {
         Self {
             lines: report.lines,
+            recording: config.record_path.is_some(),
             filter: report.filter.as_str(),
             iterations: report.iterations,
             viewport_width: config.viewport_width,
@@ -110,6 +127,8 @@ impl<'a> JsonBenchReport<'a> {
             visible: report.visible,
             timings_us: JsonBenchTimings {
                 ingest: duration_micros(report.ingest),
+                max_batch: duration_micros(report.max_batch),
+                io_flush: duration_micros(report.io_flush),
                 filter_apply: duration_micros(report.filter_apply),
                 visible_count: duration_micros(report.visible_count),
                 viewport_iteration: duration_micros(report.viewport_iteration),

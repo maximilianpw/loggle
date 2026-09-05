@@ -1,6 +1,5 @@
 use std::{
-    fs::File,
-    io::{self, BufWriter, Write},
+    io,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -17,19 +16,20 @@ use tokio::sync::mpsc;
 use crate::{
     app::App,
     model::SourceConfig,
-    page_log::{ActiveLogPageRegistration, LogPageId, PageLogRecorder, claim_active_log_page},
+    page_log::{LogPageId, PageLogRecorder, claim_active_log_page},
+    recording::{Recorder, Sink},
     ui,
 };
 
 use super::{
-    clipboard,
+    InputLine, clipboard,
     input::{self, Child, ChildShutdown, ShutdownSignal, ShutdownStatus},
     keys::{self, KeyOutcome},
 };
 
 pub(super) fn run(
-    mut rx: mpsc::Receiver<String>,
-    startup_lines: Vec<String>,
+    mut rx: mpsc::Receiver<InputLine>,
+    startup_lines: Vec<InputLine>,
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
@@ -164,8 +164,8 @@ impl Drop for TerminalModeGuard {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    rx: &mut mpsc::Receiver<String>,
-    startup_lines: Vec<String>,
+    rx: &mut mpsc::Receiver<InputLine>,
+    startup_lines: Vec<InputLine>,
     buffer_lines: usize,
     color_enabled: bool,
     source_config: SourceConfig,
@@ -178,45 +178,42 @@ fn run_app(
     let mut app = App::with_source_config(buffer_lines, source_config);
     let mut shutdown: Option<Vec<ChildShutdown>> = None;
     let mut dirty = true;
-    let mut recorder = record_path.map(SessionRecorder::create).transpose()?;
+    let mut recorder = record_path.map(Recorder::create).transpose()?;
     // The page log is an auxiliary, always-on feature; failures disable it with
     // a notice rather than tearing down the viewer the user actually asked for.
     let mut page_recorder = None;
     let mut page_id_for_header = None;
-    let mut active_page = None;
     if page_logging {
         match start_page_log(page_id, &page_command, buffer_lines) {
-            Ok((id, recorder, registration)) => {
+            Ok((id, recorder)) => {
                 page_id_for_header = Some(id);
                 page_recorder = Some(recorder);
-                active_page = Some(registration);
             }
             Err(error) => app.set_notice(format!("page log disabled: {error}")),
         }
     }
-    let _active_page = active_page;
-
-    let had_startup_lines = !startup_lines.is_empty();
-    for line in startup_lines {
-        ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
-    }
-    if had_startup_lines {
-        flush_page_recorder(&mut app, &mut page_recorder);
-    }
+    let mut startup_lines = startup_lines.into_iter();
 
     loop {
         let mut received = false;
-        while let Ok(line) = rx.try_recv() {
+        let started = Instant::now();
+        for _ in 0..input::BATCH_RECORDS {
+            if started.elapsed() >= input::BATCH_TIME {
+                break;
+            }
+            let Some(line) = startup_lines.next().or_else(|| rx.try_recv().ok()) else {
+                break;
+            };
             ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
             received = true;
             dirty = true;
         }
 
-        // Flush once per drain instead of per line, so the read command sees
-        // fresh data without a syscall on every ingested line.
-        if received {
-            flush_page_recorder(&mut app, &mut page_recorder);
+        // Disk workers publish errors even after input becomes idle.
+        if let Some(recorder) = &recorder {
+            recorder.check()?;
         }
+        dirty |= check_page_recorder(&mut app, &mut page_recorder);
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
             let mut all_exited = true;
@@ -254,7 +251,13 @@ fn run_app(
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(if received {
+            // crossterm 0.28's use-dev-tty backend never reads the TTY with a
+            // zero timeout (upstream #839), even when keys are waiting.
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(50)
+        })? {
             match event::read()? {
                 Event::Key(key) => {
                     let requested_quit = if shutdown.is_some() {
@@ -308,74 +311,59 @@ fn run_app(
 
 fn ingest_line(
     app: &mut App,
-    recorder: &mut Option<SessionRecorder>,
-    page_recorder: &mut Option<PageLogRecorder>,
-    line: String,
+    recorder: &mut Option<Recorder>,
+    page_recorder: &mut Option<Recorder>,
+    line: InputLine,
 ) -> io::Result<()> {
     if let Some(recorder) = recorder.as_mut() {
-        recorder.record_line(&line)?;
+        recorder.record_line(&line.recorded_text())?;
     }
     if let Some(active_recorder) = page_recorder.as_mut() {
-        if let Err(error) = active_recorder.record_line(&line) {
+        if let Err(error) = active_recorder.record_line(&crate::page_log::encode_input_line(&line))
+        {
             app.set_notice(format!("page log disabled: {error}"));
             *page_recorder = None;
         }
     }
-    app.push_line(line);
+    app.push_source_line(line.stream, line.source, line.text);
     Ok(())
 }
 
-fn flush_page_recorder(app: &mut App, page_recorder: &mut Option<PageLogRecorder>) {
+fn check_page_recorder(app: &mut App, page_recorder: &mut Option<Recorder>) -> bool {
     if let Some(active_recorder) = page_recorder.as_mut() {
-        if let Err(error) = active_recorder.flush() {
+        if let Err(error) = active_recorder.check() {
             app.set_notice(format!("page log disabled: {error}"));
             *page_recorder = None;
+            return true;
         }
     }
-}
-
-struct SessionRecorder {
-    writer: BufWriter<File>,
-}
-
-impl SessionRecorder {
-    fn create(path: PathBuf) -> io::Result<Self> {
-        Ok(Self {
-            writer: BufWriter::new(File::create(path)?),
-        })
-    }
-
-    fn record_line(&mut self, line: &str) -> io::Result<()> {
-        writeln!(self.writer, "{line}")
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
+    false
 }
 
 fn start_page_log(
     page_id: Option<LogPageId>,
     page_command: &str,
     buffer_lines: usize,
-) -> io::Result<(LogPageId, PageLogRecorder, ActiveLogPageRegistration)> {
+) -> io::Result<(LogPageId, Recorder)> {
     let (id, registration) =
         claim_active_log_page(page_id, page_command).map_err(io::Error::other)?;
     let recorder = PageLogRecorder::create(&id, buffer_lines).map_err(io::Error::other)?;
-    Ok((id, recorder, registration))
+    Ok((id, Recorder::start(Sink::Page(recorder, registration))?))
 }
 
 fn flush_recorders(
-    recorder: &mut Option<SessionRecorder>,
-    page_recorder: &mut Option<PageLogRecorder>,
+    recorder: &mut Option<Recorder>,
+    page_recorder: &mut Option<Recorder>,
 ) -> io::Result<()> {
     if let Some(recorder) = recorder.as_mut() {
-        recorder.flush()?;
+        recorder.finish()?;
     }
-    // Best-effort: a failure flushing the auxiliary page log must not fail the
-    // session's clean shutdown.
+    // No UI remains to display a notice at shutdown. Return final page errors
+    // so they are reported after restoring the terminal, not silently lost.
     if let Some(page_recorder) = page_recorder.as_mut() {
-        let _ = page_recorder.flush();
+        page_recorder
+            .finish()
+            .map_err(|error| io::Error::other(format!("page log flush failed: {error}")))?;
     }
     Ok(())
 }
@@ -415,14 +403,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn final_page_flush_error_is_not_silent() {
+        let mut page = Recorder::create(PathBuf::from("/dev/full")).unwrap();
+        page.record_line("failure").unwrap();
+        let error = flush_recorders(&mut None, &mut Some(page)).unwrap_err();
+        assert!(error.to_string().contains("page log flush failed"));
+    }
+
+    #[test]
     fn session_recorder_writes_raw_lines() {
         let path =
             std::env::temp_dir().join(format!("loggle-record-test-{}.log", std::process::id()));
         {
-            let mut recorder = SessionRecorder::create(path.clone()).unwrap();
+            let mut recorder = Recorder::create(path.clone()).unwrap();
             recorder.record_line("api | one").unwrap();
             recorder.record_line("web | two").unwrap();
-            recorder.flush().unwrap();
+            recorder.finish().unwrap();
         }
 
         let output = std::fs::read_to_string(&path).unwrap();

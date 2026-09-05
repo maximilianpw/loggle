@@ -6,6 +6,23 @@ use serde_json::{Map, Value};
 
 pub(crate) use interpret::LogInterpreter;
 
+/// Identity supplied by a physical reader, not inferred from display text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InputLine {
+    pub stream: u64,
+    pub source: Option<String>,
+    pub text: String,
+}
+
+impl InputLine {
+    pub(crate) fn recorded_text(&self) -> String {
+        match &self.source {
+            Some(source) => format!("[{source}] {}", self.text),
+            None => self.text.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Fatal,
@@ -274,7 +291,7 @@ fn parse_bracket_prefixed_line(line: &str) -> Option<ParsedLine> {
     let (source, message) = rest.split_once(']')?;
     let source = source.trim().to_string();
 
-    (!source.is_empty()).then(|| ParsedLine {
+    (!source.is_empty() && !looks_like_timestamp(&source)).then(|| ParsedLine {
         source,
         message: message.trim_start().to_string(),
         source_explicit: true,

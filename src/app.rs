@@ -112,8 +112,15 @@ impl App {
         }
     }
 
+    #[cfg(any(test, feature = "perf-harness"))]
     pub fn push_line(&mut self, line: String) {
         let change = self.buffer.push_line(line);
+        self.apply_buffer_change(change);
+        self.sync_selection();
+    }
+
+    pub(crate) fn push_source_line(&mut self, stream: u64, source: Option<String>, line: String) {
+        let change = self.buffer.push_source_line(stream, source, line);
         self.apply_buffer_change(change);
         self.sync_selection();
     }
@@ -739,6 +746,9 @@ impl App {
     }
 
     fn apply_buffer_change(&mut self, change: BufferChange) {
+        if let Some(notice) = change.notice {
+            self.set_notice(notice.to_string());
+        }
         for sequence in &change.removed {
             self.remove_marker(sequence);
         }

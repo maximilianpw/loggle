@@ -291,7 +291,7 @@ loggle start libre
 
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
 - `--no-color`: disables Loggle's source and severity coloring
-- `--record <PATH>`: writes every raw incoming line to a session log file
+- `--record <PATH>`: records normalized input before filtering (see guarantees below)
 - `--id <ID>` / `-i <ID>`: uses this page ID instead of an auto-generated ID
 - `--no-page-log`: disables the per-session page log used by `loggle log`/`pages`
 - `pages`: lists active Loggle pages with ID, PID, age, and command
@@ -318,13 +318,62 @@ Run synthetic ingestion, filtering, viewport iteration, and draw timings with:
 cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000 --filter text
 ```
 
-`--filter` accepts `none`, `text`, `source`, `level`, or `property`.
+`--filter` accepts `none`, `text`, `source`, `level`, or `property`. It is active
+throughout ingestion. The harness retains 10,000 records by default; use
+`--retained-lines` to vary the eviction window. It navigates and renders every
+256 records, so `ingest` measures sustained ingestion plus those interactions,
+and `max_batch` reports the slowest such batch (not a keyboard latency promise).
+`--record /tmp/loggle-bench.log` exercises the bounded session writer and reports
+its shutdown flush time; it truncates that file and fails explicitly on overload.
+The PTY regression suite additionally exercises concurrent stdout/stderr, live
+filter input, page compaction, quit responsiveness, and process/terminal cleanup.
 
 Add `--json` to emit machine-readable results with timings in microseconds:
 
 ```sh
 cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000 --filter property --json
 ```
+
+## Pipeline limits and recording guarantees
+
+- Input readers retain at most 64 KiB per physical line, discard the remainder
+  through the next newline, and append a truncation marker. Invalid UTF-8 is
+  replaced with U+FFFD and marked; read failures become explicit error records.
+  Readiness probe output retains at most 64 KiB per pipe while draining the rest.
+- The bounded input channel holds 1,024 records and backpressures producers.
+  Startup retains only its configured tail, with an additional 8 MiB text budget.
+  Startup and UI drains yield after 256 records or 4 ms, checked between records.
+- Multiline assembly is keyed by physical stream, named command, and any
+  explicit logical source prefix (including Compose). A block cannot absorb
+  another source's lines or match another source's timestamp/level. Unprefixed
+  lines in a multiplexed stream are **not** assigned to a pending prefixed block:
+  missing upstream identity cannot be recovered. Within one source, timestamp
+  and level matching remains a heuristic, not a request correlation ID.
+- Pending blocks stop at 1,024 lines or 256 KiB. Malformed/abandoned blocks show
+  a notice; their already-consumed body is not expanded back into UI rows.
+  Inference resets at 128 source contexts; completed blocks are capped at 128
+  and BuildKit context at 1,024 steps. Old inferred context can therefore be lost.
+- The live buffer retains at most `--buffer-lines` records and approximately
+  64 MiB of event payload (raw/message/properties plus record overhead), excluding
+  allocator overhead, inference tables, and queues. Filters do not expand retention.
+- Session and page writers each have a 1,024-record / 8 MiB queue. Submission
+  never waits for disk. Queue overload or I/O failure stops `--record` with an
+  error; an auxiliary page writer is disabled with a notice instead. Neither
+  silently drops records and continues claiming a complete recording. Workers
+  flush about every 50 ms. Final flush failures are reported as exit errors
+  after terminal restoration. Clean shutdown drains accepted writes and joins the
+  active workers; this final barrier can wait for slow disk. There is no `fsync`
+  or crash-durability guarantee. Error exits and disabled writers are best-effort.
+- `--record` contains normalized incoming text, before filtering or property
+  folding, with `[NAME]` prefixes for named commands. It is not a byte-exact
+  archive: newline normalization, malformed-input markers, startup-tail eviction,
+  and quitting with unread input can omit or alter original bytes. Capture
+  upstream separately if byte-exact archival is required.
+- Page files use an internal versioned format that retains stream identity;
+  `loggle log` decodes it to text. Compaction atomically replaces the file rather
+  than exposing a partial rewrite. Pages compact at twice the line limit or
+  64 MiB, retaining at most the line limit / 32 MiB tail. A compaction boundary
+  can split a multiline record. Open readers finish against their original inode.
 
 ## Controls
 

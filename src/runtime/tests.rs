@@ -59,6 +59,11 @@ fn pty_repeated_quit_escalates_and_reaps_group() {
     check_lifecycle("escalate", true);
 }
 
+#[test]
+fn pty_flood_remains_interactive_with_filter_eviction_and_recording() {
+    check_lifecycle("flood", true);
+}
+
 fn termios(file: &File) -> libc::termios {
     let mut value = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::tcgetattr(file.as_raw_fd(), &mut value) }, 0);
@@ -87,6 +92,7 @@ fn check_lifecycle(case: &str, with_pty: bool) {
             "--nocapture",
         ])
         .env("LOGGLE_LIFECYCLE_CASE", case)
+        .env("XDG_STATE_HOME", cwd.join("state"))
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -139,9 +145,21 @@ fn check_lifecycle(case: &str, with_pty: bool) {
     let deadline = Instant::now() + Duration::from_secs(12);
     let mut output = String::new();
     let mut quits = 0;
+    let mut flood_started = None;
     let status = loop {
         if let Some((master, _, _)) = &pty {
             drain_pty(master, &mut output);
+            if case == "flood" && output.contains("fixture-ready") {
+                if flood_started.is_none() {
+                    flood_started = Some(Instant::now());
+                    (&*master).write_all(b"/fixture-ready\r").unwrap();
+                } else if quits == 0
+                    && flood_started.unwrap().elapsed() >= Duration::from_millis(750)
+                {
+                    (&*master).write_all(b"kq").unwrap();
+                    quits += 1;
+                }
+            }
             let should_quit = quits == 0 && output.contains("fixture-ready");
             // Ratatui emits a cell diff, not the entire replacement message.
             let should_escalate = case == "escalate"
@@ -189,6 +207,16 @@ fn check_lifecycle(case: &str, with_pty: bool) {
     if case == "escalate" {
         assert_eq!(quits, 3);
     }
+    if case == "flood" {
+        assert_eq!(quits, 1);
+        assert!(flood_started.unwrap().elapsed() < Duration::from_secs(4));
+        let recorded = fs::read_to_string(cwd.join("flood.log")).unwrap();
+        assert!(
+            recorded.lines().count() > 1000,
+            "sustained eviction was exercised"
+        );
+        assert!(!output.contains("page log disabled"));
+    }
     fs::remove_dir_all(cwd).unwrap();
 }
 
@@ -207,6 +235,8 @@ fn lifecycle_fixture() {
     };
     let ending = if case == "exited" {
         "exit 7"
+    } else if case == "flood" {
+        "while :; do echo 'fixture-ready tenantId=load'; echo 'fixture-ready stderr tenantId=load' >&2; done"
     } else {
         "echo fixture-ready; wait"
     };
@@ -269,15 +299,19 @@ fn lifecycle_fixture() {
         color_enabled: false,
         source_config: SourceConfig::default(),
         input,
-        record_path: (case == "record-error").then(|| PathBuf::from("missing/record.log")),
+        record_path: match case.as_str() {
+            "record-error" => Some(PathBuf::from("missing/record.log")),
+            "flood" => Some(PathBuf::from("flood.log")),
+            _ => None,
+        },
         page_id: None,
         page_command: "lifecycle fixture".into(),
-        page_logging: false,
+        page_logging: case == "flood",
     });
     if let Some(saved) = saved_stdout {
         assert_eq!(unsafe { libc::dup2(saved.as_raw_fd(), 1) }, 1);
     }
-    if case == "quit" || case == "escalate" {
+    if case == "quit" || case == "escalate" || case == "flood" {
         result.unwrap();
     } else {
         let RuntimeError::Io(error) = result.unwrap_err() else {

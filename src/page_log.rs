@@ -13,8 +13,28 @@ use serde::{Deserialize, Serialize};
 use crate::{
     buffer::LogBuffer,
     filter::{LogFilter, PropertyFilterUpdate},
-    model::SourceConfig,
+    model::{InputLine, SourceConfig},
 };
+
+pub(crate) fn encode_input_line(line: &InputLine) -> String {
+    format!(
+        "\u{1e}loggle-v1\t{}",
+        serde_json::to_string(line).expect("input line serializes")
+    )
+}
+
+fn decode_input_line(line: String) -> InputLine {
+    if let Some(json) = line.strip_prefix("\u{1e}loggle-v1\t") {
+        if let Ok(input) = serde_json::from_str(json) {
+            return input;
+        }
+    }
+    InputLine {
+        stream: 0,
+        source: None,
+        text: line,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogPageId(String);
@@ -202,6 +222,7 @@ pub(crate) struct PageLogRecorder {
     writer: BufWriter<File>,
     max_lines: usize,
     lines_written: usize,
+    bytes_written: usize,
 }
 
 #[derive(Debug)]
@@ -235,16 +256,23 @@ impl PageLogRecorder {
             writer: BufWriter::new(file),
             max_lines,
             lines_written: 0,
+            bytes_written: 0,
         })
     }
 
     pub(crate) fn record_line(&mut self, line: &str) -> io::Result<()> {
+        if self.max_lines == 0 {
+            return Ok(());
+        }
         writeln!(self.writer, "{line}")?;
         self.lines_written += 1;
+        self.bytes_written += line.len() + 1;
         // Keep the on-disk log bounded to the same window as the in-memory
         // buffer: let it grow to twice the cap, then compact back down so the
         // rewrite cost is amortised across `max_lines` appends.
-        if self.max_lines > 0 && self.lines_written >= self.max_lines.saturating_mul(2) {
+        if self.lines_written >= self.max_lines.saturating_mul(2)
+            || self.bytes_written >= 64 * 1024 * 1024
+        {
             self.compact()?;
         }
         Ok(())
@@ -260,13 +288,25 @@ impl PageLogRecorder {
             let file = File::open(&self.path)?;
             tail_lines(BufReader::new(file), self.max_lines)?
         };
-        let mut file = File::create(&self.path)?;
-        for line in &retained {
-            writeln!(file, "{line}")?;
+        // Readers opening the page see the old complete inode or the new one,
+        // never a truncate-and-rewrite in progress.
+        let temporary = self.path.with_extension("log.compacting");
+        let replacement = (|| {
+            let mut file = BufWriter::new(File::create(&temporary)?);
+            for line in &retained {
+                writeln!(file, "{line}")?;
+            }
+            file.flush()?;
+            fs::rename(&temporary, &self.path)?;
+            Ok::<_, io::Error>(file)
+        })();
+        if replacement.is_err() {
+            let _ = fs::remove_file(&temporary);
         }
-        file.flush()?;
+        let file = replacement?;
         self.lines_written = retained.len();
-        self.writer = BufWriter::new(file);
+        self.bytes_written = retained.iter().map(|line| line.len() + 1).sum();
+        self.writer = file;
         Ok(())
     }
 }
@@ -390,11 +430,18 @@ fn print_log_page_tail_from_path<W: Write>(
     let lines = if options.has_filters() {
         filtered_tail_lines(reader, options, path)?
     } else {
-        tail_lines(reader, options.line_count).map_err(|source| LogPageError::Io {
-            action: "read log page",
-            path: path.to_path_buf(),
-            source,
-        })?
+        tail_lines(reader, options.line_count)
+            .map(|lines| {
+                lines
+                    .into_iter()
+                    .map(|line| decode_input_line(line).recorded_text())
+                    .collect()
+            })
+            .map_err(|source| LogPageError::Io {
+                action: "read log page",
+                path: path.to_path_buf(),
+                source,
+            })?
     };
 
     for line in lines {
@@ -412,11 +459,10 @@ fn filtered_tail_lines<R: BufRead>(
     let mut buffer = LogBuffer::unbounded_with_source_config(options.source_config.clone());
     // Track the raw lines that compose each event so a filtered match emits the
     // whole record — header plus any folded multi-line property block — instead
-    // of just the header line. A line that does not start a new event is a
-    // property-block continuation belonging to the most recently started event.
+    // of just the header line. The assembler supplies the exact owning sequence
+    // for continuations, including when other sources arrive between them.
     let mut groups: Vec<Vec<String>> = Vec::new();
     let mut group_of_sequence: HashMap<u64, usize> = HashMap::new();
-    let mut current_group: Option<usize> = None;
 
     for line in reader.lines() {
         let line = line.map_err(|source| LogPageError::Io {
@@ -424,7 +470,9 @@ fn filtered_tail_lines<R: BufRead>(
             path: path.to_path_buf(),
             source,
         })?;
-        let change = buffer.push_line(line.clone());
+        let input = decode_input_line(line);
+        let line = input.recorded_text();
+        let change = buffer.push_source_line(input.stream, input.source, input.text);
         let removed_group_lines =
             take_removed_group_lines(&groups, &mut group_of_sequence, &change.removed);
         if let Some(sequence) = change.appended {
@@ -433,9 +481,10 @@ fn filtered_tail_lines<R: BufRead>(
             group.push(line);
             groups.push(group);
             group_of_sequence.insert(sequence, index);
-            current_group = Some(index);
-        } else if let Some(index) = current_group {
-            groups[index].push(line);
+        } else if let Some(sequence) = change.consumed_by {
+            if let Some(&index) = group_of_sequence.get(&sequence) {
+                groups[index].push(line);
+            }
         }
     }
 
@@ -506,12 +555,15 @@ fn tail_lines<R: BufRead>(reader: R, line_count: usize) -> io::Result<Vec<String
         return Ok(Vec::new());
     }
 
-    let mut lines = VecDeque::with_capacity(line_count);
+    let mut lines: VecDeque<String> = VecDeque::new();
+    let mut bytes = 0;
     for line in reader.lines() {
-        if lines.len() == line_count {
-            lines.pop_front();
+        let line = line?;
+        bytes += line.len() + 1;
+        while !lines.is_empty() && (lines.len() >= line_count || bytes > 32 * 1024 * 1024) {
+            bytes -= lines.pop_front().unwrap().len() + 1;
         }
-        lines.push_back(line?);
+        lines.push_back(line);
     }
 
     Ok(lines.into_iter().collect())
@@ -942,5 +994,68 @@ mod tests {
 
         assert_eq!(error.to_string(), "log page id 'api' is already active");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_replaces_inode_without_truncating_open_readers() {
+        use std::io::Read;
+        let path = env::temp_dir().join(format!("loggle-atomic-page-{}.log", std::process::id()));
+        let mut recorder = PageLogRecorder::create_at_path(path.clone(), 2).unwrap();
+        for line in ["one", "two", "three"] {
+            recorder.record_line(line).unwrap();
+        }
+        recorder.flush().unwrap();
+        let mut old_reader = File::open(&path).unwrap();
+        recorder.record_line("four").unwrap();
+        let mut old = String::new();
+        old_reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "one\ntwo\nthree\nfour\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "three\nfour\n");
+        assert!(!path.with_extension("log.compacting").exists());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn page_replay_preserves_stream_identity_and_continuation_ownership() {
+        let input = [
+            (1, "14:06:58.892 INFO a"),
+            (2, "14:06:58.892 INFO b"),
+            (1, "[14:06:58.892] INFO (#1):"),
+            (2, "[14:06:58.892] INFO (#1):"),
+            (1, "{"),
+            (2, "{"),
+            (1, "tenant: \"a\""),
+            (2, "tenant: \"b\""),
+            (1, "}"),
+            (2, "}"),
+        ]
+        .into_iter()
+        .map(|(stream, text)| {
+            encode_input_line(&InputLine {
+                stream,
+                source: Some("api".into()),
+                text: text.into(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut options = LogPageTailOptions::new(10);
+        options.property_filters = vec!["tenant=a".into()];
+        let lines = filtered_tail_lines(
+            BufReader::new(input.as_bytes()),
+            &options,
+            Path::new("fixture"),
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "[api] 14:06:58.892 INFO a",
+                "[api] [14:06:58.892] INFO (#1):",
+                "[api] {",
+                "[api] tenant: \"a\"",
+                "[api] }"
+            ]
+        );
     }
 }
