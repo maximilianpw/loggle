@@ -403,6 +403,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn final_page_flush_error_is_not_silent() {
         let mut page = Recorder::create(PathBuf::from("/dev/full")).unwrap();
         page.record_line("failure").unwrap();

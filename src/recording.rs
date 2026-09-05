@@ -206,6 +206,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn disk_error_is_reported_even_after_input_stops() {
         let mut recorder = Recorder::create(PathBuf::from("/dev/full")).unwrap();
         recorder.record_line("failure").unwrap();
