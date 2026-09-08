@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SKILL_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd "$SKILL_DIR/../../.." && pwd)
+ARTIFACTS_DIR="$SKILL_DIR/artifacts"
+FIXTURE="$REPO_ROOT/fixtures/mixed-service-investigation.log"
+BIN="$REPO_ROOT/target/debug/loggle"
+TMP_ROOT=${TMPDIR:-/tmp}
+TMP_ROOT=${TMP_ROOT%/}
+RUNS_ROOT="$TMP_ROOT/loggle-verify"
+LAST_RUN_FILE="$RUNS_ROOT/last-run"
+PANE_WIDTH=200
+PANE_HEIGHT=40
+
+usage() {
+  cat <<'EOF'
+Usage: verify-loggle <command> [args]
+
+  build
+  launch
+  doctor
+  env
+  keys -- <tmux send-keys arguments>
+  capture [path]
+  cli -- <loggle arguments>
+  cleanup
+
+Run identity comes from VERIFY_LOGGLE_RUN, or the last launch on this machine.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+require_tmux() {
+  command -v tmux >/dev/null || die "tmux is required to drive the Loggle TUI"
+}
+
+run_dir() {
+  local run_id=$1
+  printf '%s/%s\n' "$RUNS_ROOT" "$run_id"
+}
+
+run_env_path() {
+  printf '%s/run.env\n' "$(run_dir "$1")"
+}
+
+current_run_id() {
+  if [[ -n "${VERIFY_LOGGLE_RUN:-}" ]]; then
+    printf '%s\n' "$VERIFY_LOGGLE_RUN"
+    return
+  fi
+  [[ -f "$LAST_RUN_FILE" ]] || die "no verification run; launch first"
+  cat "$LAST_RUN_FILE"
+}
+
+load_run() {
+  local path
+  path=$(run_env_path "$(current_run_id)")
+  [[ -f "$path" ]] || die "run env missing: $path"
+  # shellcheck disable=SC1090
+  source "$path"
+  : "${RUN_ID:?}" "${SESSION:?}" "${PAGE_ID:?}" "${STATE_HOME:?}" "${BIN:?}" "${EVIDENCE_DIR:?}"
+}
+
+write_run_env() {
+  local run_id=$1
+  local dir session page_id state_home evidence
+  dir=$(run_dir "$run_id")
+  session="loggle-verify-$run_id"
+  page_id="verify-$run_id"
+  state_home="$dir/state"
+  evidence="$ARTIFACTS_DIR/$run_id"
+  mkdir -p "$dir" "$state_home" "$evidence"
+  cat >"$dir/run.env" <<EOF
+RUN_ID=$(printf '%q' "$run_id")
+SESSION=$(printf '%q' "$session")
+PAGE_ID=$(printf '%q' "$page_id")
+STATE_HOME=$(printf '%q' "$state_home")
+BIN=$(printf '%q' "$BIN")
+REPO_ROOT=$(printf '%q' "$REPO_ROOT")
+EVIDENCE_DIR=$(printf '%q' "$evidence")
+FIXTURE=$(printf '%q' "$FIXTURE")
+EOF
+  printf '%s\n' "$run_id" >"$LAST_RUN_FILE"
+}
+
+session_exists() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+drop_stale_last_run() {
+  local stale path
+  stale=$(cat "$LAST_RUN_FILE")
+  path=$(run_env_path "$stale")
+  if [[ -f "$path" ]]; then
+    # shellcheck disable=SC1090
+    source "$path"
+    if [[ -n "${SESSION:-}" ]] && session_exists "$SESSION"; then
+      tmux kill-session -t "$SESSION" || true
+    fi
+  fi
+}
+
+capture_pane() {
+  tmux capture-pane -t "$SESSION" -p -J
+}
+
+pages_output() {
+  XDG_STATE_HOME="$STATE_HOME" "$BIN" pages
+}
+
+doctor_ok() {
+  load_run
+  require_tmux
+  [[ -x "$BIN" ]] || return 1
+  session_exists "$SESSION" || return 1
+  local pages pane
+  pages=$(pages_output)
+  printf '%s\n' "$pages" | grep -q "^${PAGE_ID}[[:space:]]" || return 1
+  pane=$(capture_pane)
+  printf '%s\n' "$pane" | grep -q ' loggle ' || return 1
+  printf '%s\n' "$pane" | grep -q "id=${PAGE_ID}" || return 1
+  printf '%s\n' "$pane" | grep -q 'retained 12' || return 1
+  return 0
+}
+
+cmd_build() {
+  command -v cargo >/dev/null || die "cargo is required to build loggle"
+  (cd "$REPO_ROOT" && cargo build --locked --bin loggle)
+  [[ -x "$BIN" ]] || die "expected binary at $BIN"
+}
+
+cmd_launch() {
+  require_tmux
+  [[ -f "$FIXTURE" ]] || die "missing fixture: $FIXTURE"
+  [[ -x "$BIN" ]] || cmd_build
+
+  if [[ -z "${VERIFY_LOGGLE_RUN:-}" && -f "$LAST_RUN_FILE" ]]; then
+    if (doctor_ok) >/dev/null 2>&1; then
+      load_run
+      echo "ok reused run_id=$RUN_ID page_id=$PAGE_ID session=$SESSION"
+      return 0
+    fi
+    drop_stale_last_run
+  fi
+
+  local run_id
+  run_id=${VERIFY_LOGGLE_RUN:-$(date +%Y%m%dT%H%M%S)-$$}
+  write_run_env "$run_id"
+  load_run
+
+  if session_exists "$SESSION"; then
+    if doctor_ok; then
+      echo "ok reused run_id=$RUN_ID page_id=$PAGE_ID session=$SESSION"
+      return 0
+    fi
+    tmux kill-session -t "$SESSION"
+  fi
+
+  tmux new-session -d -s "$SESSION" -x "$PANE_WIDTH" -y "$PANE_HEIGHT" \
+    -e "XDG_STATE_HOME=$STATE_HOME" -- \
+    "$BIN" --no-color --id "$PAGE_ID" -- cat "$FIXTURE"
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if doctor_ok; then
+      echo "ok run_id=$RUN_ID page_id=$PAGE_ID session=$SESSION evidence=$EVIDENCE_DIR"
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "error: launch did not become healthy" >&2
+  capture_pane >&2 || true
+  pages_output >&2 || true
+  exit 1
+}
+
+cmd_doctor() {
+  load_run
+  require_tmux
+  [[ -x "$BIN" ]] || die "binary missing: $BIN; run build"
+  session_exists "$SESSION" || die "tmux session missing: $SESSION"
+  local pages pane
+  pages=$(pages_output)
+  printf '%s\n' "$pages" | grep -q "^${PAGE_ID}[[:space:]]" || {
+    echo "$pages" >&2
+    die "page $PAGE_ID is not listed by loggle pages"
+  }
+  pane=$(capture_pane)
+  printf '%s\n' "$pane" | grep -q ' loggle ' || die "pane is missing the loggle header"
+  printf '%s\n' "$pane" | grep -q "id=${PAGE_ID}" || die "pane is missing id=$PAGE_ID"
+  printf '%s\n' "$pane" | grep -q 'retained 12' || die "pane did not retain the 12 fixture events"
+  echo "ok page_id=$PAGE_ID session=$SESSION binary=$BIN"
+  echo "$pages"
+}
+
+cmd_env() {
+  load_run
+  printf 'export VERIFY_LOGGLE_RUN=%q\n' "$RUN_ID"
+  printf 'export PAGE_ID=%q\n' "$PAGE_ID"
+  printf 'export SESSION=%q\n' "$SESSION"
+  printf 'export STATE_HOME=%q\n' "$STATE_HOME"
+  printf 'export XDG_STATE_HOME=%q\n' "$STATE_HOME"
+  printf 'export BIN=%q\n' "$BIN"
+  printf 'export EVIDENCE_DIR=%q\n' "$EVIDENCE_DIR"
+}
+
+cmd_keys() {
+  load_run
+  require_tmux
+  session_exists "$SESSION" || die "tmux session missing: $SESSION"
+  tmux send-keys -t "$SESSION" "$@"
+}
+
+cmd_capture() {
+  load_run
+  require_tmux
+  session_exists "$SESSION" || die "tmux session missing: $SESSION"
+  local path=${1:-}
+  if [[ -z "$path" ]]; then
+    capture_pane
+    return
+  fi
+  if [[ "$path" != /* ]]; then
+    path="$EVIDENCE_DIR/$path"
+  fi
+  mkdir -p "$(dirname "$path")"
+  capture_pane >"$path"
+  echo "$path"
+}
+
+cmd_cli() {
+  load_run
+  XDG_STATE_HOME="$STATE_HOME" "$BIN" "$@"
+}
+
+cmd_cleanup() {
+  if [[ -z "${VERIFY_LOGGLE_RUN:-}" && ! -f "$LAST_RUN_FILE" ]]; then
+    echo "ok nothing to clean"
+    return 0
+  fi
+  load_run
+  require_tmux
+  if session_exists "$SESSION"; then
+    tmux kill-session -t "$SESSION"
+  fi
+  rm -rf "$(run_dir "$RUN_ID")"
+  if [[ -f "$LAST_RUN_FILE" && $(cat "$LAST_RUN_FILE") == "$RUN_ID" ]]; then
+    rm -f "$LAST_RUN_FILE"
+  fi
+  echo "ok cleaned session=$SESSION; evidence kept at $EVIDENCE_DIR"
+}
+
+main() {
+  local cmd=${1:-}
+  [[ -n "$cmd" ]] || { usage; exit 2; }
+  shift || true
+  case "$cmd" in
+    build) cmd_build ;;
+    launch) cmd_launch ;;
+    doctor) cmd_doctor ;;
+    env) cmd_env ;;
+    keys)
+      [[ ${1:-} == -- ]] && shift
+      cmd_keys "$@"
+      ;;
+    capture) cmd_capture "${1:-}" ;;
+    cli)
+      [[ ${1:-} == -- ]] && shift
+      cmd_cli "$@"
+      ;;
+    cleanup) cmd_cleanup ;;
+    -h | --help | help) usage ;;
+    *)
+      usage
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
