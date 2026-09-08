@@ -31,6 +31,7 @@ struct StatusSegment {
 enum HelpVariant {
     Full,
     Compact,
+    Essential,
     None,
 }
 
@@ -90,15 +91,19 @@ fn status_segments(filters: &LogFilter, width: u16) -> Vec<StatusSegment> {
     let help = help_variant(width);
     let (source_limit, level_limit, text_limit, property_limit) = value_limits(width, help);
 
+    let (source_label, level_label, text_label, properties_label) = match help {
+        HelpVariant::Essential => ("s=", "  l=", "  /=", "  p="),
+        _ => ("source=", "  level=", "  search=", "  props="),
+    };
     let mut segments = vec![
         base(" filters "),
-        base("source="),
+        base(source_label),
         value(truncate_tail(source, source_limit)),
-        base("  level="),
+        base(level_label),
         value(truncate_tail(level, level_limit)),
-        base("  search="),
+        base(text_label),
         value(truncate_tail(text, text_limit)),
-        base("  props="),
+        base(properties_label),
         value(truncate_tail(&properties, property_limit)),
     ];
 
@@ -115,13 +120,21 @@ fn line_count_label(count: usize) -> String {
 }
 
 fn value_limits(width: u16, help: HelpVariant) -> (usize, usize, usize, usize) {
+    if help == HelpVariant::Essential {
+        // 23 columns of compact filter labels, 3 before help, 18 of help.
+        let available = (width as usize).saturating_sub(44);
+        let slot = available / 4;
+        let level = slot.min(7);
+        return (slot, level, slot, available - slot * 2 - level);
+    }
     let help_len = match help {
         HelpVariant::Full => 80,
         HelpVariant::Compact => 38,
+        HelpVariant::Essential => 18,
         HelpVariant::None => 0,
     };
     let separator_len = usize::from(help != HelpVariant::None) * 3;
-    let fixed_len = 9 + 7 + 8 + 9 + 8 + separator_len + help_len;
+    let fixed_len = 41 + separator_len + help_len;
     let available = (width as usize).saturating_sub(fixed_len);
 
     if available >= 55 {
@@ -142,6 +155,8 @@ fn help_variant(width: u16) -> HelpVariant {
         HelpVariant::Full
     } else if width >= 80 {
         HelpVariant::Compact
+    } else if width >= 48 {
+        HelpVariant::Essential
     } else {
         HelpVariant::None
     }
@@ -153,6 +168,19 @@ fn append_help(segments: &mut Vec<StatusSegment>, help: HelpVariant) {
         HelpVariant::Compact => {
             append_help_items(segments, status_help_items(CommandHelpLevel::Compact));
         }
+        HelpVariant::Essential => append_help_items(
+            segments,
+            [
+                CommandHelpItem {
+                    shortcut: "q",
+                    label: "quit",
+                },
+                CommandHelpItem {
+                    shortcut: "?",
+                    label: "commands",
+                },
+            ],
+        ),
         HelpVariant::None => {}
     }
 }
@@ -220,6 +248,7 @@ fn property_filters_summary(filters: &LogFilter) -> String {
 mod tests {
     use super::*;
     use crate::{filter::PropertyPredicate, model::Level};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn plain_status(filters: &LogFilter, width: u16) -> String {
         status_segments(filters, width)
@@ -258,11 +287,60 @@ mod tests {
     }
 
     #[test]
-    fn status_omits_help_for_narrow_widths() {
-        let status = plain_status(&LogFilter::default(), 60);
+    fn status_keeps_essential_help_at_narrow_widths() {
+        for width in [72, 60] {
+            let status = plain_status(&LogFilter::default(), width);
 
-        assert!(!status.contains("q quit"));
-        assert!(status.contains("filters source=-"));
+            assert!(status.contains("q quit"), "width {width}: {status}");
+            assert!(status.contains("? commands"), "width {width}: {status}");
+            assert!(status.len() <= width as usize, "width {width}: {status}");
+            assert!(status.contains("filters s=-"));
+        }
+    }
+
+    #[test]
+    fn narrow_status_shortens_long_filters_before_essential_help() {
+        let filters = LogFilter {
+            text: Some("database connection failure in shard six".to_string()),
+            source: Some("very-long-service-name".to_string()),
+            level: Some(Level::Error),
+            property_includes: vec![PropertyPredicate::exact("tenantId", "tenant-1")],
+            property_excludes: Vec::new(),
+        };
+
+        for width in 48..80 {
+            let status = plain_status(&filters, width);
+            assert!(status.contains("q quit"), "width {width}: {status}");
+            assert!(status.contains("? commands"), "width {width}: {status}");
+            assert!(status.len() <= width as usize, "width {width}: {status}");
+            assert!(!status.contains("very-long-service-name"));
+            assert!(!status.contains("database connection failure"));
+        }
+    }
+
+    #[test]
+    fn very_narrow_render_clips_safely_after_essential_help_is_dropped() {
+        let width = 24;
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let spans = status_segments(&LogFilter::default(), width)
+                    .into_iter()
+                    .map(|segment| Span::raw(segment.text))
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(Line::from(spans)), frame.area());
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(rendered.chars().count(), width as usize);
+        assert!(!rendered.contains("q quit"));
     }
 
     #[test]

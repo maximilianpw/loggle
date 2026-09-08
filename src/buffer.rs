@@ -127,10 +127,8 @@ impl LogBuffer {
     }
 
     fn apply_buildkit_source_context(&mut self, line: &str, parsed: &mut ParsedLine) {
-        if parsed.source_explicit {
-            return;
-        }
-
+        // Recognize the anchored BuildKit step before trusting a generic '|'
+        // prefix: a RUN instruction can itself contain shell pipelines.
         let Some(buildkit) = parse_buildkit_step_line(line) else {
             return;
         };
@@ -146,9 +144,13 @@ impl LogBuffer {
 
         if let Some(source) = self.buildkit_steps.get(&buildkit.step_id) {
             parsed.source = source.clone();
-            parsed.message = buildkit.message;
-            parsed.source_explicit = true;
+        } else {
+            // A standalone CACHED/DONE record (or an ambiguous stage header)
+            // proves build activity, not a particular Compose service.
+            parsed.source = "build".to_string();
         }
+        parsed.message = buildkit.message;
+        parsed.source_explicit = true;
     }
 
     fn apply_source_context(&mut self, parsed: &mut ParsedLine) {
@@ -200,10 +202,13 @@ impl LogBuffer {
             return;
         };
 
+        // Pending lines are consumed before any new event can be appended, so
+        // their target is still at the back. Avoid rescanning the entire page
+        // for every block when an agent reconstructs a large retained log.
         if let Some(event) = self
             .events
-            .iter_mut()
-            .find(|event| event.sequence == pending.target_sequence)
+            .back_mut()
+            .filter(|event| event.sequence == pending.target_sequence)
         {
             self.interpreter
                 .apply_properties(event, properties.clone(), &self.source_config);
@@ -239,11 +244,7 @@ impl LogBuffer {
         };
         let target_sequence = event.sequence;
 
-        if let Some(event) = self
-            .events
-            .iter_mut()
-            .find(|event| event.sequence == target_sequence)
-        {
+        if let Some(event) = self.events.back_mut() {
             self.interpreter
                 .apply_properties(event, block.properties, &self.source_config);
             change.updated.push(target_sequence);
@@ -566,6 +567,54 @@ mod tests {
         buffer.events.remove(1);
 
         assert_eq!(buffer.event_by_sequence(2).unwrap().message, "three");
+    }
+
+    #[test]
+    fn unattributed_build_steps_are_grouped_without_guessing_a_service() {
+        let mut buffer = LogBuffer::new(20);
+        for line in [
+            "[api] INFO ready",
+            "#7 CACHED",
+            "#8 [internal] load build definition",
+            "#9 [builder 1/2] RUN compile",
+            "#10 [worker internal] load metadata",
+            "#7 DONE 0.1s",
+            "#10 CACHED",
+            "plain output",
+        ] {
+            buffer.push_line(line.to_string());
+        }
+        assert_eq!(
+            sources(&buffer),
+            vec![
+                "api", "build", "build", "build", "worker", "build", "worker", "unknown"
+            ]
+        );
+        assert_eq!(buffer.events()[1].raw, "#7 CACHED");
+        assert_eq!(buffer.events()[3].message, "#9 [builder 1/2] RUN compile");
+    }
+
+    #[test]
+    fn buildkit_shell_pipelines_do_not_override_step_source() {
+        let mut buffer = LogBuffer::new(10);
+        for line in [
+            "#35 [api stage-0 1/2] RUN printf ready | cat",
+            "#36 [worker internal] load metadata",
+            "#35 CACHED",
+            "#36 DONE 0.1s",
+            "[web] INFO application | message",
+        ] {
+            buffer.push_line(line.into());
+        }
+        assert_eq!(
+            sources(&buffer),
+            vec!["api", "worker", "api", "worker", "web"]
+        );
+        assert_eq!(
+            buffer.events()[0].message,
+            "#35 [stage-0 1/2] RUN printf ready | cat"
+        );
+        assert_eq!(buffer.events()[2].raw, "#35 CACHED");
     }
 
     #[test]

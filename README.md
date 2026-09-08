@@ -181,6 +181,27 @@ loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1
 loggle log -i 1 -n 5 --property requestId
 ```
 
+Discover the actual source names before filtering (container aliases can differ
+from Compose service names):
+
+```sh
+loggle sources -i 1
+loggle sources -i 1 --source-field service,app
+loggle log -i 1 -n 5 --source api --clean
+```
+
+`sources` prints sorted `SOURCE` / `RECORDS` columns for the retained page,
+using the same parsing as the TUI source manager. Counts are parsed events, not
+raw lines or running-process health. An empty page prints only the header;
+a missing page reports an error. Repeat custom `--source-field` settings when
+querying a session that uses them.
+
+`log --clean` strips ANSI escapes and remaining terminal control characters
+from returned lines, converting tabs to spaces without compacting indentation.
+It preserves line boundaries and complete matching records. Matching and stored
+raw evidence are unchanged; omit `--clean` for the existing raw output. This is
+terminal cleanup, **not secret redaction**.
+
 Text filters match the same event fields as TUI search: raw line, parsed
 message, source, and property keys/values. Property filters use the same syntax
 as the TUI property prompt: `key`, `key=value`, `key!=value`, and `!key`. A
@@ -332,6 +353,9 @@ Press `?` to open the in-app command palette:
 
 ![Loggle command palette and help screen](public/help.jpg)
 
+In split panes 48–79 columns wide, the footer keeps `q quit` and `? commands`
+visible by abbreviating filter labels (`s`, `l`, `/`, `p`) and their values.
+
 ### Navigation
 
 - `j` / `k`: move one line down/up
@@ -401,6 +425,11 @@ Loggle treats common local-development output as structured events:
 The `source | message` form matches Docker Compose output. The `[source]
 message` form matches concurrently-style named output, including padded names
 such as `[backend ] message` and colored prefixes.
+
+BuildKit step headers establish a source for later records with the same step ID,
+including `CACHED`/`DONE` lines. Shell pipes inside `RUN` instructions are not
+treated as Compose source separators. Steps without an established service use
+the fallback source `build`; ambiguous stage names are not guessed as services.
 
 If no supported prefix is found, Loggle looks for parsed properties in this
 order: user-provided `--source-field` values, then `source`, `service`, `app`,

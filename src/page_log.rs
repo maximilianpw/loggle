@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     env, fmt, fs,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, Write},
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     buffer::LogBuffer,
     filter::{LogFilter, PropertyFilterUpdate},
-    model::SourceConfig,
+    model::{SourceConfig, clean_display_text},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +150,7 @@ pub struct ActiveLogPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogPageTailOptions {
     pub line_count: usize,
+    pub clean: bool,
     pub source: Option<String>,
     pub text: Option<String>,
     pub property_filters: Vec<String>,
@@ -160,6 +161,7 @@ impl LogPageTailOptions {
     pub fn new(line_count: usize) -> Self {
         Self {
             line_count,
+            clean: false,
             source: None,
             text: None,
             property_filters: Vec::new(),
@@ -195,6 +197,42 @@ pub fn print_log_page_tail_with_options<W: Write>(
 ) -> Result<(), LogPageError> {
     let path = log_page_path(id);
     print_log_page_tail_from_path(id, &path, options, writer)
+}
+
+/// List observed sources in the retained page, not Compose service names.
+pub fn print_log_page_sources<W: Write>(
+    id: &LogPageId,
+    source_config: SourceConfig,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    let path = log_page_path(id);
+    let file = open_log_page(id, &path)?;
+    let sources =
+        source_counts(BufReader::new(file), source_config).map_err(|source| LogPageError::Io {
+            action: "read log page",
+            path,
+            source,
+        })?;
+    writeln!(writer, "SOURCE\tRECORDS").map_err(LogPageError::Output)?;
+    for (source, count) in sources {
+        writeln!(writer, "{source}\t{count}").map_err(LogPageError::Output)?;
+    }
+    Ok(())
+}
+
+fn source_counts<R: BufRead>(
+    reader: R,
+    source_config: SourceConfig,
+) -> io::Result<BTreeMap<String, usize>> {
+    let mut buffer = LogBuffer::unbounded_with_source_config(source_config);
+    for line in reader.lines() {
+        buffer.push_line(line?);
+    }
+    let mut counts = BTreeMap::new();
+    for event in buffer.events() {
+        *counts.entry(event.source.clone()).or_default() += 1;
+    }
+    Ok(counts)
 }
 
 pub(crate) struct PageLogRecorder {
@@ -365,13 +403,8 @@ fn try_register_active_log_page(
     Ok(ActiveLogPageRegistration::new(path))
 }
 
-fn print_log_page_tail_from_path<W: Write>(
-    id: &LogPageId,
-    path: &Path,
-    options: &LogPageTailOptions,
-    writer: &mut W,
-) -> Result<(), LogPageError> {
-    let file = File::open(path).map_err(|source| {
+fn open_log_page(id: &LogPageId, path: &Path) -> Result<File, LogPageError> {
+    File::open(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             LogPageError::MissingPage {
                 id: id.clone(),
@@ -384,8 +417,16 @@ fn print_log_page_tail_from_path<W: Write>(
                 source,
             }
         }
-    })?;
+    })
+}
 
+fn print_log_page_tail_from_path<W: Write>(
+    id: &LogPageId,
+    path: &Path,
+    options: &LogPageTailOptions,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    let file = open_log_page(id, path)?;
     let reader = BufReader::new(file);
     let lines = if options.has_filters() {
         filtered_tail_lines(reader, options, path)?
@@ -398,6 +439,11 @@ fn print_log_page_tail_from_path<W: Write>(
     };
 
     for line in lines {
+        let line = if options.clean {
+            clean_display_text(&line)
+        } else {
+            line
+        };
         writeln!(writer, "{line}").map_err(LogPageError::Output)?;
     }
 
@@ -665,10 +711,92 @@ mod tests {
     }
 
     #[test]
+    fn clean_tail_preserves_whole_records_and_does_not_change_storage_or_matching() {
+        let path = env::temp_dir().join(format!("loggle-clean-test-{}.log", std::process::id()));
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        let colored = fixture
+            .lines()
+            .map(|line| format!("\x1b[31m{line}\x1b[0m\x1b]0;title\x07\n"))
+            .collect::<String>();
+        fs::write(&path, &colored).unwrap();
+        let id = LogPageId::parse("clean-test").unwrap();
+        let mut options = LogPageTailOptions::new(1);
+        options
+            .property_filters
+            .push("requestId=fixture-failed".to_string());
+        for filtered in [true, false] {
+            if !filtered {
+                options.property_filters.clear();
+            }
+            options.clean = false;
+            let mut raw = Vec::new();
+            print_log_page_tail_from_path(&id, &path, &options, &mut raw).unwrap();
+            assert!(raw.contains(&0x1b));
+            options.clean = true;
+            let mut clean = Vec::new();
+            print_log_page_tail_from_path(&id, &path, &options, &mut clean).unwrap();
+            let expected = String::from_utf8(raw)
+                .unwrap()
+                .lines()
+                .map(|line| format!("{}\n", clean_display_text(line)))
+                .collect::<String>();
+            assert_eq!(String::from_utf8(clean.clone()).unwrap(), expected);
+            assert!(!clean.contains(&0x1b));
+            assert_eq!(expected.lines().count(), if filtered { 7 } else { 1 });
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), colored);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn source_discovery_uses_event_counts_and_source_promotion() {
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        let counts =
+            source_counts(BufReader::new(fixture.as_bytes()), SourceConfig::default()).unwrap();
+        let app = {
+            let mut app = crate::app::App::with_source_config(100, SourceConfig::default());
+            for line in fixture.lines() {
+                app.push_line(line.to_string());
+            }
+            app
+        };
+        assert_eq!(
+            counts,
+            app.source_status_rows()
+                .into_iter()
+                .map(|row| (row.source, row.count))
+                .collect()
+        );
+        assert_eq!(counts.values().sum::<usize>(), 12);
+        assert_eq!(counts["api"], 5);
+        let input = "{\"message\":\"ready\",\"unit\":\"custom\"}\nplain\n#7 CACHED\n";
+        let counts = source_counts(
+            BufReader::new(input.as_bytes()),
+            SourceConfig::with_fields(["unit"]),
+        )
+        .unwrap();
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("build".into(), 1),
+                ("custom".into(), 1),
+                ("unknown".into(), 1)
+            ])
+        );
+        assert!(
+            source_counts(BufReader::new(&b""[..]), SourceConfig::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(source_counts(BufReader::new(&b"\xff"[..]), SourceConfig::default()).is_err());
+    }
+
+    #[test]
     fn filtered_tail_lines_matches_source() {
         let input = "api | one\nweb | two\napi | three\n".as_bytes();
         let options = LogPageTailOptions {
             line_count: 2,
+            clean: false,
             source: Some("api".to_string()),
             text: None,
             property_filters: Vec::new(),
@@ -689,6 +817,7 @@ mod tests {
         let input = "api | INFO request tenantId=tenant-1\napi | INFO request tenantId=tenant-2\nweb | INFO request tenantId=tenant-1\n".as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
+            clean: false,
             source: Some("api".to_string()),
             text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
@@ -709,6 +838,7 @@ mod tests {
         let input = "14:06:58.892 INFO request completed\n[14:06:58.892] INFO (#1):\n  {\n    tenantId: \"tenant-1\"\n  }\n".as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
+            clean: false,
             source: None,
             text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
@@ -739,6 +869,7 @@ mod tests {
                 .as_bytes();
         let options = LogPageTailOptions {
             line_count: 2,
+            clean: false,
             source: None,
             text: None,
             property_filters: vec!["tenantId=t1".to_string()],
@@ -763,6 +894,7 @@ mod tests {
             .as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
+            clean: false,
             source: Some("api".to_string()),
             text: Some("database".to_string()),
             property_filters: Vec::new(),
@@ -781,6 +913,7 @@ mod tests {
             .as_bytes();
         let options = LogPageTailOptions {
             line_count: 5,
+            clean: false,
             source: None,
             text: None,
             property_filters: vec!["requestId=abc-123".to_string()],
@@ -809,6 +942,7 @@ mod tests {
         let raw = fixture.lines().collect::<Vec<_>>();
         let mut options = LogPageTailOptions {
             line_count: 100,
+            clean: false,
             source: None,
             text: None,
             property_filters: vec!["requestId=fixture-failed".to_string()],
@@ -849,6 +983,7 @@ mod tests {
     fn vev_compose_fixture_replays_buildkit_and_status_filters() {
         let options = LogPageTailOptions {
             line_count: 10,
+            clean: false,
             source: Some("vev-statistics".to_string()),
             text: Some("npm ci".to_string()),
             property_filters: Vec::new(),
