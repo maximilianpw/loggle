@@ -333,6 +333,11 @@ loggle start libre
 - `start [NAME]`: launches commands from `.loggle.toml` in the current
   directory, or from a named config in the Loggle user config directory
 
+Global options go before the command or subcommand. Every subcommand has its
+own help, e.g. `loggle run --help`. A command whose first word is a subcommand
+name (`run`, `start`, `log`, `pages`, `sources`) runs that subcommand; put it
+after `--` to run it as a command instead.
+
 ## Controls
 
 Press `?` to open the in-app command palette:
