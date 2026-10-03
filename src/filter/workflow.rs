@@ -88,13 +88,9 @@ impl FilterWorkflow {
                     Level::parse(&value)
                 };
             }
-            FilterEdit::IncludeProperty => {
-                if let Some(update) = PropertyFilterUpdate::parse(&value, false) {
-                    self.filters.add_property_filter(update);
-                }
-            }
-            FilterEdit::ExcludeProperty => {
-                if let Some(update) = PropertyFilterUpdate::parse(&value, true) {
+            FilterEdit::IncludeProperty | FilterEdit::ExcludeProperty => {
+                let exclude = edit == FilterEdit::ExcludeProperty;
+                if let Some(update) = PropertyFilterUpdate::parse(&value, exclude) {
                     self.filters.add_property_filter(update);
                 }
             }
