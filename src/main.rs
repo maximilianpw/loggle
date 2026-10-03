@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use loggle::{
     ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
     RuntimeError, RuntimeInput, SourceConfig, active_log_pages, load_named_config,
@@ -20,6 +20,11 @@ const USAGE: &str = "loggle reads newline-delimited logs from stdin or runs comm
     name = "loggle",
     about = "A terminal log viewer for piped Docker Compose-style logs.",
     dont_delimit_trailing_values = true,
+    // `loggle help` must stay a bare command, as it was before subcommands.
+    disable_help_subcommand = true,
+    subcommand_value_name = "SUBCOMMAND",
+    subcommand_help_heading = "Subcommands",
+    override_usage = "loggle [OPTIONS] [--] [COMMAND]...\n       loggle [OPTIONS] <SUBCOMMAND>",
     after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
 )]
 struct Cli {
@@ -50,6 +55,11 @@ struct Cli {
     #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
     source_fields: Vec<String>,
 
+    #[command(subcommand)]
+    subcommand: Option<CliCommand>,
+
+    // A first word matching a subcommand name is routed to the subcommand;
+    // anything after `--` is always the command.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -58,9 +68,62 @@ struct Cli {
     command: Vec<String>,
 }
 
-#[derive(Debug, Parser)]
-#[command(name = "loggle log", about = "Print logs from a tagged Loggle page.")]
-struct LogCli {
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    #[command(flatten)]
+    Runtime(RuntimeCommand),
+
+    #[command(about = "Print logs from a tagged Loggle page.")]
+    Log(LogArgs),
+
+    #[command(about = "List active tagged Loggle pages.")]
+    Pages,
+
+    #[command(
+        about = "List observed source names and record counts in a retained page (not Compose service aliases)."
+    )]
+    Sources(SourcesArgs),
+}
+
+/// Subcommands that open the viewer, as opposed to querying page logs.
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    #[command(
+        about = "Run one or more named commands in one Loggle session.",
+        after_help = "Each command is a --name NAME -- COMMAND... group; output lines are prefixed with [NAME].\n\nExample:\n  loggle run --name api -- pnpm start --name web -- pnpm dev"
+    )]
+    Run(RunArgs),
+
+    #[command(
+        about = "Launch commands from .loggle.toml, or from a named config in the Loggle user config directory."
+    )]
+    Start(StartArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    // clap cannot express repeated `--name NAME -- CMD...` groups, so the raw
+    // words are captured here and split by `parse_runner_commands`.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "--name NAME -- COMMAND",
+        help = "Named command groups to run"
+    )]
+    groups: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct StartArgs {
+    #[arg(
+        value_name = "NAME",
+        help = "Named config to load instead of ./.loggle.toml"
+    )]
+    name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct LogArgs {
     #[arg(short = 'i', long = "id", value_name = "ID")]
     id: LogPageId,
 
@@ -103,16 +166,8 @@ struct LogCli {
     source_fields: Vec<String>,
 }
 
-#[derive(Debug, Parser)]
-#[command(name = "loggle pages", about = "List active tagged Loggle pages.")]
-struct PagesCli {}
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "loggle sources",
-    about = "List observed source names and record counts in a retained page (not Compose service aliases)."
-)]
-struct SourcesCli {
+#[derive(Debug, Args)]
+struct SourcesArgs {
     #[arg(short = 'i', long = "id", value_name = "ID")]
     id: LogPageId,
 
@@ -166,34 +221,22 @@ fn parse_text_filter(input: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
-    if raw_args.first().is_some_and(|arg| arg == "log") {
-        let cli = LogCli::parse_from(
-            std::iter::once("loggle log".to_string()).chain(raw_args.iter().skip(1).cloned()),
-        );
-        return report_command(run_log_command(cli));
-    }
-    if raw_args.first().is_some_and(|arg| arg == "pages") {
-        let cli = PagesCli::parse_from(
-            std::iter::once("loggle pages".to_string()).chain(raw_args.iter().skip(1).cloned()),
-        );
-        return report_command(run_pages_command(cli));
-    }
-    if raw_args.first().is_some_and(|arg| arg == "sources") {
-        let cli = SourcesCli::parse_from(
-            std::iter::once("loggle sources".to_string()).chain(raw_args.iter().skip(1).cloned()),
-        );
-        return report_command(print_log_page_sources(
-            &cli.id,
-            SourceConfig::with_fields(cli.source_fields),
-            &mut io::stdout().lock(),
-        ));
-    }
-
     let cli = Cli::parse();
-    // clap captures the trailing command verbatim (trailing_var_arg), so it is
-    // the single source of truth for what to run — no hand-rolled arg skipping.
-    let resolved_input = match runtime_input_for_command(cli.command) {
+    let runtime_command = match cli.subcommand {
+        Some(CliCommand::Log(args)) => return report_command(run_log_command(args)),
+        Some(CliCommand::Pages) => return report_command(run_pages_command()),
+        Some(CliCommand::Sources(args)) => {
+            return report_command(print_log_page_sources(
+                &args.id,
+                SourceConfig::with_fields(args.source_fields),
+                &mut io::stdout().lock(),
+            ));
+        }
+        Some(CliCommand::Runtime(command)) => Some(command),
+        None => None,
+    };
+
+    let resolved_input = match runtime_input_for_command(runtime_command, cli.command) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("error: {error}");
@@ -230,21 +273,21 @@ fn report_command(result: Result<(), LogPageError>) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn run_log_command(cli: LogCli) -> Result<(), LogPageError> {
+fn run_log_command(args: LogArgs) -> Result<(), LogPageError> {
     let options = LogPageTailOptions {
-        line_count: cli.lines,
-        clean: cli.clean,
-        source: cli.source,
-        text: cli.text,
-        property_filters: cli.property_filters,
-        source_config: SourceConfig::with_fields(cli.source_fields),
+        line_count: args.lines,
+        clean: args.clean,
+        source: args.source,
+        text: args.text,
+        property_filters: args.property_filters,
+        source_config: SourceConfig::with_fields(args.source_fields),
     };
 
     let mut stdout = io::stdout().lock();
-    print_log_page_tail_with_options(&cli.id, &options, &mut stdout)
+    print_log_page_tail_with_options(&args.id, &options, &mut stdout)
 }
 
-fn run_pages_command(_cli: PagesCli) -> Result<(), LogPageError> {
+fn run_pages_command() -> Result<(), LogPageError> {
     let pages = active_log_pages()?;
     let mut stdout = io::stdout().lock();
     if pages.is_empty() {
@@ -336,36 +379,35 @@ impl ResolvedRuntimeInput {
     }
 }
 
-fn runtime_input_for_command(command: Vec<String>) -> Result<ResolvedRuntimeInput, String> {
+fn runtime_input_for_command(
+    runtime_command: Option<RuntimeCommand>,
+    command: Vec<String>,
+) -> Result<ResolvedRuntimeInput, String> {
     let current_dir = std::env::current_dir()
         .map_err(|error| format!("could not read current directory: {error}"))?;
     let config_env = ConfigEnv::from_env();
 
-    runtime_input_for_command_with_context(command, &current_dir, &config_env)
+    runtime_input_for_command_with_context(runtime_command, command, &current_dir, &config_env)
 }
 
 fn runtime_input_for_command_with_context(
+    runtime_command: Option<RuntimeCommand>,
     command: Vec<String>,
     current_dir: &Path,
     config_env: &ConfigEnv,
 ) -> Result<ResolvedRuntimeInput, String> {
-    if command.is_empty() {
-        return Ok(ResolvedRuntimeInput::new(RuntimeInput::Stdin));
-    }
-
-    if command[0] == "run" {
-        return parse_runner_commands(&command[1..])
+    match runtime_command {
+        Some(RuntimeCommand::Run(args)) => parse_runner_commands(&args.groups)
             .map(RuntimeInput::Commands)
-            .map(ResolvedRuntimeInput::new);
+            .map(ResolvedRuntimeInput::new),
+        Some(RuntimeCommand::Start(args)) => {
+            parse_start_command(args.name.as_deref(), current_dir, config_env)
+        }
+        None if command.is_empty() => Ok(ResolvedRuntimeInput::new(RuntimeInput::Stdin)),
+        None => Ok(ResolvedRuntimeInput::new(RuntimeInput::Command(
+            command_for_runtime(command),
+        ))),
     }
-
-    if command[0] == "start" {
-        return parse_start_command(&command[1..], current_dir, config_env);
-    }
-
-    Ok(ResolvedRuntimeInput::new(RuntimeInput::Command(
-        command_for_runtime(command),
-    )))
 }
 
 fn command_for_runtime(command: Vec<String>) -> Vec<String> {
@@ -425,15 +467,11 @@ fn parse_runner_commands(args: &[String]) -> Result<Vec<NamedCommand>, String> {
 }
 
 fn parse_start_command(
-    args: &[String],
+    name: Option<&str>,
     current_dir: &Path,
     config_env: &ConfigEnv,
 ) -> Result<ResolvedRuntimeInput, String> {
-    if args.len() > 1 {
-        return Err("start accepts at most one config name".to_string());
-    }
-
-    let config = if let Some(name) = args.first() {
+    let config = if let Some(name) = name {
         load_named_config(name, config_env)
     } else {
         load_project_config(current_dir)
@@ -449,6 +487,7 @@ fn parse_start_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use loggle::StartCommand;
     use std::collections::BTreeMap;
     use std::fs;
@@ -465,8 +504,55 @@ mod tests {
         }
     }
 
-    fn runtime_input(command: Vec<String>) -> RuntimeInput {
-        runtime_input_for_command(command).unwrap().input
+    fn try_parse_cli(raw_args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("loggle").chain(raw_args.iter().copied()))
+    }
+
+    fn parse_cli(raw_args: &[&str]) -> Cli {
+        try_parse_cli(raw_args).unwrap()
+    }
+
+    fn runtime_command(subcommand: Option<CliCommand>) -> Option<RuntimeCommand> {
+        match subcommand {
+            None => None,
+            Some(CliCommand::Runtime(command)) => Some(command),
+            Some(other) => panic!("expected a runtime subcommand, got {other:?}"),
+        }
+    }
+
+    fn resolve_with_context(
+        raw_args: &[&str],
+        current_dir: &Path,
+        config_env: &ConfigEnv,
+    ) -> Result<ResolvedRuntimeInput, String> {
+        let cli = parse_cli(raw_args);
+        runtime_input_for_command_with_context(
+            runtime_command(cli.subcommand),
+            cli.command,
+            current_dir,
+            config_env,
+        )
+    }
+
+    fn resolve(raw_args: &[&str]) -> Result<ResolvedRuntimeInput, String> {
+        let cli = parse_cli(raw_args);
+        runtime_input_for_command(runtime_command(cli.subcommand), cli.command)
+    }
+
+    fn runtime_input(raw_args: &[&str]) -> RuntimeInput {
+        resolve(raw_args).unwrap().input
+    }
+
+    fn log_args(raw_args: &[&str]) -> LogArgs {
+        match parse_cli(raw_args).subcommand {
+            Some(CliCommand::Log(args)) => args,
+            other => panic!("expected log subcommand, got {other:?}"),
+        }
+    }
+
+    fn assert_help(raw_args: &[&str]) {
+        let error = try_parse_cli(raw_args).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp, "{raw_args:?}");
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -495,9 +581,15 @@ api = ["pnpm", "start"]
     }
 
     #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
     fn dc_expands_to_docker_compose_up() {
         assert_eq!(
-            runtime_input(command(&["dc"])),
+            runtime_input(&["dc"]),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
@@ -505,7 +597,7 @@ api = ["pnpm", "start"]
     #[test]
     fn dc_with_arguments_is_not_a_compose_shortcut() {
         assert_eq!(
-            runtime_input(command(&["dc", "logs", "-f"])),
+            runtime_input(&["dc", "logs", "-f"]),
             RuntimeInput::Command(command(&["dc", "logs", "-f"]))
         );
     }
@@ -513,14 +605,14 @@ api = ["pnpm", "start"]
     #[test]
     fn ordinary_commands_are_unchanged() {
         assert_eq!(
-            runtime_input(command(&["docker", "compose", "logs", "-f"])),
+            runtime_input(&["docker", "compose", "logs", "-f"]),
             RuntimeInput::Command(command(&["docker", "compose", "logs", "-f"]))
         );
     }
 
     #[test]
     fn empty_command_reads_from_stdin() {
-        assert_eq!(runtime_input(Vec::new()), RuntimeInput::Stdin);
+        assert_eq!(runtime_input(&[]), RuntimeInput::Stdin);
     }
 
     #[test]
@@ -531,19 +623,13 @@ api = ["pnpm", "start"]
         );
     }
 
-    fn parse_cli(raw_args: &[String]) -> Cli {
-        Cli::try_parse_from(std::iter::once("loggle".to_string()).chain(raw_args.iter().cloned()))
-            .unwrap()
-    }
-
     #[test]
     fn runner_cli_parses_two_named_commands() {
-        let cli = parse_cli(&command(&[
-            "run", "--name", "api", "--", "pnpm", "start", "--name", "web", "--", "pnpm", "dev",
-        ]));
-
         assert_eq!(
-            runtime_input(cli.command),
+            runtime_input(&[
+                "run", "--name", "api", "--", "pnpm", "start", "--name", "web", "--", "pnpm",
+                "dev",
+            ]),
             RuntimeInput::Commands(vec![
                 named_command("api", &["pnpm", "start"]),
                 named_command("web", &["pnpm", "dev"]),
@@ -552,68 +638,128 @@ api = ["pnpm", "start"]
     }
 
     #[test]
-    fn runner_cli_preserves_command_arguments_after_top_level_separator() {
-        let cli = parse_cli(&command(&["--", "docker", "compose", "up", "--watch"]));
-
+    fn runner_cli_keeps_hyphenated_command_arguments() {
         assert_eq!(
-            runtime_input(cli.command),
+            runtime_input(&["run", "--name", "api", "--", "pnpm", "--help", "-x"]),
+            RuntimeInput::Commands(vec![named_command("api", &["pnpm", "--help", "-x"])])
+        );
+    }
+
+    #[test]
+    fn runner_cli_preserves_command_arguments_after_top_level_separator() {
+        assert_eq!(
+            runtime_input(&["--", "docker", "compose", "up", "--watch"]),
             RuntimeInput::Command(command(&["docker", "compose", "up", "--watch"]))
         );
     }
 
     #[test]
     fn record_option_does_not_consume_runtime_command() {
-        let cli = parse_cli(&command(&[
-            "--record",
-            "session.log",
-            "docker",
-            "compose",
-            "up",
-        ]));
-
         assert_eq!(
-            runtime_input(cli.command),
+            runtime_input(&["--record", "session.log", "docker", "compose", "up"]),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
 
     #[test]
     fn page_id_option_does_not_consume_runtime_command() {
-        let cli = parse_cli(&command(&["--id", "1", "docker", "compose", "up"]));
+        let cli = parse_cli(&["--id", "1", "docker", "compose", "up"]);
 
         assert_eq!(cli.page_id.as_ref().unwrap().as_str(), "1");
         assert_eq!(
-            runtime_input(cli.command),
+            runtime_input(&["--id", "1", "docker", "compose", "up"]),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
 
     #[test]
     fn short_page_id_option_does_not_consume_runtime_command() {
-        let cli = parse_cli(&command(&["-i", "1", "docker", "compose", "up"]));
+        let cli = parse_cli(&["-i", "1", "docker", "compose", "up"]);
 
         assert_eq!(cli.page_id.as_ref().unwrap().as_str(), "1");
         assert_eq!(
-            runtime_input(cli.command),
+            runtime_input(&["-i", "1", "docker", "compose", "up"]),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
 
     #[test]
     fn no_page_log_flag_does_not_consume_runtime_command() {
-        let cli = parse_cli(&command(&["--no-page-log", "docker", "compose", "up"]));
+        let cli = parse_cli(&["--no-page-log", "docker", "compose", "up"]);
 
         assert!(cli.no_page_log);
         assert_eq!(
-            runtime_input(cli.command),
+            runtime_input(&["--no-page-log", "docker", "compose", "up"]),
             RuntimeInput::Command(command(&["docker", "compose", "up"]))
         );
     }
 
     #[test]
+    fn global_flags_parse_before_a_subcommand() {
+        let cli = parse_cli(&[
+            "--id",
+            "api",
+            "--no-color",
+            "--record",
+            "session.log",
+            "--buffer-lines",
+            "500",
+            "--source-field",
+            "service",
+            "--no-page-log",
+            "start",
+            "libre",
+        ]);
+
+        assert_eq!(cli.page_id.as_ref().unwrap().as_str(), "api");
+        assert!(cli.no_color);
+        assert!(cli.no_page_log);
+        assert_eq!(cli.buffer_lines, 500);
+        assert_eq!(cli.record, Some(std::path::PathBuf::from("session.log")));
+        assert_eq!(cli.source_fields, command(&["service"]));
+        assert!(cli.command.is_empty());
+        let Some(CliCommand::Runtime(RuntimeCommand::Start(args))) = cli.subcommand else {
+            panic!("expected start subcommand");
+        };
+        assert_eq!(args.name.as_deref(), Some("libre"));
+
+        assert_eq!(
+            runtime_input(&["-i", "api", "run", "--name", "api", "--", "pnpm", "start"]),
+            RuntimeInput::Commands(vec![named_command("api", &["pnpm", "start"])])
+        );
+    }
+
+    #[test]
+    fn page_id_with_separator_runs_command() {
+        let cli = parse_cli(&["--id", "api", "--", "docker", "compose", "up"]);
+
+        assert_eq!(cli.page_id.as_ref().unwrap().as_str(), "api");
+        assert!(cli.subcommand.is_none());
+        assert_eq!(cli.command, command(&["docker", "compose", "up"]));
+    }
+
+    #[test]
+    fn subcommands_have_help() {
+        assert_help(&["--help"]);
+        assert_help(&["run", "--help"]);
+        assert_help(&["start", "--help"]);
+        assert_help(&["log", "--help"]);
+        assert_help(&["pages", "--help"]);
+        assert_help(&["sources", "--help"]);
+    }
+
+    #[test]
+    fn help_word_is_a_bare_command() {
+        assert_eq!(
+            runtime_input(&["help", "me"]),
+            RuntimeInput::Command(command(&["help", "me"]))
+        );
+    }
+
+    #[test]
     fn log_command_cli_parses_tail_request() {
-        let cli = LogCli::try_parse_from(command(&[
-            "loggle log",
+        let args = log_args(&[
+            "log",
             "-i",
             "1",
             "-n",
@@ -627,45 +773,39 @@ api = ["pnpm", "start"]
             "--source-field",
             "service",
             "--clean",
-        ]))
-        .unwrap();
+        ]);
 
-        assert!(cli.clean);
-        assert_eq!(cli.id.as_str(), "1");
-        assert_eq!(cli.lines, 5);
-        assert_eq!(cli.source.as_deref(), Some("api"));
-        assert_eq!(cli.text.as_deref(), Some("database"));
-        assert_eq!(cli.property_filters, command(&["tenantId=tenant-1"]));
-        assert_eq!(cli.source_fields, command(&["service"]));
+        assert!(args.clean);
+        assert_eq!(args.id.as_str(), "1");
+        assert_eq!(args.lines, 5);
+        assert_eq!(args.source.as_deref(), Some("api"));
+        assert_eq!(args.text.as_deref(), Some("database"));
+        assert_eq!(args.property_filters, command(&["tenantId=tenant-1"]));
+        assert_eq!(args.source_fields, command(&["service"]));
     }
 
     #[test]
     fn pages_command_cli_parses() {
-        PagesCli::try_parse_from(command(&["loggle pages"])).unwrap();
+        assert!(matches!(
+            parse_cli(&["pages"]).subcommand,
+            Some(CliCommand::Pages)
+        ));
     }
 
     #[test]
     fn source_discovery_requires_page_and_supports_custom_source_fields() {
-        assert!(SourcesCli::try_parse_from(["loggle sources"]).is_err());
-        let cli = SourcesCli::try_parse_from([
-            "loggle sources",
-            "-i",
-            "vev",
-            "--source-field",
-            "unit,logger",
-        ])
-        .unwrap();
-        assert_eq!(cli.id.as_str(), "vev");
-        assert_eq!(cli.source_fields, command(&["unit", "logger"]));
-        assert!(
-            !LogCli::try_parse_from(["loggle log", "-i", "vev"])
-                .unwrap()
-                .clean
-        );
-        assert_eq!(
-            parse_cli(&command(&["--", "sources", "--help"])).command,
-            command(&["sources", "--help"])
-        );
+        assert!(try_parse_cli(&["sources"]).is_err());
+        let Some(CliCommand::Sources(args)) =
+            parse_cli(&["sources", "-i", "vev", "--source-field", "unit,logger"]).subcommand
+        else {
+            panic!("expected sources subcommand");
+        };
+        assert_eq!(args.id.as_str(), "vev");
+        assert_eq!(args.source_fields, command(&["unit", "logger"]));
+        assert!(!log_args(&["log", "-i", "vev"]).clean);
+        let cli = parse_cli(&["--", "sources", "--help"]);
+        assert!(cli.subcommand.is_none());
+        assert_eq!(cli.command, command(&["sources", "--help"]));
     }
 
     #[test]
@@ -694,9 +834,17 @@ api = ["pnpm", "start"]
     }
 
     #[test]
+    fn runner_rejects_no_commands() {
+        assert_eq!(
+            resolve(&["run"]).unwrap_err(),
+            "runner mode requires at least one --name <name> -- <command>"
+        );
+    }
+
+    #[test]
     fn runner_rejects_missing_name() {
         assert_eq!(
-            runtime_input_for_command(command(&["run", "api", "--", "pnpm", "start"])).unwrap_err(),
+            resolve(&["run", "api", "--", "pnpm", "start"]).unwrap_err(),
             "runner commands must start with --name <name> -- <command>"
         );
     }
@@ -704,7 +852,7 @@ api = ["pnpm", "start"]
     #[test]
     fn runner_rejects_empty_command() {
         assert_eq!(
-            runtime_input_for_command(command(&["run", "--name", "api", "--"])).unwrap_err(),
+            resolve(&["run", "--name", "api", "--"]).unwrap_err(),
             "runner command 'api' is empty"
         );
     }
@@ -712,8 +860,7 @@ api = ["pnpm", "start"]
     #[test]
     fn runner_rejects_missing_command_separator() {
         assert_eq!(
-            runtime_input_for_command(command(&["run", "--name", "api", "pnpm", "start"]))
-                .unwrap_err(),
+            resolve(&["run", "--name", "api", "pnpm", "start"]).unwrap_err(),
             "runner command 'api' must include -- before the command"
         );
     }
@@ -725,8 +872,8 @@ api = ["pnpm", "start"]
         fs::create_dir_all(&root).unwrap();
         write_config(&project_dir.join(".loggle.toml"), &root);
 
-        let resolved = runtime_input_for_command_with_context(
-            command(&["start"]),
+        let resolved = resolve_with_context(
+            &["start"],
             &project_dir,
             &ConfigEnv {
                 xdg_config_home: None,
@@ -753,8 +900,8 @@ api = ["pnpm", "start"]
     #[test]
     fn start_without_name_reports_missing_project_config() {
         let project_dir = temp_dir("missing-project");
-        let error = runtime_input_for_command_with_context(
-            command(&["start"]),
+        let error = resolve_with_context(
+            &["start"],
             &project_dir,
             &ConfigEnv {
                 xdg_config_home: None,
@@ -777,8 +924,8 @@ api = ["pnpm", "start"]
         fs::create_dir_all(&root).unwrap();
         write_config(&config_dir.join("libre.toml"), &root);
 
-        let resolved = runtime_input_for_command_with_context(
-            command(&["start", "libre"]),
+        let resolved = resolve_with_context(
+            &["start", "libre"],
             &home,
             &ConfigEnv {
                 xdg_config_home: None,
@@ -803,17 +950,7 @@ api = ["pnpm", "start"]
 
     #[test]
     fn start_rejects_extra_args() {
-        assert_eq!(
-            runtime_input_for_command_with_context(
-                command(&["start", "libre", "extra"]),
-                Path::new("/tmp"),
-                &ConfigEnv {
-                    xdg_config_home: None,
-                    home: Some(std::path::PathBuf::from("/tmp")),
-                },
-            )
-            .unwrap_err(),
-            "start accepts at most one config name"
-        );
+        let error = try_parse_cli(&["start", "libre", "extra"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 }
