@@ -1,3 +1,4 @@
+mod dialogs;
 mod list_state;
 mod visible;
 
@@ -15,8 +16,10 @@ use crate::filter::{
 };
 use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
 
-use list_state::SearchableListState;
+use dialogs::Dialogs;
 use visible::VisibleLogView;
+
+const DEFAULT_EXPORT_PATH: &str = "loggle-export.log";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -71,16 +74,12 @@ pub struct App {
     mode: Mode,
     notice: Option<String>,
     prompt: String,
-    palette: SearchableListState,
+    dialogs: Dialogs,
     pending_g: bool,
     details_open: bool,
     selected_property: usize,
-    property_filters: SearchableListState,
     editing_property_filter: Option<PropertyFilterId>,
     message_field_keys: Vec<String>,
-    message_fields: SearchableListState,
-    filter_preset_list: SearchableListState,
-    sources: SearchableListState,
 }
 
 impl App {
@@ -99,16 +98,12 @@ impl App {
             mode: Mode::Normal,
             notice: None,
             prompt: String::new(),
-            palette: SearchableListState::default(),
+            dialogs: Dialogs::default(),
             pending_g: false,
             details_open: false,
             selected_property: 0,
-            property_filters: SearchableListState::default(),
             editing_property_filter: None,
             message_field_keys: Vec::new(),
-            message_fields: SearchableListState::default(),
-            filter_preset_list: SearchableListState::default(),
-            sources: SearchableListState::default(),
         }
     }
 
@@ -167,7 +162,7 @@ impl App {
     }
 
     pub fn palette_selected(&self) -> usize {
-        self.palette.selected()
+        self.dialogs.palette_selected()
     }
 
     pub fn palette_commands(&self) -> &'static [Command] {
@@ -175,25 +170,25 @@ impl App {
     }
 
     pub fn selected_palette_command(&self) -> Option<&'static Command> {
-        self.palette_commands().get(self.palette.selected())
+        self.palette_commands().get(self.dialogs.palette_selected())
     }
 
     pub fn dialog_query(&self, kind: DialogKind) -> &str {
-        self.dialog_state(kind).query()
+        self.dialogs.query(kind)
     }
 
     pub fn selected_dialog_index(&self, kind: DialogKind) -> usize {
-        self.dialog_state(kind).selected()
+        self.dialogs.selected(kind)
     }
 
     pub fn property_filter_rows(&self) -> Vec<PropertyFilterRow> {
-        let query = self.property_filters.query().trim();
+        let query = self.dialogs.query(DialogKind::PropertyFilters).trim();
         self.filter_workflow.property_filter_rows(query)
     }
 
     pub fn selected_property_filter_row(&self) -> Option<PropertyFilterRow> {
         self.property_filter_rows()
-            .get(self.property_filters.selected())
+            .get(self.selected_dialog_index(DialogKind::PropertyFilters))
             .cloned()
     }
 
@@ -202,7 +197,7 @@ impl App {
     }
 
     pub fn message_field_rows(&self) -> Vec<&str> {
-        let query = self.message_fields.query().trim();
+        let query = self.dialogs.query(DialogKind::MessageFields).trim();
         self.message_field_keys
             .iter()
             .map(String::as_str)
@@ -212,23 +207,23 @@ impl App {
 
     pub fn selected_message_field_key(&self) -> Option<&str> {
         self.message_field_rows()
-            .get(self.message_fields.selected())
+            .get(self.selected_dialog_index(DialogKind::MessageFields))
             .copied()
     }
 
     pub fn filter_preset_rows(&self) -> Vec<FilterPresetRow> {
-        let query = self.filter_preset_list.query().trim();
+        let query = self.dialogs.query(DialogKind::FilterPresets).trim();
         self.filter_workflow.filter_preset_rows(query)
     }
 
     pub fn selected_filter_preset_row(&self) -> Option<FilterPresetRow> {
         self.filter_preset_rows()
-            .get(self.filter_preset_list.selected())
+            .get(self.selected_dialog_index(DialogKind::FilterPresets))
             .cloned()
     }
 
     pub fn source_status_rows(&self) -> Vec<SourceStatusRow> {
-        let query = self.sources.query().trim();
+        let query = self.dialogs.query(DialogKind::Sources).trim();
         self.source_status_rows_for_query(query)
     }
 
@@ -363,44 +358,37 @@ impl App {
     pub fn move_down(&mut self, amount: usize) {
         self.visible
             .move_down(&self.buffer, self.filter_workflow.filters(), amount);
-        self.pending_g = false;
         self.sync_selected_property();
     }
 
     pub fn move_up(&mut self, amount: usize) {
         self.visible.move_up(amount);
-        self.pending_g = false;
         self.sync_selected_property();
     }
 
     pub fn jump_top(&mut self) {
         self.visible.jump_top();
-        self.pending_g = false;
         self.sync_selected_property();
     }
 
     pub fn move_to_last_visible(&mut self) {
         self.visible
             .move_to_last_visible(&self.buffer, self.filter_workflow.filters());
-        self.pending_g = false;
         self.sync_selected_property();
     }
 
     pub fn jump_bottom(&mut self) {
         self.visible
             .jump_bottom(&self.buffer, self.filter_workflow.filters());
-        self.pending_g = false;
         self.sync_selection();
     }
 
     pub fn toggle_follow(&mut self) {
-        self.pending_g = false;
         self.visible
             .toggle_follow(&self.buffer, self.filter_workflow.filters());
     }
 
     pub fn start_prompt(&mut self, kind: PromptKind) {
-        self.pending_g = false;
         let property = self.selected_property().cloned();
         self.prompt = self
             .filter_workflow
@@ -415,7 +403,7 @@ impl App {
             return;
         };
         let Some(predicate) = self.filter_workflow.property_filter(row.id) else {
-            self.sync_property_filter_selection();
+            self.sync_dialog_selection(DialogKind::PropertyFilters);
             return;
         };
 
@@ -423,20 +411,17 @@ impl App {
         self.editing_property_filter = Some(row.id);
         self.visual_anchor = None;
         self.mode = Mode::Prompt(PromptKind::EditPropertyFilter);
-        self.pending_g = false;
     }
 
     pub fn open_palette(&mut self) {
         self.mode = Mode::Palette;
         self.prompt.clear();
-        self.pending_g = false;
         self.visual_anchor = None;
         self.sync_palette_selection();
     }
 
     pub fn close_palette(&mut self) {
         self.mode = Mode::Normal;
-        self.pending_g = false;
     }
 
     pub fn toggle_palette(&mut self) {
@@ -448,18 +433,17 @@ impl App {
     }
 
     pub fn move_palette_down(&mut self, amount: usize) {
-        self.palette
-            .move_down(amount, self.palette_commands().len());
+        self.dialogs
+            .move_palette_down(amount, self.palette_commands().len());
     }
 
     pub fn move_palette_up(&mut self, amount: usize) {
-        self.palette.move_up(amount);
+        self.dialogs.move_palette_up(amount);
     }
 
     pub fn open_dialog(&mut self, kind: DialogKind) {
         self.mode = Mode::Dialog(kind);
         self.prompt.clear();
-        self.pending_g = false;
         self.visual_anchor = None;
         if kind == DialogKind::PropertyFilters {
             self.editing_property_filter = None;
@@ -469,30 +453,28 @@ impl App {
 
     pub fn close_dialog(&mut self) {
         self.mode = Mode::Normal;
-        self.pending_g = false;
     }
 
     pub fn move_dialog_down(&mut self, kind: DialogKind, amount: usize) {
-        let len = self.dialog_len(kind);
-        self.dialog_state_mut(kind).move_down(amount, len);
+        let len = dialogs::dialog_len(self, kind);
+        self.dialogs.move_down(kind, amount, len);
     }
 
     pub fn move_dialog_up(&mut self, kind: DialogKind, amount: usize) {
-        self.dialog_state_mut(kind).move_up(amount);
+        self.dialogs.move_up(kind, amount);
     }
 
     pub fn push_dialog_query_char(&mut self, kind: DialogKind, value: char) {
-        let len = self.dialog_len_after_query_push(kind, value);
-        self.dialog_state_mut(kind).push_query_char(value, len);
+        let len = dialogs::dialog_len_after_query_push(self, kind, value);
+        self.dialogs.push_query_char(kind, value, len);
     }
 
     pub fn pop_dialog_query_char(&mut self, kind: DialogKind) {
-        let len = self.dialog_len_after_query_pop(kind);
-        self.dialog_state_mut(kind).pop_query_char(len);
+        let len = dialogs::dialog_len_after_query_pop(self, kind);
+        self.dialogs.pop_query_char(kind, len);
     }
 
     pub fn add_selected_message_field(&mut self) {
-        self.pending_g = false;
         let Some(key) = self
             .selected_property()
             .map(|property| property.key.clone())
@@ -507,7 +489,7 @@ impl App {
         {
             self.message_field_keys.push(key);
         }
-        self.sync_message_field_selection();
+        self.sync_dialog_selection(DialogKind::MessageFields);
     }
 
     pub fn activate_selected_dialog_row(&mut self, kind: DialogKind) {
@@ -543,11 +525,11 @@ impl App {
             Mode::Normal
         };
         self.prompt.clear();
-        self.pending_g = false;
         self.editing_property_filter = None;
     }
 
-    pub fn clear_transient(&mut self) {
+    /// Forget a half-typed `gg` chord. Key handling calls this for every key except `g`.
+    pub fn clear_pending_g(&mut self) {
         self.pending_g = false;
     }
 
@@ -557,11 +539,9 @@ impl App {
             .start_visual_selection(&self.buffer, self.filter_workflow.filters())
         else {
             self.visual_anchor = None;
-            self.pending_g = false;
             return;
         };
 
-        self.pending_g = false;
         self.visual_anchor = Some(anchor);
         self.mode = Mode::Visual;
     }
@@ -569,7 +549,6 @@ impl App {
     pub fn cancel_visual_selection(&mut self) {
         self.mode = Mode::Normal;
         self.visual_anchor = None;
-        self.pending_g = false;
     }
 
     pub fn yank_selected_line(&self) -> Option<YankedLines> {
@@ -605,25 +584,22 @@ impl App {
         };
         self.prompt.clear();
         self.editing_property_filter = None;
-        self.sync_property_filter_selection();
+        self.sync_dialog_selection(DialogKind::PropertyFilters);
         self.sync_selection();
     }
 
     pub fn clear_filters(&mut self) {
         self.filter_workflow.clear();
         self.sync_visible_cache();
-        self.pending_g = false;
         self.sync_selection();
     }
 
     pub fn save_filter_preset(&mut self) {
-        self.pending_g = false;
         self.filter_workflow.save_preset();
-        self.sync_filter_preset_selection();
+        self.sync_dialog_selection(DialogKind::FilterPresets);
     }
 
     pub fn toggle_selected_marker(&mut self) {
-        self.pending_g = false;
         let Some(sequence) = self.selected_event().map(|event| event.sequence) else {
             return;
         };
@@ -660,29 +636,33 @@ impl App {
         Ok(count)
     }
 
-    pub fn export_visible_logs_default(&self) -> io::Result<usize> {
-        self.export_visible_logs(Path::new("loggle-export.log"))
+    pub fn export_visible_logs_default(&mut self) {
+        self.export_visible_logs_with_notice(Path::new(DEFAULT_EXPORT_PATH));
+    }
+
+    fn export_visible_logs_with_notice(&mut self, path: &Path) {
+        let notice = match self.export_visible_logs(path) {
+            Ok(count) => format!("exported {count} lines to {}", path.display()),
+            Err(error) => format!("export failed: {error}"),
+        };
+        self.set_notice(notice);
     }
 
     pub fn undo_filter_change(&mut self) {
         if !self.filter_workflow.undo() {
-            self.pending_g = false;
             return;
         }
 
         self.sync_visible_cache();
-        self.pending_g = false;
         self.sync_selection();
     }
 
     pub fn toggle_details(&mut self) {
-        self.pending_g = false;
         self.details_open = !self.details_open && self.selected_event().is_some();
         self.sync_selected_property();
     }
 
     pub fn next_property(&mut self) {
-        self.pending_g = false;
         let Some(event) = self.selected_event() else {
             self.selected_property = 0;
             return;
@@ -694,12 +674,10 @@ impl App {
     }
 
     pub fn previous_property(&mut self) {
-        self.pending_g = false;
         self.selected_property = self.selected_property.saturating_sub(1);
     }
 
     pub fn follow_selected_property(&mut self) {
-        self.pending_g = false;
         let Some(property) = self.selected_property().cloned() else {
             return;
         };
@@ -710,6 +688,7 @@ impl App {
 
     pub fn handle_g(&mut self) {
         if self.pending_g {
+            self.clear_pending_g();
             self.jump_top();
         } else {
             self.pending_g = true;
@@ -725,7 +704,6 @@ impl App {
     }
 
     fn move_to_search_match(&mut self, forward: bool) {
-        self.pending_g = false;
         self.visible
             .move_to_search_match(&self.buffer, self.filter_workflow.filters(), forward);
         self.sync_selected_property();
@@ -802,80 +780,13 @@ impl App {
         })
     }
 
-    fn dialog_state(&self, kind: DialogKind) -> &SearchableListState {
-        match kind {
-            DialogKind::PropertyFilters => &self.property_filters,
-            DialogKind::MessageFields => &self.message_fields,
-            DialogKind::FilterPresets => &self.filter_preset_list,
-            DialogKind::Sources => &self.sources,
-        }
-    }
-
-    fn dialog_state_mut(&mut self, kind: DialogKind) -> &mut SearchableListState {
-        match kind {
-            DialogKind::PropertyFilters => &mut self.property_filters,
-            DialogKind::MessageFields => &mut self.message_fields,
-            DialogKind::FilterPresets => &mut self.filter_preset_list,
-            DialogKind::Sources => &mut self.sources,
-        }
-    }
-
-    fn dialog_len(&self, kind: DialogKind) -> usize {
-        match kind {
-            DialogKind::PropertyFilters => self.property_filter_rows().len(),
-            DialogKind::MessageFields => self.message_field_rows().len(),
-            DialogKind::FilterPresets => self.filter_preset_rows().len(),
-            DialogKind::Sources => self.source_status_rows().len(),
-        }
-    }
-
-    fn dialog_len_after_query_push(&self, kind: DialogKind, value: char) -> usize {
-        let mut query = self.dialog_query(kind).to_string();
-        query.push(value);
-        self.dialog_len_for_query(kind, query.trim())
-    }
-
-    fn dialog_len_after_query_pop(&self, kind: DialogKind) -> usize {
-        let mut query = self.dialog_query(kind).to_string();
-        query.pop();
-        self.dialog_len_for_query(kind, query.trim())
-    }
-
-    fn dialog_len_for_query(&self, kind: DialogKind, query: &str) -> usize {
-        match kind {
-            DialogKind::PropertyFilters => self.filter_workflow.property_filter_row_count(query),
-            DialogKind::MessageFields => self
-                .message_field_keys
-                .iter()
-                .filter(|key| {
-                    query.is_empty()
-                        || crate::filter::contains_ignore_ascii_case(key.as_str(), query)
-                })
-                .count(),
-            DialogKind::FilterPresets => self.filter_workflow.filter_preset_row_count(query),
-            DialogKind::Sources => self.source_status_rows_for_query(query).len(),
-        }
-    }
-
     fn sync_palette_selection(&mut self) {
-        self.palette.sync(self.palette_commands().len());
+        self.dialogs.sync_palette(self.palette_commands().len());
     }
 
     fn sync_dialog_selection(&mut self, kind: DialogKind) {
-        let len = self.dialog_len(kind);
-        self.dialog_state_mut(kind).sync(len);
-    }
-
-    fn sync_property_filter_selection(&mut self) {
-        self.sync_dialog_selection(DialogKind::PropertyFilters);
-    }
-
-    fn sync_message_field_selection(&mut self) {
-        self.sync_dialog_selection(DialogKind::MessageFields);
-    }
-
-    fn sync_filter_preset_selection(&mut self) {
-        self.sync_dialog_selection(DialogKind::FilterPresets);
+        let len = dialogs::dialog_len(self, kind);
+        self.dialogs.sync(kind, len);
     }
 
     fn delete_selected_property_filter(&mut self) {
@@ -885,7 +796,7 @@ impl App {
 
         self.filter_workflow.remove_property_filter(row.id);
         self.sync_visible_cache();
-        self.sync_property_filter_selection();
+        self.sync_dialog_selection(DialogKind::PropertyFilters);
         self.sync_selection();
     }
 
@@ -900,7 +811,7 @@ impl App {
         {
             self.message_field_keys.remove(index);
         }
-        self.sync_message_field_selection();
+        self.sync_dialog_selection(DialogKind::MessageFields);
     }
 
     fn apply_selected_filter_preset(&mut self) {
@@ -908,7 +819,7 @@ impl App {
             return;
         };
         if !self.filter_workflow.apply_preset(row.index) {
-            self.sync_filter_preset_selection();
+            self.sync_dialog_selection(DialogKind::FilterPresets);
             return;
         }
 
@@ -922,7 +833,7 @@ impl App {
             return;
         };
         self.filter_workflow.delete_preset(row.index);
-        self.sync_filter_preset_selection();
+        self.sync_dialog_selection(DialogKind::FilterPresets);
     }
 }
 
@@ -940,7 +851,7 @@ fn filter_edit(kind: PromptKind) -> FilterEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::{PropertyFilterUpdate, PropertyPredicate};
+    use crate::filter::PropertyPredicate;
 
     #[test]
     fn follow_mode_tracks_bottom_as_lines_arrive() {
@@ -1246,50 +1157,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_presets_save_search_and_restore_filters() {
-        let mut app = App::new(10);
-        app.push_line("api | ERROR one".to_string());
-        app.push_line("web | INFO two".to_string());
-        app.start_prompt(PromptKind::Level);
-        for ch in "error".chars() {
-            app.push_prompt_char(ch);
-        }
-        app.apply_prompt();
-
-        app.save_filter_preset();
-        app.clear_filters();
-        assert_eq!(app.visible_count(), 2);
-
-        app.open_dialog(DialogKind::FilterPresets);
-        app.push_dialog_query_char(DialogKind::FilterPresets, 'e');
-        app.push_dialog_query_char(DialogKind::FilterPresets, 'r');
-        let rows = app.filter_preset_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].summary, "level=error");
-
-        app.activate_selected_dialog_row(DialogKind::FilterPresets);
-
-        assert_eq!(app.mode(), &Mode::Normal);
-        assert_eq!(app.filters().level, Some(Level::Error));
-        assert_eq!(app.visible_count(), 1);
-    }
-
-    #[test]
-    fn filter_presets_are_not_duplicated() {
-        let mut app = App::new(10);
-        app.start_prompt(PromptKind::Source);
-        for ch in "api".chars() {
-            app.push_prompt_char(ch);
-        }
-        app.apply_prompt();
-
-        app.save_filter_preset();
-        app.save_filter_preset();
-
-        assert_eq!(app.filter_preset_rows().len(), 1);
-    }
-
-    #[test]
     fn export_visible_logs_writes_filtered_rows() {
         let mut app = App::new(10);
         app.push_line("api | ERROR one".to_string());
@@ -1309,6 +1176,39 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(output, "api | ERROR one\napi | ERROR three\n");
+    }
+
+    #[test]
+    fn export_reports_line_count_in_notice() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+        app.push_line("web | INFO two".to_string());
+
+        let path = std::env::temp_dir().join(format!(
+            "loggle-export-notice-test-{}.log",
+            std::process::id()
+        ));
+        app.export_visible_logs_with_notice(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            app.notice(),
+            Some(format!("exported 2 lines to {}", path.display()).as_str())
+        );
+    }
+
+    #[test]
+    fn export_failure_is_reported_in_notice() {
+        let mut app = App::new(10);
+        app.push_line("api | ERROR one".to_string());
+
+        let path = std::env::temp_dir()
+            .join(format!("loggle-missing-dir-{}", std::process::id()))
+            .join("export.log");
+        app.export_visible_logs_with_notice(&path);
+
+        let notice = app.notice().unwrap();
+        assert!(notice.starts_with("export failed: "), "{notice}");
     }
 
     #[test]
@@ -1456,146 +1356,6 @@ mod tests {
         assert_eq!(
             app.message_field_keys(),
             &["tenantId".to_string(), "requestId".to_string()]
-        );
-    }
-
-    #[test]
-    fn message_field_dialog_searches_and_deletes_selected_fields() {
-        let mut app = App::new(10);
-        app.message_field_keys = vec![
-            "tenantId".to_string(),
-            "requestId".to_string(),
-            "durationMs".to_string(),
-        ];
-
-        app.open_dialog(DialogKind::MessageFields);
-        app.push_dialog_query_char(DialogKind::MessageFields, 'r');
-        app.push_dialog_query_char(DialogKind::MessageFields, 'e');
-
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
-        assert_eq!(app.message_field_rows(), vec!["requestId"]);
-
-        app.delete_selected_dialog_row(DialogKind::MessageFields);
-
-        assert_eq!(
-            app.message_field_keys(),
-            &["tenantId".to_string(), "durationMs".to_string()]
-        );
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
-        assert_eq!(app.selected_dialog_index(DialogKind::MessageFields), 0);
-    }
-
-    #[test]
-    fn message_field_dialog_backspace_deletes_when_search_is_empty() {
-        let mut app = App::new(10);
-        app.message_field_keys = vec!["tenantId".to_string()];
-
-        app.open_dialog(DialogKind::MessageFields);
-        app.delete_selected_dialog_row(DialogKind::MessageFields);
-
-        assert!(app.message_field_keys().is_empty());
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::MessageFields));
-    }
-
-    #[test]
-    fn palette_opens_and_closes_from_normal_mode() {
-        let mut app = App::new(10);
-
-        app.toggle_palette();
-        assert_eq!(app.mode(), &Mode::Palette);
-
-        app.toggle_palette();
-        assert_eq!(app.mode(), &Mode::Normal);
-    }
-
-    #[test]
-    fn palette_selection_moves_and_clamps() {
-        let mut app = App::new(10);
-        app.open_palette();
-
-        app.move_palette_down(2);
-        assert_eq!(app.palette_selected(), 2);
-
-        app.move_palette_down(usize::MAX);
-        assert_eq!(app.palette_selected(), app.palette_commands().len() - 1);
-
-        app.move_palette_up(usize::MAX);
-        assert_eq!(app.palette_selected(), 0);
-    }
-
-    #[test]
-    fn property_filter_dialog_searches_active_filters() {
-        let mut app = App::new(10);
-        app.filters_mut().add_property_filter(PropertyFilterUpdate {
-            exclude: false,
-            predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
-        });
-        app.filters_mut().add_property_filter(PropertyFilterUpdate {
-            exclude: true,
-            predicate: PropertyPredicate::exists("debug"),
-        });
-
-        app.open_dialog(DialogKind::PropertyFilters);
-        app.push_dialog_query_char(DialogKind::PropertyFilters, 'i');
-        app.push_dialog_query_char(DialogKind::PropertyFilters, 'g');
-
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
-        let rows = app.property_filter_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, "ignore");
-        assert_eq!(rows[0].summary, "!debug");
-    }
-
-    #[test]
-    fn deleting_selected_property_filter_removes_it() {
-        let mut app = App::new(10);
-        app.filters_mut().add_property_filter(PropertyFilterUpdate {
-            exclude: false,
-            predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
-        });
-        app.filters_mut().add_property_filter(PropertyFilterUpdate {
-            exclude: true,
-            predicate: PropertyPredicate::exists("debug"),
-        });
-
-        app.open_dialog(DialogKind::PropertyFilters);
-        app.move_dialog_down(DialogKind::PropertyFilters, 1);
-        app.delete_selected_dialog_row(DialogKind::PropertyFilters);
-
-        assert_eq!(
-            app.filters().property_includes,
-            vec![PropertyPredicate::exact("tenantId", "tenant-1")]
-        );
-        assert!(app.filters().property_excludes.is_empty());
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
-        assert_eq!(app.selected_dialog_index(DialogKind::PropertyFilters), 0);
-    }
-
-    #[test]
-    fn editing_property_filter_replaces_existing_filter() {
-        let mut app = App::new(10);
-        app.filters_mut().add_property_filter(PropertyFilterUpdate {
-            exclude: false,
-            predicate: PropertyPredicate::exact("tenantId", "tenant-1"),
-        });
-
-        app.open_dialog(DialogKind::PropertyFilters);
-        app.start_property_filter_edit();
-        assert_eq!(app.mode(), &Mode::Prompt(PromptKind::EditPropertyFilter));
-        assert_eq!(app.prompt(), "tenantId=tenant-1");
-        for _ in 0.."tenantId=tenant-1".len() {
-            app.pop_prompt_char();
-        }
-        for value in "tenantId!=tenant-2".chars() {
-            app.push_prompt_char(value);
-        }
-        app.apply_prompt();
-
-        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::PropertyFilters));
-        assert!(app.filters().property_includes.is_empty());
-        assert_eq!(
-            app.filters().property_excludes,
-            vec![PropertyPredicate::exact("tenantId", "tenant-2")]
         );
     }
 }

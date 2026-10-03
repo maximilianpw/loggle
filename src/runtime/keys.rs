@@ -12,6 +12,9 @@ pub(super) enum KeyOutcome {
 
 pub(super) fn handle_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutcome {
     app.clear_notice();
+    if key.code != KeyCode::Char('g') {
+        app.clear_pending_g();
+    }
 
     match app.mode() {
         Mode::Prompt(_) => handle_prompt_key(app, key),
@@ -46,12 +49,10 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.move_up(half_page),
         (KeyCode::Char('g'), _) => app.handle_g(),
         (KeyCode::Char('?'), _) => app.toggle_palette(),
-        (KeyCode::Esc, _) => app.clear_transient(),
         _ => {
             if let Some(action) = normal_action_for_key(key) {
                 return execute_command(app, action);
             }
-            app.clear_transient();
         }
     }
 
@@ -68,7 +69,7 @@ fn handle_visual_key(app: &mut App, key: KeyEvent, half_page: usize) -> KeyOutco
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.move_up(half_page),
         (KeyCode::Char('g'), _) => app.handle_g(),
         (KeyCode::Char('G'), _) => app.move_to_last_visible(),
-        _ => app.clear_transient(),
+        _ => {}
     }
 
     KeyOutcome::Continue
@@ -150,9 +151,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::UndoFilterChange => app.undo_filter_change(),
         CommandAction::SaveFilterPreset => app.save_filter_preset(),
         CommandAction::FilterPresets => app.open_dialog(DialogKind::FilterPresets),
-        CommandAction::ExportVisibleLogs => {
-            let _ = app.export_visible_logs_default();
-        }
+        CommandAction::ExportVisibleLogs => app.export_visible_logs_default(),
         CommandAction::ToggleMarker => app.toggle_selected_marker(),
         CommandAction::Sources => app.open_dialog(DialogKind::Sources),
         CommandAction::NextMatch => app.next_search_match(),
@@ -193,6 +192,64 @@ mod tests {
         let outcome = handle_key(&mut app, key(KeyCode::Char('q')), 5);
 
         assert_eq!(outcome, KeyOutcome::Quit);
+    }
+
+    fn three_line_app_at_bottom() -> App {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one".to_string());
+        app.push_line("web | INFO two".to_string());
+        app.push_line("worker | INFO three".to_string());
+        app
+    }
+
+    #[test]
+    fn gg_jumps_to_top() {
+        let mut app = three_line_app_at_bottom();
+
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        assert_eq!(app.selected(), 2);
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn g_followed_by_another_key_cancels_the_chord() {
+        let mut app = three_line_app_at_bottom();
+
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        handle_key(&mut app, key(KeyCode::Char('x')), 5);
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        assert_eq!(app.selected(), 2);
+
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn g_followed_by_escape_cancels_the_chord() {
+        let mut app = three_line_app_at_bottom();
+
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        handle_key(&mut app, key(KeyCode::Esc), 5);
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+
+        assert_eq!(app.selected(), 2);
+    }
+
+    #[test]
+    fn visual_mode_gg_jumps_to_top_but_g_k_g_does_not() {
+        let mut app = three_line_app_at_bottom();
+        handle_key(&mut app, key(KeyCode::Char('v')), 5);
+
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        handle_key(&mut app, key(KeyCode::Char('k')), 5);
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        assert_eq!(app.selected(), 1);
+
+        handle_key(&mut app, key(KeyCode::Char('g')), 5);
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.visual_selection_range(), Some((0, 2)));
     }
 
     #[test]
