@@ -25,14 +25,6 @@ impl<'a> StartPlan<'a> {
         Ok(plan)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.commands.len()
-    }
-
-    pub(crate) fn command(&self, index: usize) -> &StartCommand {
-        &self.commands[index]
-    }
-
     pub(crate) fn dependency_indexes(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
         self.commands[index]
             .wait_for

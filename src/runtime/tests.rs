@@ -15,7 +15,7 @@ use std::{
 };
 
 #[test]
-fn no_tty_startup_reaps_process_group() {
+fn no_tty_startup_fails_before_spawning() {
     check_lifecycle("no-tty", false);
 }
 
@@ -29,14 +29,16 @@ fn partial_named_startup_reaps_child() {
     check_lifecycle("named", false);
 }
 
+// `loggle start` schedules commands from the event loop, so startup failures
+// happen inside the TUI and must restore the terminal as well as reap.
 #[test]
-fn partial_startup_reaps_process_group() {
-    check_lifecycle("partial", false);
+fn pty_partial_startup_restores_terminal_and_reaps_group() {
+    check_lifecycle("partial", true);
 }
 
 #[test]
-fn exited_before_readiness_terminates_descendants() {
-    check_lifecycle("exited", false);
+fn pty_exited_before_readiness_restores_terminal_and_reaps_group() {
+    check_lifecycle("exited", true);
 }
 
 #[test]
@@ -45,7 +47,7 @@ fn pty_output_initialization_failure_restores_raw_mode() {
 }
 
 #[test]
-fn pty_recording_failure_restores_terminal_and_reaps_group() {
+fn pty_recording_failure_restores_terminal_before_spawning() {
     check_lifecycle("record-error", true);
 }
 
@@ -329,7 +331,14 @@ fn lifecycle_fixture() {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    if case != "single" && case != "named" {
+    // Start commands spawn from the event loop, so a failure before it runs
+    // must not have launched anything.
+    if matches!(case.as_str(), "no-tty" | "output-error" | "record-error") {
+        assert!(
+            !PathBuf::from("leader").exists(),
+            "{case}: start command spawned before the event loop"
+        );
+    } else if case != "single" && case != "named" {
         assert!(
             fs::metadata("descendant").is_ok(),
             "fixture must launch descendants"

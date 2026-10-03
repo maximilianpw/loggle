@@ -22,25 +22,29 @@ use crate::{
 
 use super::{
     RuntimeConfig, clipboard,
-    input::{self, Child, ChildShutdown, ShutdownSignal, ShutdownStatus},
+    input::{
+        self, Child, ChildShutdown, ShutdownSignal, ShutdownStatus, StartProgress, StartScheduler,
+    },
     keys::{self, KeyOutcome},
 };
 
 pub(super) fn run(
     rx: Receiver<String>,
-    startup_lines: Vec<String>,
     mut children: Vec<Child>,
+    scheduler: Option<StartScheduler>,
     config: RuntimeConfig,
 ) -> io::Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let result = run_app(
         terminal.terminal_mut(),
         &rx,
-        startup_lines,
         &mut children,
+        scheduler,
         config,
     );
 
+    // Startup failures land here too: children spawned so far are killed with
+    // their process groups before the terminal is restored.
     drop(children);
 
     let cleanup_result = terminal.restore();
@@ -152,8 +156,8 @@ impl Drop for TerminalModeGuard {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     rx: &Receiver<String>,
-    startup_lines: Vec<String>,
     children: &mut Vec<Child>,
+    mut scheduler: Option<StartScheduler>,
     config: RuntimeConfig,
 ) -> io::Result<()> {
     let RuntimeConfig {
@@ -188,15 +192,7 @@ fn run_app(
         }
     }
     let _active_page = active_page;
-
-    let had_startup_lines = !startup_lines.is_empty();
-    for line in startup_lines {
-        recorders.ingest(&mut app, &line)?;
-        app.push_line(line);
-    }
-    if had_startup_lines {
-        recorders.flush(&mut app);
-    }
+    let mut start_notice = None;
 
     loop {
         let mut received = false;
@@ -211,6 +207,20 @@ fn run_app(
         // fresh data without a syscall on every ingested line.
         if received {
             recorders.flush(&mut app);
+        }
+
+        // A startup error aborts the session like any other: returning it lets
+        // `run` kill the spawned children and restore the terminal.
+        if let Some(active_scheduler) = scheduler.as_mut() {
+            let now = Instant::now();
+            let notice = match active_scheduler.tick(children, now)? {
+                StartProgress::InProgress => Some(active_scheduler.progress_notice(now)),
+                StartProgress::Ready => {
+                    scheduler = None;
+                    None
+                }
+            };
+            dirty |= show_start_notice(&mut app, &mut start_notice, notice);
         }
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
@@ -273,6 +283,9 @@ fn run_app(
                                 return Ok(());
                             }
                             None => {
+                                // Spawn nothing further: only children already
+                                // started go through the shutdown ladder.
+                                scheduler = None;
                                 let now = Instant::now();
                                 shutdown = Some(
                                     children
@@ -374,6 +387,23 @@ fn start_page_log(
         claim_active_log_page(page_id, page_command).map_err(io::Error::other)?;
     let recorder = PageLogRecorder::create(&id, buffer_lines).map_err(io::Error::other)?;
     Ok((id, recorder, registration))
+}
+
+/// Mirrors startup progress in the status notice; `None` clears it once every
+/// command is ready. An unrelated notice (page log, copy result) stays until a
+/// key press clears it. Returns whether the notice changed.
+fn show_start_notice(app: &mut App, shown: &mut Option<String>, notice: Option<String>) -> bool {
+    let owns_notice = app.notice().is_none() || app.notice() == shown.as_deref();
+    if !owns_notice || app.notice() == notice.as_deref() {
+        return false;
+    }
+
+    match &notice {
+        Some(notice) => app.set_notice(notice.clone()),
+        None => app.clear_notice(),
+    }
+    *shown = notice;
+    true
 }
 
 fn copy_to_clipboard(app: &mut App, text: &str, line_count: usize) {
