@@ -9,7 +9,7 @@ ratatui TUI. User docs: `README.md`. Dev and release: `CONTRIBUTING.md`.
 Dependencies point downward; lower modules must not import higher ones.
 
 ```text
-main.rs            clap CLI; dispatches log/pages/sources/run/start/dc
+main.rs            clap CLI; dispatches log/pages/sources/facets/run/start/dc
   -> lib.rs        crate root; re-exports the public API used by main.rs
     -> runtime     event loop: input, terminal, keys, start_plan, clipboard
       -> app       App state; visible (VisibleLogView), list_state
@@ -22,7 +22,8 @@ perf.rs + bin/loggle-bench.rs   only with the `perf-harness` feature
 
 - `ui` reads `app` state to draw; `app` does not depend on `ui`.
 - `config` parses `.loggle.toml` into `runtime::StartCommand`/`ReadySpec`.
-- `page_log` reuses `buffer`, `filter`, and `model` for `loggle log`/`sources`.
+- `page_log` reuses `buffer`, `filter`, `facet`, and `model` for
+  `loggle log`/`sources`/`facets`.
 
 `src/model/` is being split into per-parser submodules. Target layout:
 `model.rs` keeps the shared types and dispatch, with `model/compose`,

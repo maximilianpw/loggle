@@ -246,6 +246,37 @@ Errors are still printed as text to stderr with exit status `1`.
 `{"schema_version":1,"id":…,"pid":…,"started_unix_seconds":…,"command":…}`
 object per active page, and nothing when there are none.
 
+Summarize a page before filtering it: `facets` counts records per source,
+level, and property key, and, with `--property-key`, per value of one property:
+
+```sh
+loggle facets -i 1
+loggle facets -i 1 --property-key requestId --json
+```
+
+```text
+source (12 records, 4 buckets)
+  api         5
+  worker      4
+  database    2
+  minio-init  1
+...
+```
+
+```json
+{"schema_version":1,"facet":"property_value","property_key":"requestId","available_records":12,"window_records":12,"window_truncated":false,"matched_records":12,"eligible_records":12,"total_buckets":3,"truncated":false,"buckets":[{"value":"fixture-failed","count":5,"value_types":["string","text"]},{"value":"fixture-success","count":5,"value_types":["string","text"]},{"value":"fixture-failed-extra","count":1,"value_types":["text"]}]}
+```
+
+`facets` accepts the same `--source`, `--text`, `--level`, `--property`, and
+`--source-field` filters as `log`. As in the TUI facet dialog, each facet
+ignores its own filter, so `--level error` narrows the source counts while the
+level facet still shows every level. It aggregates the newest `--records`
+parsed records and prints at most `--buckets` buckets per facet (most frequent
+first); `window_truncated` and `truncated` report when either bound clipped
+the result. Text output escapes control characters in values; `--json` prints
+one `schema_version` 1 object per facet in `source`, `level`, `property_key`,
+`property_value` order.
+
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the
 TUI. Each log retains roughly the same window as the in-memory buffer
@@ -386,6 +417,19 @@ loggle start libre
   with `--json`)
 - `log --source-field <FIELD>`: applies custom source promotion when reading a
   page
+- `facets -i <ID>`: counts records per source, level, and property key in a
+  tagged Loggle page; accepts the `log` filters `--source`/`--service`,
+  `--text`/`--search`, `--level`, `--property`, and `--source-field`
+- `facets --facet <FACET>`: prints only this facet (`source`, `level`,
+  `property_key`, `property_value`); repeatable, default `source`, `level`,
+  `property_key`
+- `facets --property-key <KEY>`: also counts the values of this property
+  (`property_value`, which requires it)
+- `facets --records <N>`: aggregates the newest `N` parsed records, `1`–`100000`,
+  default `10000`
+- `facets --buckets <N>`: prints at most `N` buckets per facet, `1`–`100`,
+  default `20`
+- `facets --json`: prints one `schema_version` 1 JSON object per facet (JSONL)
 - `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
@@ -395,7 +439,7 @@ loggle start libre
 
 Global options go before the command or subcommand. Every subcommand has its
 own help, e.g. `loggle run --help`. A command whose first word is a subcommand
-name (`run`, `start`, `log`, `pages`, `sources`) runs that subcommand; put it
+name (`run`, `start`, `log`, `pages`, `sources`, `facets`) runs that subcommand; put it
 after `--` to run it as a command instead.
 
 ## Controls

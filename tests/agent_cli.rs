@@ -1,5 +1,5 @@
-//! Drives the real `loggle` binary the way an agent would: `log`/`pages` with
-//! `--json` and `--level` against a page log written straight into a temporary
+//! Drives the real `loggle` binary the way an agent would: `log`/`pages`/
+//! `facets` with `--json` and `--level` against a page log written straight into a temporary
 //! `XDG_STATE_HOME`, so no live viewer session (or pty) is needed.
 
 use std::{
@@ -204,4 +204,109 @@ fn pages_json_lists_versioned_page_objects() {
             "command": "cat fixtures/mixed-service-investigation.log",
         })]
     );
+}
+
+#[test]
+fn facets_json_emits_one_versioned_group_per_facet() {
+    let state = TestState::new("facets-json");
+    state.add_page("t", FIXTURE);
+
+    let groups = json_lines(&state.run(&["facets", "-i", "t", "--json"]));
+
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group["facet"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["source", "level", "property_key"]
+    );
+    for group in &groups {
+        assert_eq!(group["schema_version"], 1);
+        assert_eq!(group["available_records"], 12);
+        assert!(group["buckets"].is_array());
+    }
+    assert_eq!(groups[0]["buckets"][0]["value"], "api");
+    assert_eq!(groups[0]["buckets"][0]["count"], 5);
+
+    let narrowed = json_lines(&state.run(&[
+        "facets", "-i", "t", "--facet", "source", "--level", "error", "--json",
+    ]));
+    assert_eq!(narrowed.len(), 1);
+    assert_eq!(narrowed[0]["eligible_records"], 3);
+}
+
+#[test]
+fn facets_property_key_counts_values_in_json_and_text() {
+    let state = TestState::new("facets-property");
+    state.add_page("t", FIXTURE);
+
+    let groups = json_lines(&state.run(&[
+        "facets",
+        "-i",
+        "t",
+        "--facet",
+        "property_value",
+        "--property-key",
+        "requestId",
+        "--json",
+    ]));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["facet"], "property_value");
+    assert_eq!(groups[0]["property_key"], "requestId");
+    let buckets = groups[0]["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bucket| {
+            (
+                bucket["value"].as_str().unwrap().to_string(),
+                bucket["count"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        buckets,
+        [
+            ("fixture-failed".to_string(), 5),
+            ("fixture-success".to_string(), 5),
+            ("fixture-failed-extra".to_string(), 1),
+        ]
+    );
+
+    let text = state.run(&[
+        "facets",
+        "-i",
+        "t",
+        "--property-key",
+        "requestId",
+        "--facet",
+        "level",
+    ]);
+    assert!(text.status.success(), "stderr: {}", stderr(&text));
+    assert_eq!(
+        stdout(&text),
+        "level (12 records, 2 buckets)\n  error  3\n  info   9\n\nproperty_value requestId (12 records, 3 buckets)\n  fixture-failed        5\n  fixture-success       5\n  fixture-failed-extra  1\n"
+    );
+}
+
+#[test]
+fn facets_errors_match_log_exit_codes() {
+    let state = TestState::new("facets-errors");
+
+    let missing = state.run(&["facets", "-i", "missing", "--json"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(stdout(&missing), "");
+    assert!(
+        stderr(&missing).starts_with("error: no log page found for id 'missing'"),
+        "{}",
+        stderr(&missing)
+    );
+
+    let invalid = state.run(&["facets", "-i", "t", "--facet", "tenant"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(stderr(&invalid).contains("invalid value 'tenant'"));
+
+    let keyless = state.run(&["facets", "-i", "t", "--facet", "property_value"]);
+    assert_eq!(keyless.status.code(), Some(2));
+    assert!(stderr(&keyless).contains("--property-key"));
 }
