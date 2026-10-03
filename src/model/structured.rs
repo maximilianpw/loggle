@@ -34,6 +34,44 @@ pub fn parse_structured_message(message: &str) -> Option<StructuredMessage> {
         message: rest.trim_start().to_string(),
     })
 }
+
+/// How strongly a source-stripped message looks like the start of a new
+/// structured record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StructuredLineKind {
+    None,
+    /// A level-first summary such as `ERROR failed`. Property entries named
+    /// after a level (`error: "x"`) also classify here.
+    LevelOnly,
+    /// A timestamp + level summary, bare (`10:00:00.000 INFO`) or bracketed
+    /// (`[10:00:00.000] INFO`).
+    Timestamped,
+}
+
+pub(super) fn structured_line_kind(message: &str) -> StructuredLineKind {
+    match parse_structured_message(message) {
+        Some(message) if message.timestamp.is_some() => StructuredLineKind::Timestamped,
+        Some(_) => StructuredLineKind::LevelOnly,
+        None if is_bracketed_timestamp_structured(message) => StructuredLineKind::Timestamped,
+        None => StructuredLineKind::None,
+    }
+}
+
+fn is_bracketed_timestamp_structured(message: &str) -> bool {
+    let Some(after_open) = message.trim().strip_prefix('[') else {
+        return false;
+    };
+    let Some((timestamp, after_timestamp)) = after_open.split_once(']') else {
+        return false;
+    };
+    if !looks_like_timestamp(timestamp) {
+        return false;
+    }
+
+    split_first_token(after_timestamp.trim_start())
+        .is_some_and(|(level, _)| parse_level_token(level).is_some())
+}
+
 pub(super) fn split_first_token(value: &str) -> Option<(&str, &str)> {
     let value = value.trim_start();
     if value.is_empty() {
@@ -163,5 +201,29 @@ mod tests {
     #[test]
     fn infers_unknown_without_level_tokens() {
         assert_eq!(infer_level("request completed"), Level::Unknown);
+    }
+
+    #[test]
+    fn classifies_structured_record_starts() {
+        assert_eq!(
+            structured_line_kind("10:00:00.000 INFO ready"),
+            StructuredLineKind::Timestamped
+        );
+        assert_eq!(
+            structured_line_kind("[10:00:01.000] ERROR recovered"),
+            StructuredLineKind::Timestamped
+        );
+        assert_eq!(
+            structured_line_kind("ERROR recovered"),
+            StructuredLineKind::LevelOnly
+        );
+        assert_eq!(
+            structured_line_kind("[10:00:01.000] recovered"),
+            StructuredLineKind::None
+        );
+        assert_eq!(
+            structured_line_kind("requestId: \"abc\","),
+            StructuredLineKind::None
+        );
     }
 }

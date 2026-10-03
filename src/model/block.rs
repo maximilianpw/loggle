@@ -66,6 +66,55 @@ pub fn parse_property_object(input: &str) -> Option<Vec<LogProperty>> {
 
     saw_open.then_some(properties)
 }
+
+/// Returns whether a source-stripped line can belong inside an open property
+/// block: blank or bracket/comma punctuation, a complete one-line object, a
+/// `key: value` entry, or a scalar array element.
+pub(super) fn is_property_body_line(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_whitespace() || matches!(ch, '{' | '}' | '[' | ']' | ','))
+    {
+        return true;
+    }
+
+    if parse_property_object(trimmed).is_some() {
+        return true;
+    }
+
+    let scalar = trim_trailing_comma(trimmed);
+    parse_property_entry(scalar).is_some()
+        || is_complete_quoted_scalar(scalar)
+        || is_number_literal(scalar)
+        || matches!(scalar, "true" | "false" | "null")
+}
+
+fn is_complete_quoted_scalar(value: &str) -> bool {
+    let Some(quote) = value.chars().next().filter(|ch| matches!(ch, '\'' | '"')) else {
+        return false;
+    };
+    if value.len() < 2 || !value.ends_with(quote) {
+        return false;
+    }
+
+    let mut escaped = false;
+    for ch in value[quote.len_utf8()..value.len() - quote.len_utf8()].chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return false;
+        }
+    }
+    !escaped
+}
+
 pub(super) fn parse_property_entry(entry: &str) -> Option<LogProperty> {
     let (key, value) = entry.split_once(':')?;
     let key = parse_property_key(key.trim())?;
@@ -196,6 +245,36 @@ mod tests {
 
         assert_eq!(header.timestamp, "14:06:58.892");
         assert_eq!(header.level, Level::Info);
+    }
+
+    #[test]
+    fn classifies_property_body_lines() {
+        for body in [
+            "",
+            "  }",
+            "],",
+            "[ ],",
+            "{ owner: api }",
+            "requestId: \"abc\",",
+            "reason: failed hard,",
+            "\"first\",",
+            "-7.5,",
+            "null",
+        ] {
+            assert!(is_property_body_line(body), "{body:?} is a body line");
+        }
+        for other in [
+            "} recovered",
+            "INFO recovered",
+            "\"unterminated",
+            "\"a\" \"b\"",
+            "plain text",
+        ] {
+            assert!(
+                !is_property_body_line(other),
+                "{other:?} is not a body line"
+            );
+        }
     }
 
     #[test]
