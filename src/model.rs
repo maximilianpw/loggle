@@ -11,10 +11,9 @@ use std::{borrow::Cow, fmt};
 
 pub use block::{parse_property_block_header, parse_property_object};
 pub(crate) use buildkit::parse_buildkit_step_line;
-pub(crate) use compose::message_without_source_prefix;
 pub use compose::parse_compose_line;
 pub use inline::parse_inline_properties;
-pub(crate) use interpret::LogInterpreter;
+pub(crate) use interpret::{LogInterpreter, PropertyFoldHeader};
 use json::{parse_json_log_message, split_trailing_json_properties};
 pub use structured::{infer_level, parse_structured_message};
 pub use text::clean_display_text;
