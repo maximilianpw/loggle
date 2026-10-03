@@ -106,10 +106,10 @@ impl LogBuffer {
             return None;
         }
 
-        if self.events.len() == self.capacity {
-            if let Some(event) = self.events.pop_front() {
-                change.removed.push(event.sequence);
-            }
+        if self.events.len() == self.capacity
+            && let Some(event) = self.events.pop_front()
+        {
+            change.removed.push(event.sequence);
         }
 
         let sequence = self.next_sequence;
@@ -127,10 +127,8 @@ impl LogBuffer {
     }
 
     fn apply_buildkit_source_context(&mut self, line: &str, parsed: &mut ParsedLine) {
-        if parsed.source_explicit {
-            return;
-        }
-
+        // Recognize the anchored BuildKit step before trusting a generic '|'
+        // prefix: a RUN instruction can itself contain shell pipelines.
         let Some(buildkit) = parse_buildkit_step_line(line) else {
             return;
         };
@@ -146,9 +144,13 @@ impl LogBuffer {
 
         if let Some(source) = self.buildkit_steps.get(&buildkit.step_id) {
             parsed.source = source.clone();
-            parsed.message = buildkit.message;
-            parsed.source_explicit = true;
+        } else {
+            // A standalone CACHED/DONE record (or an ambiguous stage header)
+            // proves build activity, not a particular Compose service.
+            parsed.source = "build".to_string();
         }
+        parsed.message = buildkit.message;
+        parsed.source_explicit = true;
     }
 
     fn apply_source_context(&mut self, parsed: &mut ParsedLine) {
@@ -184,6 +186,13 @@ impl LogBuffer {
         true
     }
 
+    /// Returns the back event's sequence when a property-block header belongs
+    /// to it.
+    ///
+    /// Attachment is heuristic: the header and event are matched only on the
+    /// time-of-day timestamp string and level. Two same-level events logged in
+    /// the same millisecond can therefore mis-attach; this is an accepted
+    /// limitation.
     fn property_target_sequence(&self, header: &PropertyBlockHeader) -> Option<u64> {
         let event = self.events.back()?;
         (event.timestamp.as_deref() == Some(header.timestamp.as_str())
@@ -200,10 +209,13 @@ impl LogBuffer {
             return;
         };
 
+        // Pending lines are consumed before any new event can be appended, so
+        // their target is still at the back. Avoid rescanning the entire page
+        // for every block when an agent reconstructs a large retained log.
         if let Some(event) = self
             .events
-            .iter_mut()
-            .find(|event| event.sequence == pending.target_sequence)
+            .back_mut()
+            .filter(|event| event.sequence == pending.target_sequence)
         {
             self.interpreter
                 .apply_properties(event, properties.clone(), &self.source_config);
@@ -221,6 +233,13 @@ impl LogBuffer {
         }
     }
 
+    /// Moves a deferred property block onto the newly appended back event and
+    /// drops the block's standalone header event.
+    ///
+    /// Uses the same heuristic as [`Self::property_target_sequence`]: matching
+    /// is on (time-of-day timestamp string, level) only, so two same-level
+    /// events in the same millisecond can mis-attach. This is an accepted
+    /// limitation.
     fn apply_completed_property_block_to_back(&mut self, change: &mut BufferChange) {
         let Some(event) = self.events.back() else {
             return;
@@ -239,24 +258,16 @@ impl LogBuffer {
         };
         let target_sequence = event.sequence;
 
-        if let Some(event) = self
-            .events
-            .iter_mut()
-            .find(|event| event.sequence == target_sequence)
-        {
+        if let Some(event) = self.events.back_mut() {
             self.interpreter
                 .apply_properties(event, block.properties, &self.source_config);
             change.updated.push(target_sequence);
         }
 
-        if let Some(position) = self
-            .events
-            .iter()
-            .position(|event| event.sequence == block.header_sequence)
+        if let Some(position) = self.index_of_sequence(block.header_sequence)
+            && let Some(event) = self.events.remove(position)
         {
-            if let Some(event) = self.events.remove(position) {
-                change.removed.push(event.sequence);
-            }
+            change.removed.push(event.sequence);
         }
     }
 
@@ -274,18 +285,19 @@ impl LogBuffer {
         &self.events
     }
 
+    /// Looks up an event by sequence in O(log n).
+    ///
+    /// Events are always stored in ascending sequence order, but sequences may
+    /// have gaps (eviction from the front, or a property-block header removed
+    /// from the middle), so an offset from the front sequence is not reliable.
     pub(crate) fn event_by_sequence(&self, sequence: u64) -> Option<&LogEvent> {
-        let first_sequence = self.events.front()?.sequence;
-        let offset = sequence.checked_sub(first_sequence)?;
-        if let Ok(index) = usize::try_from(offset) {
-            if let Some(event) = self.events.get(index) {
-                if event.sequence == sequence {
-                    return Some(event);
-                }
-            }
-        }
+        self.events.get(self.index_of_sequence(sequence)?)
+    }
 
-        self.events.iter().find(|event| event.sequence == sequence)
+    fn index_of_sequence(&self, sequence: u64) -> Option<usize> {
+        self.events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok()
     }
 }
 
@@ -566,6 +578,104 @@ mod tests {
         buffer.events.remove(1);
 
         assert_eq!(buffer.event_by_sequence(2).unwrap().message, "three");
+    }
+
+    #[test]
+    fn finds_every_event_by_sequence_after_mid_deque_property_header_removal() {
+        let mut buffer = LogBuffer::new(1_000);
+
+        buffer.push_line("[api] INFO first".to_string());
+        // The header has no matching predecessor, so it is kept as event 1
+        // until the following matching event claims its properties.
+        buffer.push_line("[api] [21:05:37.312] INFO (#140):".to_string());
+        buffer.push_line("[api] {".to_string());
+        buffer.push_line("[api] requestId: \"abc-123\",".to_string());
+        buffer.push_line("[api] }".to_string());
+        let change = buffer.push_line("[api] 21:05:37.312 INFO http.request ok".to_string());
+        assert_eq!(change.appended, Some(2));
+        assert_eq!(change.removed, vec![1]);
+
+        for index in 0..2_000 {
+            buffer.push_line(format!("[api] INFO line {index}"));
+        }
+
+        let sequences = buffer
+            .events()
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+        for sequence in &sequences {
+            assert_eq!(
+                buffer.event_by_sequence(*sequence).unwrap().sequence,
+                *sequence
+            );
+        }
+        assert!(buffer.event_by_sequence(1).is_none());
+        assert!(buffer.event_by_sequence(sequences[0] - 1).is_none());
+        assert!(buffer.event_by_sequence(sequences[999] + 1).is_none());
+
+        // A gap that stays inside the retained window.
+        let mut buffer = LogBuffer::new(100);
+        for index in 0..100 {
+            buffer.push_line(format!("[api] INFO line {index}"));
+        }
+        buffer.events.remove(50);
+        for sequence in (0..100).filter(|sequence| *sequence != 50) {
+            assert_eq!(
+                buffer.event_by_sequence(sequence).unwrap().message,
+                format!("line {sequence}")
+            );
+        }
+        assert!(buffer.event_by_sequence(50).is_none());
+    }
+
+    #[test]
+    fn unattributed_build_steps_are_grouped_without_guessing_a_service() {
+        let mut buffer = LogBuffer::new(20);
+        for line in [
+            "[api] INFO ready",
+            "#7 CACHED",
+            "#8 [internal] load build definition",
+            "#9 [builder 1/2] RUN compile",
+            "#10 [worker internal] load metadata",
+            "#7 DONE 0.1s",
+            "#10 CACHED",
+            "plain output",
+        ] {
+            buffer.push_line(line.to_string());
+        }
+        assert_eq!(
+            sources(&buffer),
+            vec![
+                "api", "build", "build", "build", "worker", "build", "worker", "unknown"
+            ]
+        );
+        assert_eq!(buffer.events()[1].raw, "#7 CACHED");
+        assert_eq!(buffer.events()[3].message, "#9 [builder 1/2] RUN compile");
+    }
+
+    #[test]
+    fn buildkit_shell_pipelines_do_not_override_step_source() {
+        let mut buffer = LogBuffer::new(10);
+        for line in [
+            "#35 [api stage-0 1/2] RUN printf ready | cat",
+            "#36 [worker internal] load metadata",
+            "#35 CACHED",
+            "#36 DONE 0.1s",
+            "[web] INFO application | message",
+        ] {
+            buffer.push_line(line.into());
+        }
+        assert_eq!(
+            sources(&buffer),
+            vec!["api", "worker", "api", "worker", "web"]
+        );
+        assert_eq!(
+            buffer.events()[0].message,
+            "#35 [stage-0 1/2] RUN printf ready | cat"
+        );
+        assert_eq!(buffer.events()[2].raw, "#35 CACHED");
     }
 
     #[test]

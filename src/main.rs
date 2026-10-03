@@ -9,7 +9,7 @@ use clap::Parser;
 use loggle::{
     ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
     RuntimeError, RuntimeInput, SourceConfig, active_log_pages, load_named_config,
-    load_project_config, print_log_page_tail_with_options, run,
+    load_project_config, print_log_page_sources, print_log_page_tail_with_options, run,
 };
 
 #[derive(Debug, Parser)]
@@ -17,7 +17,7 @@ use loggle::{
     name = "loggle",
     about = "A terminal log viewer for piped Docker Compose-style logs.",
     dont_delimit_trailing_values = true,
-    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
+    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
 )]
 struct Cli {
     #[arg(long, default_value_t = 100_000, value_parser = parse_buffer_lines)]
@@ -65,6 +65,12 @@ struct LogCli {
     lines: usize,
 
     #[arg(
+        long,
+        help = "Strip ANSI/control codes from output; leave stored logs and matching unchanged"
+    )]
+    clean: bool,
+
+    #[arg(
         short = 's',
         long = "source",
         visible_alias = "service",
@@ -97,6 +103,19 @@ struct LogCli {
 #[derive(Debug, Parser)]
 #[command(name = "loggle pages", about = "List active tagged Loggle pages.")]
 struct PagesCli {}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "loggle sources",
+    about = "List observed source names and record counts in a retained page (not Compose service aliases)."
+)]
+struct SourcesCli {
+    #[arg(short = 'i', long = "id", value_name = "ID")]
+    id: LogPageId,
+
+    #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
+    source_fields: Vec<String>,
+}
 
 fn parse_buffer_lines(input: &str) -> Result<usize, String> {
     let value = input
@@ -157,6 +176,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         return report_command(run_pages_command(cli));
     }
+    if raw_args.first().is_some_and(|arg| arg == "sources") {
+        let cli = SourcesCli::parse_from(
+            std::iter::once("loggle sources".to_string()).chain(raw_args.iter().skip(1).cloned()),
+        );
+        return report_command(print_log_page_sources(
+            &cli.id,
+            SourceConfig::with_fields(cli.source_fields),
+            &mut io::stdout().lock(),
+        ));
+    }
 
     let cli = Cli::parse();
     // clap captures the trailing command verbatim (trailing_var_arg), so it is
@@ -201,6 +230,7 @@ fn report_command(result: Result<(), LogPageError>) -> Result<(), Box<dyn Error>
 fn run_log_command(cli: LogCli) -> Result<(), LogPageError> {
     let options = LogPageTailOptions {
         line_count: cli.lines,
+        clean: cli.clean,
         source: cli.source,
         text: cli.text,
         property_filters: cli.property_filters,
@@ -593,9 +623,11 @@ api = ["pnpm", "start"]
             "tenantId=tenant-1",
             "--source-field",
             "service",
+            "--clean",
         ]))
         .unwrap();
 
+        assert!(cli.clean);
         assert_eq!(cli.id.as_str(), "1");
         assert_eq!(cli.lines, 5);
         assert_eq!(cli.source.as_deref(), Some("api"));
@@ -607,6 +639,30 @@ api = ["pnpm", "start"]
     #[test]
     fn pages_command_cli_parses() {
         PagesCli::try_parse_from(command(&["loggle pages"])).unwrap();
+    }
+
+    #[test]
+    fn source_discovery_requires_page_and_supports_custom_source_fields() {
+        assert!(SourcesCli::try_parse_from(["loggle sources"]).is_err());
+        let cli = SourcesCli::try_parse_from([
+            "loggle sources",
+            "-i",
+            "vev",
+            "--source-field",
+            "unit,logger",
+        ])
+        .unwrap();
+        assert_eq!(cli.id.as_str(), "vev");
+        assert_eq!(cli.source_fields, command(&["unit", "logger"]));
+        assert!(
+            !LogCli::try_parse_from(["loggle log", "-i", "vev"])
+                .unwrap()
+                .clean
+        );
+        assert_eq!(
+            parse_cli(&command(&["--", "sources", "--help"])).command,
+            command(&["sources", "--help"])
+        );
     }
 
     #[test]

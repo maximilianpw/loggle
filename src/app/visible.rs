@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::{
     buffer::{BufferChange, LogBuffer},
     filter::LogFilter,
@@ -6,7 +8,10 @@ use crate::{
 
 #[derive(Debug, Default)]
 pub(super) struct VisibleLogView {
-    cache: Vec<u64>,
+    /// Sequences of events matching the active filters, sorted ascending.
+    /// Evictions remove the oldest (front) sequence, so a deque keeps that
+    /// O(1) instead of shifting the whole cache per incoming line.
+    cache: VecDeque<u64>,
     selected: usize,
     viewport_start: usize,
     follow: bool,
@@ -296,12 +301,58 @@ impl VisibleLogView {
     }
 
     fn remove_sequence(&mut self, sequence: u64) {
-        if let Some(index) = self
-            .cache
-            .iter()
-            .position(|cached_sequence| *cached_sequence == sequence)
-        {
+        if self.cache.front() == Some(&sequence) {
+            self.cache.pop_front();
+        } else if let Ok(index) = self.cache.binary_search(&sequence) {
             self.cache.remove(index);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached(view: &VisibleLogView) -> Vec<u64> {
+        view.cache.iter().copied().collect()
+    }
+
+    #[test]
+    fn filtered_cache_stays_sorted_across_evictions_and_updates() {
+        let filters = LogFilter {
+            text: Some("keep".to_string()),
+            ..LogFilter::default()
+        };
+        let mut buffer = LogBuffer::new(4);
+        let mut view = VisibleLogView::new();
+        view.on_filters_changed(&buffer, &filters);
+
+        for index in 0..10 {
+            let label = if index % 2 == 0 { "keep" } else { "drop" };
+            let change = buffer.push_line(format!("[api] INFO {label} {index}"));
+            view.on_line_received(&change, &buffer, &filters);
+        }
+
+        // Buffer retains 6..=9; only even sequences match.
+        assert_eq!(cached(&view), vec![6, 8]);
+        assert_eq!(view.visible_count(&buffer, &filters), 2);
+        assert_eq!(
+            view.event_at(&buffer, &filters, 1).unwrap().message,
+            "keep 8"
+        );
+
+        // Re-refreshing an existing sequence keeps a single sorted entry.
+        view.refresh_sequence(6, &buffer, &filters);
+        assert_eq!(cached(&view), vec![6, 8]);
+
+        // Removing a non-front sequence uses the binary-search path.
+        view.remove_sequence(8);
+        assert_eq!(cached(&view), vec![6]);
+        view.refresh_sequence(8, &buffer, &filters);
+        assert_eq!(cached(&view), vec![6, 8]);
+
+        let mut rebuilt = VisibleLogView::new();
+        rebuilt.on_filters_changed(&buffer, &filters);
+        assert_eq!(cached(&rebuilt), cached(&view));
     }
 }
