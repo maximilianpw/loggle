@@ -326,6 +326,7 @@ fn source_counts<R: BufRead>(
     for line in reader.lines() {
         buffer.push_line(line?);
     }
+    buffer.finish_input();
     let mut counts = BTreeMap::new();
     for event in buffer.events() {
         *counts.entry(event.source.clone()).or_default() += 1;
@@ -712,6 +713,7 @@ fn tail_matching_records<R: BufRead>(
             groups[index].push(line);
         }
     }
+    buffer.finish_input();
 
     let filter = log_filter_for_options(options)?;
     let matching = buffer

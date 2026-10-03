@@ -112,13 +112,6 @@ impl LogBuffer {
 
     /// Ends input: an unclosed property block is dropped without applying any
     /// of its partial properties. Call once the source reaches EOF.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "EOF callers in runtime/terminal.rs and page_log.rs are wired separately"
-        )
-    )]
     pub(crate) fn finish_input(&mut self) {
         self.pending_properties = None;
     }

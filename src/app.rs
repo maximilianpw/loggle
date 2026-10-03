@@ -123,6 +123,12 @@ impl App {
         }
     }
 
+    /// Marks the end of input so an unterminated property block is dropped
+    /// rather than left waiting for lines that will never arrive.
+    pub fn finish_input(&mut self) {
+        self.buffer.finish_input();
+    }
+
     pub fn push_line(&mut self, line: String) {
         let change = self.buffer.push_line(line);
         self.apply_buffer_change(change);

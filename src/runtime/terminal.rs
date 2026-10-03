@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::{self, BufWriter, Write},
     path::PathBuf,
-    sync::mpsc::Receiver,
+    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -193,14 +193,30 @@ fn run_app(
     }
     let _active_page = active_page;
     let mut start_notice = None;
+    let mut input_ended = false;
 
     loop {
         let mut received = false;
-        while let Ok(line) = rx.try_recv() {
-            recorders.ingest(&mut app, &line)?;
-            app.push_line(line);
-            received = true;
-            dirty = true;
+        loop {
+            match rx.try_recv() {
+                Ok(line) => {
+                    recorders.ingest(&mut app, &line)?;
+                    app.push_line(line);
+                    received = true;
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Every reader thread has exited: no more lines will come,
+                    // so close any property block still waiting for its `}`.
+                    if !input_ended {
+                        input_ended = true;
+                        app.finish_input();
+                        dirty = true;
+                    }
+                    break;
+                }
+            }
         }
 
         // Flush once per drain instead of per line, so the read command sees
