@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, fmt, io, path::PathBuf, sync::mpsc, time::Durat
 
 use crate::{model::SourceConfig, page_log::LogPageId};
 
-use input::Child;
+use input::{Child, StartScheduler};
 pub(crate) use start_plan::StartPlan;
 
 #[derive(Debug, Clone)]
@@ -97,21 +97,21 @@ impl From<io::Error> for RuntimeError {
 
 pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
     let (tx, rx) = mpsc::sync_channel(input::LINE_CHANNEL_CAPACITY);
-    let started = start_input(&config.input, tx, &rx, config.buffer_lines)?;
+    let started = start_input(&config.input, tx)?;
 
-    terminal::run(rx, started.startup_lines, started.children, config).map_err(RuntimeError::from)
+    terminal::run(rx, started.children, started.scheduler, config).map_err(RuntimeError::from)
 }
 
 struct StartedInput {
     children: Vec<Child>,
-    startup_lines: Vec<String>,
+    /// `loggle start` spawns nothing up front: the event loop ticks the
+    /// scheduler so the terminal is interactive while commands become ready.
+    scheduler: Option<StartScheduler>,
 }
 
 fn start_input(
     input_mode: &RuntimeInput,
     tx: mpsc::SyncSender<String>,
-    rx: &mpsc::Receiver<String>,
-    startup_line_capacity: usize,
 ) -> Result<StartedInput, RuntimeError> {
     match input_mode {
         RuntimeInput::Stdin => {
@@ -122,24 +122,20 @@ fn start_input(
             input::spawn_stdin_reader(tx)?;
             Ok(StartedInput {
                 children: Vec::new(),
-                startup_lines: Vec::new(),
+                scheduler: None,
             })
         }
         RuntimeInput::Command(command) => Ok(StartedInput {
             children: vec![input::spawn_command(command, tx)?],
-            startup_lines: Vec::new(),
+            scheduler: None,
         }),
         RuntimeInput::Commands(commands) => Ok(StartedInput {
             children: input::spawn_named_commands(commands, tx)?,
-            startup_lines: Vec::new(),
+            scheduler: None,
         }),
-        RuntimeInput::StartCommands(commands) => {
-            let (startup_lines, children) =
-                input::spawn_start_commands_draining(commands, tx, rx, startup_line_capacity)?;
-            Ok(StartedInput {
-                children,
-                startup_lines,
-            })
-        }
+        RuntimeInput::StartCommands(commands) => Ok(StartedInput {
+            children: Vec::new(),
+            scheduler: Some(StartScheduler::new(commands.clone(), tx)?),
+        }),
     }
 }

@@ -5,7 +5,7 @@ use std::{
     os::fd::FromRawFd,
     os::unix::process::CommandExt,
     path::Path,
-    process::{Child as ProcessChild, Command, Stdio},
+    process::{Child as ProcessChild, Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -72,25 +72,21 @@ pub(super) fn spawn_named_commands(
     Ok(children)
 }
 
+/// Drives a scheduler to completion. The event loop ticks it instead, so the
+/// terminal stays interactive while commands wait on readiness.
 #[cfg(test)]
 pub(super) fn spawn_start_commands(
     commands: &[StartCommand],
     tx: mpsc::SyncSender<String>,
 ) -> io::Result<Vec<Child>> {
-    let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
-    StartScheduler::new(plan, tx).run(None, None)
-}
+    let mut scheduler = StartScheduler::new(commands.to_vec(), tx)?;
+    let mut children = Vec::new();
 
-pub(super) fn spawn_start_commands_draining(
-    commands: &[StartCommand],
-    tx: mpsc::SyncSender<String>,
-    rx: &mpsc::Receiver<String>,
-    retained_lines: usize,
-) -> io::Result<(Vec<String>, Vec<Child>)> {
-    let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
-    let mut startup_lines = StartupLineBuffer::new(retained_lines);
-    let children = StartScheduler::new(plan, tx).run(Some(rx), Some(&mut startup_lines))?;
-    Ok((startup_lines.into_vec(), children))
+    while scheduler.tick(&mut children, Instant::now())? == StartProgress::InProgress {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    Ok(children)
 }
 
 fn spawn_named_command(command: &NamedCommand, tx: mpsc::SyncSender<String>) -> io::Result<Child> {
@@ -268,67 +264,125 @@ struct SpawnedStartCommand {
     line_ready_rx: Option<mpsc::Receiver<()>>,
 }
 
-struct StartScheduler<'a> {
-    plan: StartPlan<'a>,
+/// Starts `loggle start` commands in dependency order without blocking. The
+/// event loop ticks it so the terminal stays interactive while commands wait on
+/// readiness.
+pub(super) struct StartScheduler {
+    commands: Vec<StartCommand>,
+    dependencies: Vec<Vec<usize>>,
     tx: mpsc::SyncSender<String>,
     states: Vec<StartState>,
-    children: Vec<Option<Child>>,
+    /// Index of each spawned command in the caller's `children`.
+    child_slots: Vec<Option<usize>>,
     line_ready: Vec<Option<mpsc::Receiver<()>>>,
     command_ready: Vec<Option<CommandReadyState>>,
 }
 
-impl<'a> StartScheduler<'a> {
-    fn new(plan: StartPlan<'a>, tx: mpsc::SyncSender<String>) -> Self {
-        let len = plan.len();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartProgress {
+    InProgress,
+    Ready,
+}
 
-        Self {
-            plan,
+impl StartScheduler {
+    pub(super) fn new(
+        commands: Vec<StartCommand>,
+        tx: mpsc::SyncSender<String>,
+    ) -> io::Result<Self> {
+        let plan =
+            StartPlan::new(&commands).map_err(|error| io::Error::other(error.to_string()))?;
+        let dependencies = (0..commands.len())
+            .map(|index| plan.dependency_indexes(index).collect())
+            .collect();
+        let len = commands.len();
+
+        Ok(Self {
+            commands,
+            dependencies,
             tx,
             states: vec![StartState::Pending; len],
-            children: (0..len).map(|_| None).collect(),
+            child_slots: vec![None; len],
             line_ready: (0..len).map(|_| None).collect(),
             command_ready: (0..len).map(|_| None).collect(),
+        })
+    }
+
+    /// Spawns every command whose dependencies are ready and polls readiness.
+    /// Spawned children are pushed onto `children`, so the caller's shutdown
+    /// path owns them from the moment they start; the caller must not reorder
+    /// or remove them while the scheduler is in progress.
+    pub(super) fn tick(
+        &mut self,
+        children: &mut Vec<Child>,
+        now: Instant,
+    ) -> io::Result<StartProgress> {
+        loop {
+            let mut progressed = self.spawn_unblocked(children, now)?;
+            progressed |= self.check_readiness(children, now)?;
+
+            if !progressed {
+                break;
+            }
+        }
+
+        if self.all_ready() {
+            Ok(StartProgress::Ready)
+        } else {
+            Ok(StartProgress::InProgress)
         }
     }
 
-    fn run(
-        mut self,
-        startup_rx: Option<&mpsc::Receiver<String>>,
-        mut startup_lines: Option<&mut StartupLineBuffer>,
-    ) -> io::Result<Vec<Child>> {
-        while !self.all_ready() {
-            let now = Instant::now();
-            let mut progressed = self.spawn_unblocked(now)?;
-            progressed |= self.check_readiness(now)?;
-
-            if !progressed {
-                thread::sleep(Duration::from_millis(10));
-            }
-
-            drain_startup_lines(startup_rx, &mut startup_lines);
+    /// Summarises startup for the status line, e.g.
+    /// `starting: 1/3 ready; waiting for db (times out in 12s)`.
+    pub(super) fn progress_notice(&self, now: Instant) -> String {
+        let ready = self
+            .states
+            .iter()
+            .filter(|state| **state == StartState::Ready)
+            .count();
+        let mut notice = format!("starting: {ready}/{} ready", self.commands.len());
+        let waiting = (0..self.commands.len())
+            .filter(|index| self.states[*index] == StartState::Started)
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            return notice;
         }
 
-        drain_startup_lines(startup_rx, &mut startup_lines);
+        let names = waiting
+            .iter()
+            .map(|index| self.commands[*index].name.as_str())
+            .collect::<Vec<_>>();
+        notice.push_str("; waiting for ");
+        notice.push_str(&names.join(", "));
 
-        Ok(self
-            .children
-            .into_iter()
-            .map(|child| child.expect("ready start commands have children"))
-            .collect())
+        let deadline = waiting
+            .iter()
+            .filter_map(|index| self.command_ready[*index].as_ref())
+            .map(|command_ready| command_ready.deadline)
+            .min();
+        if let Some(deadline) = deadline {
+            let seconds = deadline
+                .saturating_duration_since(now)
+                .as_millis()
+                .div_ceil(1000);
+            notice.push_str(&format!(" (times out in {seconds}s)"));
+        }
+
+        notice
     }
 
     fn all_ready(&self) -> bool {
         self.states.iter().all(|state| *state == StartState::Ready)
     }
 
-    fn spawn_unblocked(&mut self, now: Instant) -> io::Result<bool> {
+    fn spawn_unblocked(&mut self, children: &mut Vec<Child>, now: Instant) -> io::Result<bool> {
         let mut progressed = false;
-        for index in 0..self.plan.len() {
+        for index in 0..self.commands.len() {
             if self.states[index] != StartState::Pending || !self.dependencies_ready(index) {
                 continue;
             }
 
-            self.spawn_command(index, now)?;
+            self.spawn_command(index, children, now)?;
             progressed = true;
         }
 
@@ -336,16 +390,22 @@ impl<'a> StartScheduler<'a> {
     }
 
     fn dependencies_ready(&self, index: usize) -> bool {
-        self.plan
-            .dependency_indexes(index)
-            .all(|dependency_index| self.states[dependency_index] == StartState::Ready)
+        self.dependencies[index]
+            .iter()
+            .all(|dependency_index| self.states[*dependency_index] == StartState::Ready)
     }
 
-    fn spawn_command(&mut self, index: usize, now: Instant) -> io::Result<()> {
-        let command = self.plan.command(index);
+    fn spawn_command(
+        &mut self,
+        index: usize,
+        children: &mut Vec<Child>,
+        now: Instant,
+    ) -> io::Result<()> {
+        let command = &self.commands[index];
         let spawned = spawn_start_command(command, self.tx.clone())?;
 
-        self.children[index] = Some(spawned.child);
+        self.child_slots[index] = Some(children.len());
+        children.push(spawned.child);
         match &command.ready {
             None => {
                 self.states[index] = StartState::Ready;
@@ -373,15 +433,15 @@ impl<'a> StartScheduler<'a> {
         Ok(())
     }
 
-    fn check_readiness(&mut self, now: Instant) -> io::Result<bool> {
+    fn check_readiness(&mut self, children: &mut [Child], now: Instant) -> io::Result<bool> {
         let mut progressed = false;
 
-        for index in 0..self.plan.len() {
+        for index in 0..self.commands.len() {
             if self.states[index] != StartState::Started {
                 continue;
             }
 
-            let command = self.plan.command(index);
+            let command = &self.commands[index];
 
             if self.line_ready[index]
                 .as_ref()
@@ -393,18 +453,12 @@ impl<'a> StartScheduler<'a> {
             }
 
             if let Some(command_ready) = self.command_ready[index].as_mut() {
-                if command_ready.is_command_probe_due(now) {
-                    let probe_outcome =
-                        command_ready.run_probe(command.cwd.as_deref(), &command.env, now)?;
-
-                    match probe_outcome {
-                        ProbeOutcome::Ready => {
-                            self.states[index] = StartState::Ready;
-                            progressed = true;
-                            continue;
-                        }
-                        ProbeOutcome::NotReady => {}
-                    }
+                let probe_outcome =
+                    command_ready.poll_probe(command.cwd.as_deref(), &command.env, now)?;
+                if let ProbeOutcome::Ready = probe_outcome {
+                    self.states[index] = StartState::Ready;
+                    progressed = true;
+                    continue;
                 }
 
                 if now >= command_ready.deadline {
@@ -412,10 +466,9 @@ impl<'a> StartScheduler<'a> {
                 }
             }
 
-            if let Some(child) = self.children[index].as_mut() {
+            if let Some(child) = self.child_slots[index].map(|slot| &mut children[slot]) {
                 if let Some(status) = child.try_wait()? {
                     input_reap_child(child);
-                    self.children[index] = None;
                     let message = format!(
                         "command '{}' exited before readiness{}",
                         command.name,
@@ -430,57 +483,6 @@ impl<'a> StartScheduler<'a> {
         }
 
         Ok(progressed)
-    }
-}
-
-fn drain_startup_lines(
-    startup_rx: Option<&mpsc::Receiver<String>>,
-    startup_lines: &mut Option<&mut StartupLineBuffer>,
-) {
-    let Some(rx) = startup_rx else {
-        return;
-    };
-    let Some(lines) = startup_lines.as_deref_mut() else {
-        return;
-    };
-
-    lines.drain(rx);
-}
-
-#[derive(Debug)]
-struct StartupLineBuffer {
-    lines: VecDeque<String>,
-    capacity: usize,
-}
-
-impl StartupLineBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            lines: VecDeque::with_capacity(capacity.min(LINE_CHANNEL_CAPACITY)),
-            capacity,
-        }
-    }
-
-    fn drain(&mut self, rx: &mpsc::Receiver<String>) {
-        // Stops on both empty and disconnected: startup only takes what is queued.
-        while let Ok(line) = rx.try_recv() {
-            self.push(line);
-        }
-    }
-
-    fn push(&mut self, line: String) {
-        if self.capacity == 0 {
-            return;
-        }
-
-        while self.lines.len() >= self.capacity {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(line);
-    }
-
-    fn into_vec(self) -> Vec<String> {
-        self.lines.into_iter().collect()
     }
 }
 
@@ -518,20 +520,17 @@ impl CommandReadyState {
                 command,
                 interval,
                 next_probe,
+                running: None,
             },
             deadline,
             recent_output: RecentProbeOutput::new(),
         }
     }
 
-    fn is_command_probe_due(&self, now: Instant) -> bool {
-        matches!(
-            &self.kind,
-            ReadyKind::Command { next_probe, .. } if now >= *next_probe
-        )
-    }
-
-    fn run_probe(
+    /// Advances the readiness probe one step without blocking: starts it when
+    /// due, or collects its result once it has finished. A probe still running
+    /// at the deadline is killed and reported as timed out.
+    fn poll_probe(
         &mut self,
         cwd: Option<&Path>,
         env: &BTreeMap<String, String>,
@@ -541,12 +540,26 @@ impl CommandReadyState {
             command,
             interval,
             next_probe,
+            running,
         } = &mut self.kind
         else {
             return Ok(ProbeOutcome::NotReady);
         };
 
-        let probe = run_probe_with_deadline(command, cwd, env, self.deadline)?;
+        let Some(mut probe) = running.take() else {
+            if now >= *next_probe {
+                *running = Some(RunningProbe::spawn(command, cwd, env)?);
+            }
+            return Ok(ProbeOutcome::NotReady);
+        };
+
+        if !probe.has_finished()? && now < self.deadline {
+            *running = Some(probe);
+            return Ok(ProbeOutcome::NotReady);
+        }
+
+        let probe = probe.finish();
+        *next_probe = now + *interval;
         self.recent_output.push(probe.output_summary());
 
         if probe.success {
@@ -556,7 +569,6 @@ impl CommandReadyState {
             return Err(self.timeout_error_for_output("readiness probe timed out"));
         }
 
-        *next_probe = now + *interval;
         Ok(ProbeOutcome::NotReady)
     }
 
@@ -590,6 +602,7 @@ enum ReadyKind {
         command: Vec<String>,
         interval: Duration,
         next_probe: Instant,
+        running: Option<RunningProbe>,
     },
 }
 
@@ -597,6 +610,80 @@ enum ReadyKind {
 enum ProbeOutcome {
     Ready,
     NotReady,
+}
+
+/// A readiness probe in flight. Its output is read on background threads so
+/// a chatty probe cannot block on a full pipe while the event loop polls it.
+#[derive(Debug)]
+struct RunningProbe {
+    child: Child,
+    status: Option<ExitStatus>,
+    stdout: thread::JoinHandle<Vec<u8>>,
+    stderr: thread::JoinHandle<Vec<u8>>,
+}
+
+impl RunningProbe {
+    fn spawn(
+        command: &[String],
+        cwd: Option<&Path>,
+        env: &BTreeMap<String, String>,
+    ) -> io::Result<Self> {
+        let mut child = spawn_probe(command, cwd, env)?;
+        let stdout = child
+            .stdout
+            .take()
+            .map(read_pipe_in_thread)
+            .expect("probe stdout is piped");
+        let stderr = child
+            .stderr
+            .take()
+            .map(read_pipe_in_thread)
+            .expect("probe stderr is piped");
+
+        Ok(Self {
+            child,
+            status: None,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// The probe has finished once it has exited and its output is fully read.
+    fn has_finished(&mut self) -> io::Result<bool> {
+        if self.status.is_none() {
+            self.status = self.child.try_wait()?;
+        }
+
+        Ok(self.status.is_some() && self.stdout.is_finished() && self.stderr.is_finished())
+    }
+
+    /// Kills the probe's process group, which also closes the output pipes of
+    /// any descendant it left behind, and collects what it wrote.
+    fn finish(mut self) -> ProbeRun {
+        force_kill_child_group(&mut self.child);
+
+        ProbeRun {
+            success: self.status.is_some_and(|status| status.success()),
+            timed_out: self.status.is_none(),
+            stdout: probe_output(self.stdout),
+            stderr: probe_output(self.stderr),
+        }
+    }
+}
+
+/// A descendant that left the probe's process group can hold its pipe open
+/// indefinitely; give up on that output rather than stall the event loop.
+fn probe_output(reader: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    if reader.is_finished() {
+        reader.join().unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Debug)]
@@ -659,53 +746,6 @@ impl RecentProbeOutput {
             .collect::<Vec<_>>()
             .join("\n---\n")
     }
-}
-
-fn run_probe_with_deadline(
-    command: &[String],
-    cwd: Option<&Path>,
-    env: &BTreeMap<String, String>,
-    deadline: Instant,
-) -> io::Result<ProbeRun> {
-    let mut child = spawn_probe(command, cwd, env)?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(read_pipe_in_thread)
-        .expect("probe stdout is piped");
-    let stderr = child
-        .stderr
-        .take()
-        .map(read_pipe_in_thread)
-        .expect("probe stderr is piped");
-    let mut timed_out = false;
-    let success;
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            success = status.success();
-            break;
-        }
-
-        if Instant::now() >= deadline {
-            timed_out = true;
-            force_kill_child_group(&mut child);
-            success = false;
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-
-    Ok(ProbeRun {
-        success,
-        timed_out,
-        stdout,
-        stderr,
-    })
 }
 
 fn read_pipe_in_thread<R>(mut input: R) -> thread::JoinHandle<Vec<u8>>
@@ -1054,21 +1094,44 @@ mod tests {
     }
 
     #[test]
-    fn startup_line_buffer_drains_channel_and_keeps_tail() {
-        let (tx, rx) = mpsc::sync_channel(4);
-        for index in 0..4 {
-            tx.try_send(format!("line {index}")).unwrap();
-        }
-        assert!(tx.try_send("would-block".to_string()).is_err());
+    fn hanging_ready_probe_does_not_block_tick() {
+        let (tx, _rx) = mpsc::sync_channel(16);
+        let mut db = start_command("db", &["/bin/sh", "-c", "sleep 5"]);
+        db.ready = Some(ReadySpec::Command {
+            command: command(&["/bin/sh", "-c", "echo probing; sleep 5"]),
+            interval: Duration::from_millis(25),
+            timeout: Duration::from_millis(300),
+        });
+        let api = start_command("api", &["/bin/sh", "-c", "sleep 5"]);
+        let mut scheduler = StartScheduler::new(vec![db, api], tx).unwrap();
+        let mut children = Vec::new();
+        let started = Instant::now();
 
-        let mut buffer = StartupLineBuffer::new(2);
-        buffer.drain(&rx);
+        let progress = scheduler.tick(&mut children, started).unwrap();
 
+        assert_eq!(progress, StartProgress::InProgress);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(children.len(), 2);
         assert_eq!(
-            buffer.into_vec(),
-            vec!["line 2".to_string(), "line 3".to_string()]
+            scheduler.progress_notice(started),
+            "starting: 1/2 ready; waiting for db (times out in 1s)"
         );
-        tx.try_send("line 4".to_string()).unwrap();
+
+        let error = loop {
+            match scheduler.tick(&mut children, Instant::now()) {
+                Ok(progress) => assert_eq!(progress, StartProgress::InProgress),
+                Err(error) => break error,
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        cleanup_children(&mut children);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            error.to_string(),
+            "readiness probe timed out\nrecent readiness probe output:\nstdout:\nprobing"
+        );
     }
 
     #[test]
