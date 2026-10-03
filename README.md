@@ -271,7 +271,7 @@ loggle facets -i 1
 # Versioned machine-readable groups, including values for one exact key
 loggle facets -i 1 --property-key tenantId --format jsonl
 
-# Facets compose with the same query flags as `loggle log`
+# Facets compose with the same filter flags as `loggle log` (`--clean` is log-only)
 loggle facets -i 1 --source api --level error --property region=eu --records 5000 --limit 10
 ```
 
