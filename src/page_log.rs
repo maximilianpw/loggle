@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     env, fmt, fs,
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -179,7 +179,7 @@ impl LogPageTailOptions {
 }
 
 pub fn active_log_pages() -> Result<Vec<ActiveLogPage>, LogPageError> {
-    active_log_pages_from_dir(&log_page_registry_dir())
+    active_log_pages_from_dir(&log_page_registry_dir(), &log_page_dir())
 }
 
 pub fn print_log_page_tail<W: Write>(
@@ -235,8 +235,17 @@ fn source_counts<R: BufRead>(
     Ok(counts)
 }
 
+/// Appends a session's lines to its page log on disk.
+///
+/// The page log is stored as two segments: the current segment `<id>.log` and
+/// the previous, rotated segment `<id>.log.1`. Once the current segment holds
+/// `max_lines` lines it is renamed over the rotated segment and a fresh current
+/// segment is started, so readers that concatenate both segments always see
+/// between `max_lines` and `2 × max_lines` of the most recent lines. Rotation is
+/// a rename plus a reopen, so it never reads the log back on the UI thread.
 pub(crate) struct PageLogRecorder {
     path: PathBuf,
+    rotated_path: PathBuf,
     writer: BufWriter<File>,
     max_lines: usize,
     lines_written: usize,
@@ -244,7 +253,8 @@ pub(crate) struct PageLogRecorder {
 
 #[derive(Debug)]
 pub(crate) struct ActiveLogPageRegistration {
-    path: PathBuf,
+    metadata_path: PathBuf,
+    log_path: PathBuf,
 }
 
 impl PageLogRecorder {
@@ -262,6 +272,14 @@ impl PageLogRecorder {
             path: dir.to_path_buf(),
             source,
         })?;
+        let rotated_path = rotated_log_page_path(&path);
+        // A rotated segment left by an earlier session with the same id would
+        // otherwise be read as this session's history.
+        remove_file_if_exists(&rotated_path).map_err(|source| LogPageError::Io {
+            action: "remove stale log page segment",
+            path: rotated_path.clone(),
+            source,
+        })?;
         let file = File::create(&path).map_err(|source| LogPageError::Io {
             action: "create log page",
             path: path.clone(),
@@ -270,6 +288,7 @@ impl PageLogRecorder {
 
         Ok(Self {
             path,
+            rotated_path,
             writer: BufWriter::new(file),
             max_lines,
             lines_written: 0,
@@ -280,10 +299,10 @@ impl PageLogRecorder {
         writeln!(self.writer, "{line}")?;
         self.lines_written += 1;
         // Keep the on-disk log bounded to the same window as the in-memory
-        // buffer: let it grow to twice the cap, then compact back down so the
-        // rewrite cost is amortised across `max_lines` appends.
-        if self.max_lines > 0 && self.lines_written >= self.max_lines.saturating_mul(2) {
-            self.compact()?;
+        // buffer: once the current segment is full, rotate it out so at most
+        // two segments' worth of lines are retained.
+        if self.max_lines > 0 && self.lines_written >= self.max_lines {
+            self.rotate()?;
         }
         Ok(())
     }
@@ -292,32 +311,31 @@ impl PageLogRecorder {
         self.writer.flush()
     }
 
-    fn compact(&mut self) -> io::Result<()> {
+    fn rotate(&mut self) -> io::Result<()> {
+        // Flush before renaming so the rotated segment ends on a whole line.
         self.writer.flush()?;
-        let retained = {
-            let file = File::open(&self.path)?;
-            tail_lines(BufReader::new(file), self.max_lines)?
-        };
-        let mut file = File::create(&self.path)?;
-        for line in &retained {
-            writeln!(file, "{line}")?;
-        }
-        file.flush()?;
-        self.lines_written = retained.len();
-        self.writer = BufWriter::new(file);
+        fs::rename(&self.path, &self.rotated_path)?;
+        self.writer = BufWriter::new(File::create(&self.path)?);
+        self.lines_written = 0;
         Ok(())
     }
 }
 
 impl ActiveLogPageRegistration {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
+    fn new(metadata_path: PathBuf, log_path: PathBuf) -> Self {
+        Self {
+            metadata_path,
+            log_path,
+        }
     }
 }
 
 impl Drop for ActiveLogPageRegistration {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Remove the log before releasing the id, so a session that claims the
+        // id afterwards cannot have its fresh log deleted by us.
+        remove_log_page_segments(&self.log_path);
+        let _ = fs::remove_file(&self.metadata_path);
     }
 }
 
@@ -325,20 +343,27 @@ pub(crate) fn claim_active_log_page(
     requested: Option<LogPageId>,
     command: impl Into<String>,
 ) -> Result<(LogPageId, ActiveLogPageRegistration), LogPageError> {
-    claim_active_log_page_in_dir(requested, command, &log_page_registry_dir())
+    claim_active_log_page_in_dir(
+        requested,
+        command,
+        &log_page_registry_dir(),
+        &log_page_dir(),
+    )
 }
 
 fn claim_active_log_page_in_dir(
     requested: Option<LogPageId>,
     command: impl Into<String>,
-    dir: &Path,
+    registry_dir: &Path,
+    page_dir: &Path,
 ) -> Result<(LogPageId, ActiveLogPageRegistration), LogPageError> {
     let command = command.into();
     // Reaps metadata left behind by dead processes so their ids can be reused.
-    let active = active_log_pages_from_dir(dir)?;
+    let active = active_log_pages_from_dir(registry_dir, page_dir)?;
 
     if let Some(requested) = requested {
-        let registration = try_register_active_log_page(&requested, &command, dir)?;
+        let registration =
+            try_register_active_log_page(&requested, &command, registry_dir, page_dir)?;
         return Ok((requested, registration));
     }
 
@@ -347,7 +372,7 @@ fn claim_active_log_page_in_dir(
         if active.iter().any(|page| page.id == id.as_str()) {
             continue;
         }
-        match try_register_active_log_page(&id, &command, dir) {
+        match try_register_active_log_page(&id, &command, registry_dir, page_dir) {
             Ok(registration) => return Ok((id, registration)),
             // Lost the race to a concurrently starting session; try the next id.
             Err(LogPageError::ActivePageIdInUse(_)) => continue,
@@ -363,15 +388,16 @@ fn claim_active_log_page_in_dir(
 fn try_register_active_log_page(
     id: &LogPageId,
     command: &str,
-    dir: &Path,
+    registry_dir: &Path,
+    page_dir: &Path,
 ) -> Result<ActiveLogPageRegistration, LogPageError> {
-    fs::create_dir_all(dir).map_err(|source| LogPageError::Io {
+    fs::create_dir_all(registry_dir).map_err(|source| LogPageError::Io {
         action: "create active page directory",
-        path: dir.to_path_buf(),
+        path: registry_dir.to_path_buf(),
         source,
     })?;
 
-    let path = active_log_page_path_in_dir(id, dir);
+    let path = active_log_page_path_in_dir(id, registry_dir);
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -400,25 +426,94 @@ fn try_register_active_log_page(
             source,
         })?;
 
-    Ok(ActiveLogPageRegistration::new(path))
+    Ok(ActiveLogPageRegistration::new(
+        path,
+        log_page_path_in_dir(id, page_dir),
+    ))
 }
 
-fn open_log_page(id: &LogPageId, path: &Path) -> Result<File, LogPageError> {
-    File::open(path).map_err(|source| {
-        if source.kind() == io::ErrorKind::NotFound {
-            LogPageError::MissingPage {
-                id: id.clone(),
-                path: path.to_path_buf(),
-            }
-        } else {
+/// Opens a page's retained window — the rotated segment followed by the
+/// current one — as a single stream of lines in recording order.
+fn open_log_page(id: &LogPageId, path: &Path) -> Result<Box<dyn Read>, LogPageError> {
+    // The recorder may rotate between our two opens, which would skip or
+    // duplicate a segment. Rotation always replaces the rotated segment, so
+    // detect it by checking that path still names the file we opened.
+    const OPEN_ATTEMPTS: usize = 3;
+
+    let rotated_path = rotated_log_page_path(path);
+    let mut attempt = 1;
+    loop {
+        let rotated = open_log_page_segment(&rotated_path)?;
+        let current = open_log_page_segment(path)?;
+        let unchanged = segment_unchanged(rotated.as_ref(), &rotated_path).map_err(|source| {
             LogPageError::Io {
                 action: "open log page",
-                path: path.to_path_buf(),
+                path: rotated_path.clone(),
                 source,
             }
+        })?;
+        if !unchanged && attempt < OPEN_ATTEMPTS {
+            attempt += 1;
+            continue;
         }
-    })
+
+        return match (rotated, current) {
+            (Some(rotated), Some(current)) => Ok(Box::new(rotated.chain(current))),
+            (Some(segment), None) | (None, Some(segment)) => Ok(Box::new(segment)),
+            (None, None) => Err(LogPageError::MissingPage {
+                id: id.clone(),
+                path: path.to_path_buf(),
+            }),
+        };
+    }
 }
+
+fn open_log_page_segment(path: &Path) -> Result<Option<File>, LogPageError> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(LogPageError::Io {
+            action: "open log page",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Whether `path` still names the segment that was opened (or is still absent).
+fn segment_unchanged(opened: Option<&File>, path: &Path) -> io::Result<bool> {
+    let opened = opened
+        .map(|file| file.metadata().map(|metadata| file_identity(&metadata)))
+        .transpose()?;
+    Ok(opened == path_identity(path)?)
+}
+
+/// Identifies the file a path currently names, or `None` when it is missing.
+fn path_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(file_identity(&metadata))),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+// Without a portable inode, only a segment appearing or disappearing is
+// detected; the window is still read in order, just possibly stale.
+#[cfg(not(unix))]
+type FileIdentity = ();
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {}
 
 fn print_log_page_tail_from_path<W: Write>(
     id: &LogPageId,
@@ -450,6 +545,12 @@ fn print_log_page_tail_from_path<W: Write>(
     Ok(())
 }
 
+/// Returns the last `options.line_count` records matching the filters, each
+/// emitted whole (header plus any folded multi-line block).
+///
+/// This loads the entire retained window into memory to parse it into events.
+/// That window is bounded by the recorder's rotation to at most
+/// `2 × buffer_lines` lines, which is the documented bound.
 fn filtered_tail_lines<R: BufRead>(
     reader: R,
     options: &LogPageTailOptions,
@@ -564,7 +665,31 @@ fn tail_lines<R: BufRead>(reader: R, line_count: usize) -> io::Result<Vec<String
 }
 
 fn log_page_path(id: &LogPageId) -> PathBuf {
-    log_page_dir().join(format!("{}.log", id.as_str()))
+    log_page_path_in_dir(id, &log_page_dir())
+}
+
+fn log_page_path_in_dir(id: &LogPageId, dir: &Path) -> PathBuf {
+    dir.join(format!("{}.log", id.as_str()))
+}
+
+/// The previous segment of a page log: `<id>.log.1` next to `<id>.log`.
+fn rotated_log_page_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
+/// Best-effort removal of both segments of a page log.
+fn remove_log_page_segments(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(rotated_log_page_path(path));
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(source) if source.kind() != io::ErrorKind::NotFound => Err(source),
+        _ => Ok(()),
+    }
 }
 
 fn log_page_dir() -> PathBuf {
@@ -579,7 +704,10 @@ fn active_log_page_path_in_dir(id: &LogPageId, dir: &Path) -> PathBuf {
     dir.join(format!("{}.json", id.as_str()))
 }
 
-fn active_log_pages_from_dir(dir: &Path) -> Result<Vec<ActiveLogPage>, LogPageError> {
+fn active_log_pages_from_dir(
+    dir: &Path,
+    page_dir: &Path,
+) -> Result<Vec<ActiveLogPage>, LogPageError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -616,12 +744,12 @@ fn active_log_pages_from_dir(dir: &Path) -> Result<Vec<ActiveLogPage>, LogPageEr
         if process_is_active(page.pid) {
             pages.push(page);
         } else {
-            // The owning process is gone: drop its metadata and its log file so
-            // stale pages do not accumulate in the state directory.
-            let _ = fs::remove_file(path);
+            // The owning process is gone: drop both log segments and then its
+            // metadata so stale pages do not accumulate in the state directory.
             if let Ok(id) = LogPageId::parse(&page.id) {
-                let _ = fs::remove_file(log_page_path(&id));
+                remove_log_page_segments(&log_page_path_in_dir(&id, page_dir));
             }
+            let _ = fs::remove_file(path);
         }
     }
 
@@ -1006,118 +1134,257 @@ mod tests {
         );
     }
 
+    /// A fresh state directory for one test, with separate registry and page
+    /// subdirectories so tests never touch the user's real page logs.
+    fn test_state_dir(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = env::temp_dir().join(format!("loggle-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let registry_dir = root.join("active-pages");
+        let page_dir = root.join("pages");
+        (root, registry_dir, page_dir)
+    }
+
+    fn read_page(id: &LogPageId, path: &Path, line_count: usize) -> Vec<String> {
+        let mut output = Vec::new();
+        print_log_page_tail_from_path(id, path, &LogPageTailOptions::new(line_count), &mut output)
+            .unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn page_log_recorder_truncates_and_flushes_lines() {
-        let path = env::temp_dir().join(format!(
-            "loggle-page-recorder-test-{}.log",
-            std::process::id()
-        ));
+        let (root, _, page_dir) = test_state_dir("page-recorder-test");
+        let path = page_dir.join("recorder.log");
+        let rotated_path = rotated_log_page_path(&path);
+        fs::create_dir_all(&page_dir).unwrap();
         fs::write(&path, "old\n").unwrap();
+        fs::write(&rotated_path, "stale\n").unwrap();
 
         {
             let mut recorder = PageLogRecorder::create_at_path(path.clone(), 100).unwrap();
+            // A previous session's segments must not leak into this page.
+            assert!(!rotated_path.exists());
             recorder.record_line("one").unwrap();
             recorder.record_line("two").unwrap();
             recorder.flush().unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+            assert!(!rotated_path.exists());
         }
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn page_log_recorder_compacts_to_stay_within_bound() {
-        let path = env::temp_dir().join(format!(
-            "loggle-page-recorder-compact-test-{}.log",
-            std::process::id()
-        ));
+        let (root, _, page_dir) = test_state_dir("page-recorder-compact-test");
+        let path = page_dir.join("recorder.log");
+        let rotated_path = rotated_log_page_path(&path);
 
         {
             let mut recorder = PageLogRecorder::create_at_path(path.clone(), 2).unwrap();
-            for index in 0..6 {
+            for index in 0..7 {
                 recorder.record_line(&format!("line {index}")).unwrap();
+                recorder.flush().unwrap();
+                let current = fs::read_to_string(&path).unwrap().lines().count();
+                let rotated = fs::read_to_string(&rotated_path)
+                    .map(|contents| contents.lines().count())
+                    .unwrap_or(0);
+                // Each segment holds less than a full window, so together they
+                // never exceed twice the cap.
+                assert!(current < 2, "current segment over cap after {index}");
+                assert!(rotated <= 2, "rotated segment over cap after {index}");
             }
-            recorder.flush().unwrap();
         }
 
-        let contents = fs::read_to_string(&path).unwrap();
-        let lines = contents.lines().collect::<Vec<_>>();
-        assert!(
-            lines.len() <= 4,
-            "compaction should keep the file bounded, got {lines:?}"
+        // Rotation is a rename: the full previous segment moves aside intact
+        // and the current segment keeps only what was written since.
+        assert_eq!(
+            fs::read_to_string(&rotated_path).unwrap(),
+            "line 4\nline 5\n"
         );
-        assert_eq!(lines.last(), Some(&"line 5"));
-        let _ = fs::remove_file(path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "line 6\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn page_log_reader_sees_lines_across_rotation_boundary_in_order() {
+        let (root, _, page_dir) = test_state_dir("page-rotation-read-test");
+        let id = LogPageId::parse("rotation").unwrap();
+        let path = log_page_path_in_dir(&id, &page_dir);
+
+        let mut recorder = PageLogRecorder::create_at_path(path.clone(), 3).unwrap();
+        for index in 0..8 {
+            recorder
+                .record_line(&format!("api | INFO line {index}"))
+                .unwrap();
+        }
+        recorder.flush().unwrap();
+
+        // Rotated segment holds lines 3..6 and the current one holds 6..8.
+        let expected = (3..8)
+            .map(|index| format!("api | INFO line {index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(read_page(&id, &path, 100), expected);
+        assert_eq!(read_page(&id, &path, 3), expected[2..]);
+
+        let mut options = LogPageTailOptions::new(3);
+        options.text = Some("line".to_string());
+        let mut output = Vec::new();
+        print_log_page_tail_from_path(&id, &path, &options, &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected[2..]
+        );
+
+        // Immediately after a rotation the current segment is empty and the
+        // whole window comes from the rotated segment.
+        recorder.record_line("api | INFO line 8").unwrap();
+        recorder.flush().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(read_page(&id, &path, 1), vec!["api | INFO line 8"]);
+
+        drop(recorder);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_page_reports_missing_page_error() {
+        let (root, _, page_dir) = test_state_dir("missing-page-test");
+        let id = LogPageId::parse("missing").unwrap();
+        let path = log_page_path_in_dir(&id, &page_dir);
+
+        let error =
+            print_log_page_tail_from_path(&id, &path, &LogPageTailOptions::new(1), &mut Vec::new())
+                .unwrap_err();
+
+        assert!(matches!(error, LogPageError::MissingPage { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaping_dead_page_removes_both_log_segments() {
+        let (root, registry_dir, page_dir) = test_state_dir("reap-page-test");
+        let id = LogPageId::parse("dead").unwrap();
+        let log_path = log_page_path_in_dir(&id, &page_dir);
+        let rotated_path = rotated_log_page_path(&log_path);
+        let metadata_path = active_log_page_path_in_dir(&id, &registry_dir);
+        fs::create_dir_all(&registry_dir).unwrap();
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(&log_path, "current\n").unwrap();
+        fs::write(&rotated_path, "rotated\n").unwrap();
+        let dead = ActiveLogPage {
+            id: id.as_str().to_string(),
+            // Pid 0 is never a live page owner.
+            pid: 0,
+            started_unix_seconds: 0,
+            command: "gone".to_string(),
+        };
+        fs::write(&metadata_path, serde_json::to_string(&dead).unwrap()).unwrap();
+
+        assert!(
+            active_log_pages_from_dir(&registry_dir, &page_dir)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(!metadata_path.exists());
+        assert!(!log_path.exists());
+        assert!(!rotated_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn active_log_page_registration_writes_and_removes_metadata() {
-        let dir = env::temp_dir().join(format!("loggle-active-page-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let (root, registry_dir, page_dir) = test_state_dir("active-page-test");
         let id = LogPageId::parse("api").unwrap();
+        let log_path = log_page_path_in_dir(&id, &page_dir);
+        let rotated_path = rotated_log_page_path(&log_path);
 
         {
-            let (claimed, _registration) =
-                claim_active_log_page_in_dir(Some(id), "docker compose up", &dir).unwrap();
+            let (claimed, _registration) = claim_active_log_page_in_dir(
+                Some(id),
+                "docker compose up",
+                &registry_dir,
+                &page_dir,
+            )
+            .unwrap();
             assert_eq!(claimed.as_str(), "api");
-            let pages = active_log_pages_from_dir(&dir).unwrap();
+            let pages = active_log_pages_from_dir(&registry_dir, &page_dir).unwrap();
 
             assert_eq!(pages.len(), 1);
             assert_eq!(pages[0].id, "api");
             assert_eq!(pages[0].pid, std::process::id());
             assert_eq!(pages[0].command, "docker compose up");
+
+            let mut recorder = PageLogRecorder::create_at_path(log_path.clone(), 1).unwrap();
+            recorder.record_line("one").unwrap();
+            recorder.record_line("two").unwrap();
+            recorder.flush().unwrap();
+            assert!(log_path.exists());
+            assert!(rotated_path.exists());
         }
 
-        assert!(active_log_pages_from_dir(&dir).unwrap().is_empty());
-        let _ = fs::remove_dir_all(dir);
+        assert!(
+            active_log_pages_from_dir(&registry_dir, &page_dir)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!log_path.exists());
+        assert!(!rotated_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn active_log_pages_ignore_invalid_metadata_files() {
-        let dir = env::temp_dir().join(format!(
-            "loggle-invalid-active-page-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("invalid.json"), "{").unwrap();
+        let (root, registry_dir, page_dir) = test_state_dir("invalid-active-page-test");
+        fs::create_dir_all(&registry_dir).unwrap();
+        fs::write(registry_dir.join("invalid.json"), "{").unwrap();
 
-        assert!(active_log_pages_from_dir(&dir).unwrap().is_empty());
-        let _ = fs::remove_dir_all(dir);
+        assert!(
+            active_log_pages_from_dir(&registry_dir, &page_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn claim_active_log_page_allocates_first_available_numeric_id() {
-        let dir = env::temp_dir().join(format!(
-            "loggle-allocate-page-id-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let (root, registry_dir, page_dir) = test_state_dir("allocate-page-id-test");
         let one = LogPageId::parse("1").unwrap();
         let three = LogPageId::parse("3").unwrap();
-        let (_, _one) = claim_active_log_page_in_dir(Some(one), "one", &dir).unwrap();
-        let (_, _three) = claim_active_log_page_in_dir(Some(three), "three", &dir).unwrap();
+        let (_, _one) =
+            claim_active_log_page_in_dir(Some(one), "one", &registry_dir, &page_dir).unwrap();
+        let (_, _three) =
+            claim_active_log_page_in_dir(Some(three), "three", &registry_dir, &page_dir).unwrap();
 
-        let (id, _registration) = claim_active_log_page_in_dir(None, "two", &dir).unwrap();
+        let (id, _registration) =
+            claim_active_log_page_in_dir(None, "two", &registry_dir, &page_dir).unwrap();
 
         assert_eq!(id.as_str(), "2");
-        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn claim_active_log_page_rejects_active_requested_id() {
-        let dir = env::temp_dir().join(format!(
-            "loggle-requested-page-id-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let (root, registry_dir, page_dir) = test_state_dir("requested-page-id-test");
         let id = LogPageId::parse("api").unwrap();
         let (_, _registration) =
-            claim_active_log_page_in_dir(Some(id.clone()), "api", &dir).unwrap();
+            claim_active_log_page_in_dir(Some(id.clone()), "api", &registry_dir, &page_dir)
+                .unwrap();
 
-        let error = claim_active_log_page_in_dir(Some(id), "api", &dir).unwrap_err();
+        let error =
+            claim_active_log_page_in_dir(Some(id), "api", &registry_dir, &page_dir).unwrap_err();
 
         assert_eq!(error.to_string(), "log page id 'api' is already active");
-        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(root);
     }
 }
