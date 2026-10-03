@@ -201,6 +201,51 @@ filtered tail returns whole matching records — the header line plus any folded
 multi-line property block — and `-n` counts matching records rather than
 individual lines.
 
+Filter by severity with `--level` (`fatal`, `error`, `warn`, `info`, `debug`,
+`trace`, `unknown`; case-insensitive, `err`/`warning`/`verbose` accepted). It
+composes with the other filters:
+
+```sh
+loggle log -i 1 -n 5 --level error
+loggle log -i 1 -n 5 --level error --service api --property tenantId=tenant-1
+```
+
+For machine consumption, `--json` prints one JSON object per record per line
+(JSONL) instead of raw lines:
+
+```sh
+loggle log -i 1 -n 1 --property requestId=fixture-failed --json
+```
+
+```json
+{"schema_version":1,"sequence":6,"source":"api","timestamp":"10:00:00.050","level":"error","message":"request failed","properties":{"cause":"job insert rejected: missing synthetic parent","requestId":"fixture-failed","statusCode":500},"raw":"[api] 10:00:00.050 ERROR request failed\n[api] [10:00:00.050] ERROR (#1):\n[api] {\n[api]   requestId: \"fixture-failed\",\n[api]   statusCode: 500,\n[api]   cause: \"job insert rejected: missing synthetic parent\",\n[api] }"}
+```
+
+Record fields (`schema_version` 1):
+
+- `schema_version`: always `1` for this shape; incompatible changes bump it.
+- `sequence`: the record's event number in the page's retained window, parsed
+  at query time. It increases in recording order but may skip values (a folded
+  property block consumes one). It is a stable reference across repeated
+  queries of the same page until the page log rotates (after roughly
+  `--buffer-lines` more lines).
+- `source`, `message`: parsed source and message strings.
+- `timestamp`: the parsed timestamp string, or `null`.
+- `level`: one of the lowercase `--level` names.
+- `properties`: parsed properties as an object, first value per key. Numbers
+  are JSON numbers when that is lossless (otherwise strings, e.g. `01` or
+  out-of-range integers), booleans and `null` are typed, everything else is a
+  string.
+- `raw`: the whole record — header plus any folded property block — joined
+  with `\n`. `--clean` applies to this field only; matching and stored logs
+  are unchanged.
+
+With `--json` and no matches, nothing is printed and the exit status is `0`.
+Errors are still printed as text to stderr with exit status `1`.
+`loggle pages --json` prints one
+`{"schema_version":1,"id":…,"pid":…,"started_unix_seconds":…,"command":…}`
+object per active page, and nothing when there are none.
+
 Page logs are stored in Loggle's local state directory and flushed as input is
 drained, so the read command can inspect a live session without taking over the
 TUI. Each log retains roughly the same window as the in-memory buffer
@@ -302,6 +347,8 @@ loggle pages
 loggle sources -i 1
 loggle log -i 1 -n 5 --clean
 loggle log -i 1 -n 5 --service api --property tenantId=tenant-1
+loggle log -i 1 -n 5 --level error --json
+loggle pages --json
 loggle --id api -- docker compose up
 loggle --source-field service,app < app.log
 loggle run --name api -- pnpm start --name web -- pnpm dev
@@ -319,6 +366,7 @@ loggle start libre
   column when no explicit prefix exists. Repeat it or pass comma-separated
   fields, e.g. `--source-field service,app`
 - `pages`: lists active Loggle pages with ID, PID, age, and command
+- `pages --json`: prints one versioned JSON object per active page (JSONL)
 - `sources -i <ID>`: lists observed source names and record counts for a page;
   accepts `--source-field`
 - `log -i <ID> -n <N>`: prints the last `N` raw lines from a tagged Loggle page
@@ -329,7 +377,13 @@ loggle start libre
   output to records matching a text query
 - `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
   properties. Repeat for multiple required predicates
-- `log --clean`: strips ANSI/control codes from printed lines
+- `log --level <LEVEL>`: limits page output to records at one severity
+  (`fatal`, `error`, `warn`, `info`, `debug`, `trace`, `unknown`;
+  case-insensitive)
+- `log --json`: prints one `schema_version` 1 JSON record per line (JSONL)
+  instead of raw lines; see [Agent Log Access](#agent-log-access)
+- `log --clean`: strips ANSI/control codes from printed lines (the `raw` field
+  with `--json`)
 - `log --source-field <FIELD>`: applies custom source promotion when reading a
   page
 - `dc`: shortcut for `docker compose up`

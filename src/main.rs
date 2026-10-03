@@ -6,9 +6,10 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use loggle::{
-    ConfigEnv, LogPageError, LogPageId, LogPageTailOptions, NamedCommand, RuntimeConfig,
-    RuntimeError, RuntimeInput, SourceConfig, active_log_pages, load_named_config,
-    load_project_config, print_log_page_sources, print_log_page_tail_with_options, run,
+    ActiveLogPageRecord, ConfigEnv, LogLevel, LogOutputFormat, LogPageError, LogPageId,
+    LogPageTailOptions, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
+    active_log_pages, load_named_config, load_project_config, print_log_page_sources,
+    print_log_page_tail_with_options, run, write_json_line,
 };
 
 /// Printed when loggle is started from a terminal with nothing to read.
@@ -25,7 +26,7 @@ const USAGE: &str = "loggle reads newline-delimited logs from stdin or runs comm
     subcommand_value_name = "SUBCOMMAND",
     subcommand_help_heading = "Subcommands",
     override_usage = "loggle [OPTIONS] [--] [COMMAND]...\n       loggle [OPTIONS] <SUBCOMMAND>",
-    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
+    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1\n  loggle log -i 1 -n 5 --level error --json"
 )]
 struct Cli {
     #[arg(
@@ -93,7 +94,7 @@ enum CliCommand {
     Log(LogArgs),
 
     #[command(about = "List active tagged Loggle pages.")]
-    Pages,
+    Pages(PagesArgs),
 
     #[command(
         about = "List observed source names and record counts in a retained page (not Compose service aliases)."
@@ -178,8 +179,31 @@ struct LogArgs {
     )]
     text: Option<String>,
 
+    #[arg(
+        long = "level",
+        value_name = "LEVEL",
+        value_parser = parse_level,
+        help = "Only records at this level: fatal, error, warn, info, debug, trace, unknown"
+    )]
+    level: Option<LogLevel>,
+
+    #[arg(
+        long,
+        help = "Print one schema_version 1 JSON record per line (JSONL) instead of raw lines"
+    )]
+    json: bool,
+
     #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
     source_fields: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct PagesArgs {
+    #[arg(
+        long,
+        help = "Print one schema_version 1 JSON object per page per line (JSONL)"
+    )]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -236,11 +260,19 @@ fn parse_text_filter(input: &str) -> Result<String, String> {
     parse_non_empty(input, "text filter")
 }
 
+fn parse_level(input: &str) -> Result<LogLevel, String> {
+    LogLevel::parse(input).ok_or_else(|| {
+        format!(
+            "invalid level '{input}'; expected one of: fatal, error, warn, info, debug, trace, unknown"
+        )
+    })
+}
+
 fn main() {
     let cli = Cli::parse();
     let runtime_command = match cli.subcommand {
         Some(CliCommand::Log(args)) => return report_command(run_log_command(args)),
-        Some(CliCommand::Pages) => return report_command(run_pages_command()),
+        Some(CliCommand::Pages(args)) => return report_command(run_pages_command(args)),
         Some(CliCommand::Sources(args)) => {
             return report_command(print_log_page_sources(
                 &args.id,
@@ -298,17 +330,30 @@ fn run_log_command(args: LogArgs) -> Result<(), LogPageError> {
         clean: args.clean,
         source: args.source,
         text: args.text,
+        level: args.level,
         property_filters: args.property_filters,
         source_config: SourceConfig::with_fields(args.source_fields),
+        format: if args.json {
+            LogOutputFormat::Json
+        } else {
+            LogOutputFormat::Text
+        },
     };
 
     let mut stdout = io::stdout().lock();
     print_log_page_tail_with_options(&args.id, &options, &mut stdout)
 }
 
-fn run_pages_command() -> Result<(), LogPageError> {
+fn run_pages_command(args: PagesArgs) -> Result<(), LogPageError> {
     let pages = active_log_pages()?;
     let mut stdout = io::stdout().lock();
+    if args.json {
+        for page in &pages {
+            write_json_line(&mut stdout, &ActiveLogPageRecord::new(page))?;
+        }
+        return Ok(());
+    }
+
     if pages.is_empty() {
         writeln!(stdout, "no active loggle pages").map_err(LogPageError::Output)?;
         return Ok(());
@@ -814,8 +859,41 @@ api = ["pnpm", "start"]
     fn pages_command_cli_parses() {
         assert!(matches!(
             parse_cli(&["pages"]).subcommand,
-            Some(CliCommand::Pages)
+            Some(CliCommand::Pages(PagesArgs { json: false }))
         ));
+        assert!(matches!(
+            parse_cli(&["pages", "--json"]).subcommand,
+            Some(CliCommand::Pages(PagesArgs { json: true }))
+        ));
+    }
+
+    #[test]
+    fn log_command_cli_parses_level_aliases_and_json() {
+        for (input, expected) in [
+            ("fatal", LogLevel::Fatal),
+            ("ERR", LogLevel::Error),
+            ("Error", LogLevel::Error),
+            ("warning", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("verbose", LogLevel::Trace),
+            ("unknown", LogLevel::Unknown),
+        ] {
+            let args = log_args(&["log", "-i", "1", "--level", input, "--json"]);
+            assert_eq!(args.level, Some(expected), "{input}");
+            assert!(args.json);
+        }
+
+        let args = log_args(&["log", "-i", "1"]);
+        assert_eq!(args.level, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn log_command_cli_rejects_invalid_level() {
+        let error = try_parse_cli(&["log", "-i", "1", "--level", "notice"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("invalid level 'notice'"));
     }
 
     #[test]

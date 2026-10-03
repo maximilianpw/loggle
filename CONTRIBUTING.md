@@ -19,7 +19,10 @@ cargo test --locked --all-targets --all-features
 
 `--all-features` enables the `perf-harness` feature so the `loggle-bench`
 binary is compiled, linted, and tested too. The runtime integration tests in
-`src/runtime/tests.rs` only run on Linux.
+`src/runtime/tests.rs` only run on Linux. `tests/agent_cli.rs` runs the real
+`loggle` binary for `log`/`pages` (`--json`, `--level`) against page logs it
+writes into a temporary `XDG_STATE_HOME`; it needs no live session or pty and
+runs on every platform (`cargo test --locked --test agent_cli`).
 
 Check compilation or build the debug binary (written to `target/debug/loggle`):
 

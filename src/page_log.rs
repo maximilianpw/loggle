@@ -8,13 +8,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
+pub use crate::model::Level as LogLevel;
 use crate::{
     buffer::LogBuffer,
     filter::{LogFilter, PropertyFilterUpdate},
-    model::{SourceConfig, clean_display_text},
+    model::{LogEvent, LogProperty, PropertyValue, SourceConfig, clean_display_text},
 };
+
+/// Version of the JSONL record contract emitted by `loggle log --json` and
+/// `loggle pages --json`. Bump it on any incompatible change to a record shape.
+pub const LOG_PAGE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogPageId(String);
@@ -147,14 +152,26 @@ pub struct ActiveLogPage {
     pub command: String,
 }
 
+/// How `loggle log` writes the records it selects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogOutputFormat {
+    /// The raw page-log lines, one per output line.
+    #[default]
+    Text,
+    /// One [`LogPageRecord`] JSON object per line (JSONL).
+    Json,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogPageTailOptions {
     pub line_count: usize,
     pub clean: bool,
     pub source: Option<String>,
     pub text: Option<String>,
+    pub level: Option<LogLevel>,
     pub property_filters: Vec<String>,
     pub source_config: SourceConfig,
+    pub format: LogOutputFormat,
 }
 
 impl LogPageTailOptions {
@@ -164,8 +181,10 @@ impl LogPageTailOptions {
             clean: false,
             source: None,
             text: None,
+            level: None,
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
+            format: LogOutputFormat::Text,
         }
     }
 
@@ -174,8 +193,87 @@ impl LogPageTailOptions {
             .as_ref()
             .is_some_and(|source| !source.is_empty())
             || self.text.as_ref().is_some_and(|text| !text.is_empty())
+            || self.level.is_some()
             || !self.property_filters.is_empty()
     }
+}
+
+/// One parsed record of a page log, as emitted by `loggle log --json`.
+///
+/// This is the `schema_version: 1` contract. `sequence` is the record's event
+/// sequence within the page's retained window as parsed at query time: it
+/// increases in recording order (with gaps where a folded property block
+/// consumed a number) and is stable across repeated queries of a page until
+/// its log rotates, but it is not the live viewer's internal sequence. `properties` keeps the first value
+/// of each key; numbers are JSON numbers only when that is lossless, booleans
+/// and null are typed, and everything else is a string. `raw` is the whole
+/// record (header plus any folded property block) joined with `\n`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LogPageRecord {
+    pub schema_version: u32,
+    pub sequence: u64,
+    pub source: String,
+    pub timestamp: Option<String>,
+    #[serde(serialize_with = "serialize_level")]
+    pub level: LogLevel,
+    pub message: String,
+    pub properties: BTreeMap<String, serde_json::Value>,
+    pub raw: String,
+}
+
+impl LogPageRecord {
+    fn new(event: &LogEvent, lines: &[String], clean: bool) -> Self {
+        let raw = if clean {
+            lines
+                .iter()
+                .map(|line| clean_display_text(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            lines.join("\n")
+        };
+        Self {
+            schema_version: LOG_PAGE_SCHEMA_VERSION,
+            sequence: event.sequence,
+            source: event.source.clone(),
+            timestamp: event.timestamp.clone(),
+            level: event.level,
+            message: event.message.clone(),
+            properties: record_properties(&event.properties),
+            raw,
+        }
+    }
+}
+
+fn serialize_level<S: Serializer>(level: &LogLevel, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(level.as_str())
+}
+
+/// One active page, as emitted by `loggle pages --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveLogPageRecord<'a> {
+    pub schema_version: u32,
+    #[serde(flatten)]
+    pub page: &'a ActiveLogPage,
+}
+
+impl<'a> ActiveLogPageRecord<'a> {
+    pub fn new(page: &'a ActiveLogPage) -> Self {
+        Self {
+            schema_version: LOG_PAGE_SCHEMA_VERSION,
+            page,
+        }
+    }
+}
+
+/// Writes `value` as one compact JSON object followed by a newline.
+pub fn write_json_line<W: Write, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), LogPageError> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(|source| LogPageError::Output(source.into()))?;
+    writeln!(writer).map_err(LogPageError::Output)
 }
 
 pub fn active_log_pages() -> Result<Vec<ActiveLogPage>, LogPageError> {
@@ -523,6 +621,16 @@ fn print_log_page_tail_from_path<W: Write>(
 ) -> Result<(), LogPageError> {
     let file = open_log_page(id, path)?;
     let reader = BufReader::new(file);
+    if options.format == LogOutputFormat::Json {
+        for record in tail_matching_records(reader, options, path)? {
+            write_json_line(
+                writer,
+                &LogPageRecord::new(&record.event, &record.lines, options.clean),
+            )?;
+        }
+        return Ok(());
+    }
+
     let lines = if options.has_filters() {
         filtered_tail_lines(reader, options, path)?
     } else {
@@ -545,17 +653,36 @@ fn print_log_page_tail_from_path<W: Write>(
     Ok(())
 }
 
-/// Returns the last `options.line_count` records matching the filters, each
-/// emitted whole (header plus any folded multi-line block).
-///
-/// This loads the entire retained window into memory to parse it into events.
-/// That window is bounded by the recorder's rotation to at most
-/// `2 × buffer_lines` lines, which is the documented bound.
+/// Returns the raw lines of the last `options.line_count` records matching the
+/// filters, each emitted whole (header plus any folded multi-line block).
 fn filtered_tail_lines<R: BufRead>(
     reader: R,
     options: &LogPageTailOptions,
     path: &Path,
 ) -> Result<Vec<String>, LogPageError> {
+    Ok(tail_matching_records(reader, options, path)?
+        .into_iter()
+        .flat_map(|record| record.lines)
+        .collect())
+}
+
+/// A parsed event together with the raw page-log lines that compose it.
+struct MatchedRecord {
+    event: LogEvent,
+    lines: Vec<String>,
+}
+
+/// Returns the last `options.line_count` records matching the filters, in
+/// recording order.
+///
+/// This loads the entire retained window into memory to parse it into events.
+/// That window is bounded by the recorder's rotation to at most
+/// `2 × buffer_lines` lines, which is the documented bound.
+fn tail_matching_records<R: BufRead>(
+    reader: R,
+    options: &LogPageTailOptions,
+    path: &Path,
+) -> Result<Vec<MatchedRecord>, LogPageError> {
     let mut buffer = LogBuffer::unbounded_with_source_config(options.source_config.clone());
     // Track the raw lines that compose each event so a filtered match emits the
     // whole record — header plus any folded multi-line property block — instead
@@ -591,18 +718,20 @@ fn filtered_tail_lines<R: BufRead>(
         .events()
         .iter()
         .filter(|event| filter.matches(event))
-        .map(|event| event.sequence)
         .collect::<Vec<_>>();
 
     let start = matching.len().saturating_sub(options.line_count);
-    let mut lines = Vec::new();
-    for sequence in &matching[start..] {
-        if let Some(&index) = group_of_sequence.get(sequence) {
-            lines.extend(groups[index].iter().cloned());
+    let mut records = Vec::new();
+    for event in &matching[start..] {
+        if let Some(&index) = group_of_sequence.get(&event.sequence) {
+            records.push(MatchedRecord {
+                event: (*event).clone(),
+                lines: std::mem::take(&mut groups[index]),
+            });
         }
     }
 
-    Ok(lines)
+    Ok(records)
 }
 
 fn take_removed_group_lines(
@@ -638,6 +767,7 @@ fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, Log
         .as_ref()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
+    filter.level = options.level;
 
     for property_filter in &options.property_filters {
         let update = PropertyFilterUpdate::parse(property_filter, false)
@@ -646,6 +776,36 @@ fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, Log
     }
 
     Ok(filter)
+}
+
+fn record_properties(properties: &[LogProperty]) -> BTreeMap<String, serde_json::Value> {
+    let mut values = BTreeMap::new();
+    for property in properties {
+        values
+            .entry(property.key.clone())
+            .or_insert_with(|| property_json_value(&property.value));
+    }
+    values
+}
+
+fn property_json_value(value: &PropertyValue) -> serde_json::Value {
+    match value {
+        PropertyValue::String(value) | PropertyValue::Text(value) => {
+            serde_json::Value::String(value.clone())
+        }
+        PropertyValue::Number(value) => lossless_json_number(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.clone())),
+        PropertyValue::Bool(value) => serde_json::Value::Bool(*value),
+        PropertyValue::Null => serde_json::Value::Null,
+    }
+}
+
+/// Parses `value` as a JSON number only when re-serializing it reproduces the
+/// exact text, so `01`, `1.` or out-of-range integers stay strings.
+fn lossless_json_number(value: &str) -> Option<serde_json::Number> {
+    let number = serde_json::from_str::<serde_json::Number>(value).ok()?;
+    (number.to_string() == value).then_some(number)
 }
 
 fn tail_lines<R: BufRead>(reader: R, line_count: usize) -> io::Result<Vec<String>> {
@@ -929,6 +1089,8 @@ mod tests {
             text: None,
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines =
@@ -950,6 +1112,8 @@ mod tests {
             text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines =
@@ -971,6 +1135,8 @@ mod tests {
             text: None,
             property_filters: vec!["tenantId=tenant-1".to_string()],
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines =
@@ -1002,6 +1168,8 @@ mod tests {
             text: None,
             property_filters: vec!["tenantId=t1".to_string()],
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines =
@@ -1027,12 +1195,212 @@ mod tests {
             text: Some("database".to_string()),
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines =
             filtered_tail_lines(BufReader::new(input), &options, Path::new("test.log")).unwrap();
 
         assert_eq!(lines, vec!["api | ERROR database unavailable".to_string()]);
+    }
+
+    /// Records as `loggle log --json` would emit them, parsed back as JSON.
+    fn json_records(input: &str, options: &LogPageTailOptions) -> Vec<serde_json::Value> {
+        tail_matching_records(
+            BufReader::new(input.as_bytes()),
+            options,
+            Path::new("test.log"),
+        )
+        .unwrap()
+        .iter()
+        .map(|record| {
+            let mut line = Vec::new();
+            write_json_line(
+                &mut line,
+                &LogPageRecord::new(&record.event, &record.lines, options.clean),
+            )
+            .unwrap();
+            let line = String::from_utf8(line).unwrap();
+            assert_eq!(line.lines().count(), 1, "one record per line: {line}");
+            serde_json::from_str(&line).unwrap()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn json_record_types_properties_with_lossless_numbers() {
+        let input = "api | INFO values canonical=500 negative=-3 float=1.5 leading=01 trailing=1. huge=18446744073709551616 flag=true off=false missing=null label=\"ok\" text=bare dup=first dup=second\n";
+        let records = json_records(input, &LogPageTailOptions::new(10));
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["sequence"], 0);
+        assert_eq!(record["source"], "api");
+        assert_eq!(record["timestamp"], serde_json::Value::Null);
+        assert_eq!(record["level"], "info");
+        assert!(record["message"].as_str().unwrap().starts_with("values"));
+        let properties = &record["properties"];
+        assert_eq!(properties["canonical"], serde_json::json!(500));
+        assert_eq!(properties["negative"], serde_json::json!(-3));
+        assert_eq!(properties["float"], serde_json::json!(1.5));
+        assert_eq!(properties["leading"], "01");
+        assert_eq!(properties["trailing"], "1.");
+        assert_eq!(properties["huge"], "18446744073709551616");
+        assert_eq!(properties["flag"], true);
+        assert_eq!(properties["off"], false);
+        assert_eq!(properties["missing"], serde_json::Value::Null);
+        assert_eq!(properties["label"], "ok");
+        assert_eq!(properties["text"], "bare");
+        assert_eq!(properties["dup"], "first");
+        assert_eq!(record["raw"], input.trim_end());
+    }
+
+    #[test]
+    fn json_record_matches_the_schema_version_1_shape_with_multiline_raw() {
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        let mut options = LogPageTailOptions::new(1);
+        options.property_filters = vec!["requestId=fixture-failed".to_string()];
+        let records = json_records(fixture, &options);
+
+        assert_eq!(records.len(), 1);
+        let raw = fixture.lines().collect::<Vec<_>>()[6..13].join("\n");
+        assert_eq!(
+            records[0],
+            serde_json::json!({
+                "schema_version": 1,
+                "sequence": records[0]["sequence"],
+                "source": "api",
+                "timestamp": "10:00:00.050",
+                "level": "error",
+                "message": "request failed",
+                "properties": {
+                    "cause": "job insert rejected: missing synthetic parent",
+                    "requestId": "fixture-failed",
+                    "statusCode": 500,
+                },
+                "raw": raw,
+            })
+        );
+        assert!(records[0]["sequence"].is_u64());
+        assert_eq!(records[0]["raw"].as_str().unwrap().lines().count(), 7);
+    }
+
+    #[test]
+    fn json_without_filters_emits_one_record_per_event_with_increasing_sequence() {
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        let records = json_records(fixture, &LogPageTailOptions::new(100));
+        let sequences = records
+            .iter()
+            .map(|record| record["sequence"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(records.len(), 12);
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+        let raw_lines = records
+            .iter()
+            .map(|record| record["raw"].as_str().unwrap().lines().count())
+            .sum::<usize>();
+        assert_eq!(raw_lines, fixture.lines().count());
+    }
+
+    #[test]
+    fn level_filter_composes_with_source_text_and_property_filters() {
+        let input = "api | ERROR database failed tenantId=tenant-1\napi | ERROR database failed tenantId=tenant-2\napi | INFO database failed tenantId=tenant-1\nweb | ERROR database failed tenantId=tenant-1\napi | WARN database slow tenantId=tenant-1\n";
+        let mut options = LogPageTailOptions::new(10);
+        options.level = LogLevel::parse("ERR");
+        assert_eq!(
+            log_filter_for_options(&options).unwrap().level,
+            options.level
+        );
+
+        let lines = |options: &LogPageTailOptions| {
+            filtered_tail_lines(BufReader::new(input.as_bytes()), options, Path::new("t")).unwrap()
+        };
+        assert_eq!(lines(&options).len(), 3);
+        options.source = Some("api".to_string());
+        options.text = Some("database".to_string());
+        options.property_filters = vec!["tenantId=tenant-1".to_string()];
+        assert_eq!(
+            lines(&options),
+            ["api | ERROR database failed tenantId=tenant-1"]
+        );
+        options.level = Some(LogLevel::Warn);
+        assert_eq!(
+            lines(&options),
+            ["api | WARN database slow tenantId=tenant-1"]
+        );
+        options.level = Some(LogLevel::Fatal);
+        assert!(lines(&options).is_empty());
+        options.format = LogOutputFormat::Json;
+        assert!(json_records(input, &options).is_empty());
+    }
+
+    #[test]
+    fn level_filter_alone_takes_the_record_path_in_text_output() {
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        let raw = fixture.lines().collect::<Vec<_>>();
+        let mut options = LogPageTailOptions::new(100);
+        options.level = Some(LogLevel::Error);
+
+        let lines =
+            filtered_tail_lines(BufReader::new(fixture.as_bytes()), &options, Path::new("t"))
+                .unwrap();
+
+        assert_eq!(lines, [&raw[4..5], &raw[5..13]].concat());
+        options.format = LogOutputFormat::Json;
+        let records = json_records(fixture, &options);
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record["level"] == "error"));
+    }
+
+    #[test]
+    fn json_output_with_clean_strips_raw_only_and_empty_matches_emit_nothing() {
+        let (root, _, page_dir) = test_state_dir("json-clean-test");
+        let id = LogPageId::parse("json").unwrap();
+        let path = log_page_path_in_dir(&id, &page_dir);
+        fs::create_dir_all(&page_dir).unwrap();
+        let colored = "\x1b[31mapi | ERROR boom tenantId=t1\x1b[0m\n[api] INFO ok\n";
+        fs::write(&path, colored).unwrap();
+        let mut options = LogPageTailOptions::new(10);
+        options.format = LogOutputFormat::Json;
+        options.property_filters = vec!["tenantId=t1".to_string()];
+        let query = |options: &LogPageTailOptions| {
+            let mut output = Vec::new();
+            print_log_page_tail_from_path(&id, &path, options, &mut output).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+
+        let raw: serde_json::Value = serde_json::from_str(query(&options).trim_end()).unwrap();
+        assert!(raw["raw"].as_str().unwrap().contains('\x1b'));
+        options.clean = true;
+        let clean: serde_json::Value = serde_json::from_str(query(&options).trim_end()).unwrap();
+        assert_eq!(clean["raw"], "api | ERROR boom tenantId=t1");
+        assert_eq!(clean["message"], raw["message"]);
+        assert_eq!(clean["properties"], raw["properties"]);
+
+        options.property_filters = vec!["tenantId=missing".to_string()];
+        assert_eq!(query(&options), "");
+        assert_eq!(fs::read_to_string(&path).unwrap(), colored);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_page_json_record_is_versioned_and_flat() {
+        let page = ActiveLogPage {
+            id: "api".to_string(),
+            pid: 42,
+            started_unix_seconds: 7,
+            command: "docker compose up".to_string(),
+        };
+        let mut output = Vec::new();
+        write_json_line(&mut output, &ActiveLogPageRecord::new(&page)).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"schema_version\":1,\"id\":\"api\",\"pid\":42,\"started_unix_seconds\":7,\"command\":\"docker compose up\"}\n"
+        );
     }
 
     #[test]
@@ -1046,6 +1414,8 @@ mod tests {
             text: None,
             property_filters: vec!["requestId=abc-123".to_string()],
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines =
@@ -1075,6 +1445,8 @@ mod tests {
             text: None,
             property_filters: vec!["requestId=fixture-failed".to_string()],
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
         let replay = |options: &LogPageTailOptions| {
             filtered_tail_lines(
@@ -1116,6 +1488,8 @@ mod tests {
             text: Some("npm ci".to_string()),
             property_filters: Vec::new(),
             source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
         };
 
         let lines = filtered_tail_lines(

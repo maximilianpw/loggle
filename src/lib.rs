@@ -17,8 +17,9 @@ pub use config::{
 };
 pub use model::SourceConfig;
 pub use page_log::{
-    ActiveLogPage, LogPageError, LogPageId, LogPageIdError, LogPageTailOptions, active_log_pages,
-    print_log_page_sources, print_log_page_tail, print_log_page_tail_with_options,
+    ActiveLogPage, ActiveLogPageRecord, LOG_PAGE_SCHEMA_VERSION, LogLevel, LogOutputFormat,
+    LogPageError, LogPageId, LogPageIdError, LogPageRecord, LogPageTailOptions, active_log_pages,
+    print_log_page_sources, print_log_page_tail, print_log_page_tail_with_options, write_json_line,
 };
 pub use runtime::{
     NamedCommand, ReadySpec, RuntimeConfig, RuntimeError, RuntimeInput, StartCommand, run,
