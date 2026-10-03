@@ -4,54 +4,56 @@ use super::{
     parse_property_object,
 };
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct LogInterpreter;
+/// Turns raw source lines into [`LogEvent`]s, promoting a source from the
+/// configured property fields when the line itself did not name one.
+#[derive(Debug, Clone)]
+pub(crate) struct LogInterpreter {
+    source_config: SourceConfig,
+}
 
 impl LogInterpreter {
-    pub(crate) fn parse_source_line(self, line: &str) -> ParsedLine {
+    pub(crate) fn new(source_config: SourceConfig) -> Self {
+        Self { source_config }
+    }
+
+    pub(crate) fn parse_source_line(&self, line: &str) -> ParsedLine {
         parse_compose_line(line)
     }
 
-    pub(crate) fn property_block_header(self, line: &str) -> Option<PropertyBlockHeader> {
+    pub(crate) fn property_block_header(&self, line: &str) -> Option<PropertyBlockHeader> {
         parse_property_block_header(line)
     }
 
-    pub(crate) fn property_object(self, input: &str) -> Option<Vec<LogProperty>> {
+    pub(crate) fn property_object(&self, input: &str) -> Option<Vec<LogProperty>> {
         parse_property_object(input)
     }
 
-    pub(crate) fn message_without_source_prefix(self, line: &str) -> String {
+    pub(crate) fn message_without_source_prefix(&self, line: &str) -> String {
         message_without_source_prefix(line)
     }
 
     pub(crate) fn event_from_source_line(
-        self,
+        &self,
         sequence: u64,
         raw: String,
         parsed: ParsedLine,
-        source_config: &SourceConfig,
     ) -> LogEvent {
         let mut event = LogEvent::from_parsed_line(sequence, raw, parsed);
-        self.promote_source(&mut event, source_config);
+        self.promote_source(&mut event);
         event
     }
 
-    pub(crate) fn apply_properties(
-        self,
-        event: &mut LogEvent,
-        properties: Vec<LogProperty>,
-        source_config: &SourceConfig,
-    ) {
+    pub(crate) fn apply_properties(&self, event: &mut LogEvent, properties: Vec<LogProperty>) {
         event.set_properties(properties);
-        self.promote_source(event, source_config);
+        self.promote_source(event);
     }
 
-    fn promote_source(self, event: &mut LogEvent, source_config: &SourceConfig) {
+    fn promote_source(&self, event: &mut LogEvent) {
         if event.source != "unknown" {
             return;
         }
 
-        for field in source_config.fields() {
+        for field in self.source_config.fields() {
             let Some(source) = event
                 .property(field)
                 .map(|property| property.value.as_display_str())
@@ -71,19 +73,15 @@ impl LogInterpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PropertyValue, SourceConfig};
+    use crate::model::PropertyValue;
 
     #[test]
     fn event_construction_promotes_source_from_properties() {
-        let interpreter = LogInterpreter;
+        let interpreter = LogInterpreter::new(SourceConfig::default());
         let parsed = interpreter.parse_source_line("INFO ready service=api");
 
-        let event = interpreter.event_from_source_line(
-            0,
-            "INFO ready service=api".to_string(),
-            parsed,
-            &SourceConfig::default(),
-        );
+        let event =
+            interpreter.event_from_source_line(0, "INFO ready service=api".to_string(), parsed);
 
         assert_eq!(event.source, "api");
         assert_eq!(
@@ -94,14 +92,9 @@ mod tests {
 
     #[test]
     fn applying_properties_can_promote_source() {
-        let interpreter = LogInterpreter;
+        let interpreter = LogInterpreter::new(SourceConfig::default());
         let parsed = interpreter.parse_source_line("INFO ready");
-        let mut event = interpreter.event_from_source_line(
-            0,
-            "INFO ready".to_string(),
-            parsed,
-            &SourceConfig::default(),
-        );
+        let mut event = interpreter.event_from_source_line(0, "INFO ready".to_string(), parsed);
 
         interpreter.apply_properties(
             &mut event,
@@ -109,7 +102,6 @@ mod tests {
                 key: "service".to_string(),
                 value: PropertyValue::String("worker".to_string()),
             }],
-            &SourceConfig::default(),
         );
 
         assert_eq!(event.source, "worker");

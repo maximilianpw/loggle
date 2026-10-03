@@ -14,7 +14,6 @@ pub struct LogBuffer {
     completed_property_blocks: VecDeque<CompletedPropertyBlock>,
     active_source: Option<String>,
     buildkit_steps: HashMap<String, String>,
-    source_config: SourceConfig,
     interpreter: LogInterpreter,
 }
 
@@ -66,8 +65,7 @@ impl LogBuffer {
             completed_property_blocks: VecDeque::new(),
             active_source: None,
             buildkit_steps: HashMap::new(),
-            source_config,
-            interpreter: LogInterpreter,
+            interpreter: LogInterpreter::new(source_config),
         }
     }
 
@@ -113,12 +111,9 @@ impl LogBuffer {
         }
 
         let sequence = self.next_sequence;
-        let event = self.interpreter.event_from_source_line(
-            self.next_sequence,
-            line,
-            parsed,
-            &self.source_config,
-        );
+        let event = self
+            .interpreter
+            .event_from_source_line(self.next_sequence, line, parsed);
         self.next_sequence += 1;
         self.events.push_back(event);
         change.appended = Some(sequence);
@@ -173,7 +168,7 @@ impl LogBuffer {
             return false;
         };
 
-        if !pending.push_line(line) {
+        if !pending.push_line(&self.interpreter, line) {
             return false;
         }
 
@@ -217,8 +212,7 @@ impl LogBuffer {
             .back_mut()
             .filter(|event| event.sequence == pending.target_sequence)
         {
-            self.interpreter
-                .apply_properties(event, properties.clone(), &self.source_config);
+            self.interpreter.apply_properties(event, properties.clone());
             change.updated.push(pending.target_sequence);
         }
 
@@ -259,8 +253,7 @@ impl LogBuffer {
         let target_sequence = event.sequence;
 
         if let Some(event) = self.events.back_mut() {
-            self.interpreter
-                .apply_properties(event, block.properties, &self.source_config);
+            self.interpreter.apply_properties(event, block.properties);
             change.updated.push(target_sequence);
         }
 
@@ -381,8 +374,8 @@ impl PendingPropertyBlock {
         }
     }
 
-    fn push_line(&mut self, line: &str) -> bool {
-        let line = LogInterpreter.message_without_source_prefix(line);
+    fn push_line(&mut self, interpreter: &LogInterpreter, line: &str) -> bool {
+        let line = interpreter.message_without_source_prefix(line);
         let trimmed = line.trim();
         if !self.saw_open && !trimmed.is_empty() && !trimmed.starts_with('{') {
             return false;
