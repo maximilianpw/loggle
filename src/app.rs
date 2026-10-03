@@ -11,12 +11,16 @@ use std::{
 
 use crate::buffer::{BufferChange, LogBuffer};
 use crate::commands::{COMMANDS, Command};
+use crate::facet::{
+    FacetGroup, FacetKind, FacetOptions, FacetValueType, MAX_FACET_BUCKET_LIMIT,
+    MAX_FACET_RECORD_LIMIT, aggregate_facets,
+};
 use crate::filter::{
     FilterEdit, FilterPresetRow, FilterWorkflow, LogFilter, PropertyFilterId, PropertyFilterRow,
 };
 use crate::model::{Level, LogEvent, LogProperty, SourceConfig};
 
-use dialogs::Dialogs;
+use dialogs::{Dialogs, FacetSnapshot};
 use visible::VisibleLogView;
 
 const DEFAULT_EXPORT_PATH: &str = "loggle-export.log";
@@ -37,6 +41,7 @@ pub enum DialogKind {
     MessageFields,
     FilterPresets,
     Sources,
+    Facets,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +63,15 @@ pub struct SourceStatusRow {
     pub last_sequence: u64,
 }
 
+/// One facet bucket in the facet dialog: a source, level, property key, or property value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FacetDialogRow {
+    pub facet: FacetKind,
+    pub value: String,
+    pub count: usize,
+    pub value_types: Vec<FacetValueType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YankedLines {
     pub text: String,
@@ -75,6 +89,7 @@ pub struct App {
     notice: Option<String>,
     prompt: String,
     dialogs: Dialogs,
+    facet_snapshot: FacetSnapshot,
     pending_g: bool,
     details_open: bool,
     selected_property: usize,
@@ -99,6 +114,7 @@ impl App {
             notice: None,
             prompt: String::new(),
             dialogs: Dialogs::default(),
+            facet_snapshot: FacetSnapshot::default(),
             pending_g: false,
             details_open: false,
             selected_property: 0,
@@ -263,6 +279,33 @@ impl App {
             row.last_sequence = event.sequence;
         }
         rows.into_values().collect()
+    }
+
+    /// Facet buckets from the snapshot taken when the facet dialog opened, narrowed by
+    /// the dialog query. In the property-value view these are the drilled key's values.
+    pub fn facet_rows(&self) -> Vec<&FacetDialogRow> {
+        let query = self.dialogs.query(DialogKind::Facets).trim();
+        self.facet_snapshot
+            .rows(self.facet_dialog_is_drilldown())
+            .iter()
+            .filter(|row| dialogs::facet_row_matches(row, query))
+            .collect()
+    }
+
+    pub fn selected_facet_row(&self) -> Option<FacetDialogRow> {
+        self.facet_rows()
+            .get(self.selected_dialog_index(DialogKind::Facets))
+            .map(|row| (*row).clone())
+    }
+
+    /// Window and bucket counts for the current facet view, computed before searching.
+    pub fn facet_dialog_summary(&self) -> &str {
+        self.facet_snapshot
+            .summary(self.facet_dialog_is_drilldown())
+    }
+
+    pub fn facet_dialog_is_drilldown(&self) -> bool {
+        self.dialogs.facet_values_open()
     }
 
     pub fn filters(&self) -> &LogFilter {
@@ -445,8 +488,13 @@ impl App {
         self.mode = Mode::Dialog(kind);
         self.prompt.clear();
         self.visual_anchor = None;
-        if kind == DialogKind::PropertyFilters {
-            self.editing_property_filter = None;
+        match kind {
+            DialogKind::PropertyFilters => self.editing_property_filter = None,
+            DialogKind::Facets => {
+                self.facet_snapshot = FacetSnapshot::from_groups(&self.aggregate_facets(None));
+                self.dialogs.reset_facets();
+            }
+            DialogKind::MessageFields | DialogKind::FilterPresets | DialogKind::Sources => {}
         }
         self.sync_dialog_selection(kind);
     }
@@ -498,6 +546,7 @@ impl App {
             DialogKind::MessageFields => {}
             DialogKind::FilterPresets => self.apply_selected_filter_preset(),
             DialogKind::Sources => {}
+            DialogKind::Facets => self.activate_selected_facet_row(),
         }
     }
 
@@ -507,6 +556,7 @@ impl App {
             DialogKind::MessageFields => self.delete_selected_message_field(),
             DialogKind::FilterPresets => self.delete_selected_filter_preset(),
             DialogKind::Sources => {}
+            DialogKind::Facets => self.return_to_facet_root(),
         }
     }
 
@@ -834,6 +884,78 @@ impl App {
         };
         self.filter_workflow.delete_preset(row.index);
         self.sync_dialog_selection(DialogKind::FilterPresets);
+    }
+
+    /// Facets over the newest retained events, with each facet excluding its own active
+    /// filter so alternatives stay visible while every other filter still applies.
+    fn aggregate_facets(&self, property_key: Option<&str>) -> Vec<FacetGroup> {
+        let options = FacetOptions::new(MAX_FACET_BUCKET_LIMIT, property_key.map(str::to_string))
+            .unwrap_or_default();
+        aggregate_facets(
+            self.buffer.events().iter(),
+            MAX_FACET_RECORD_LIMIT,
+            self.filter_workflow.filters(),
+            &options,
+        )
+    }
+
+    fn activate_selected_facet_row(&mut self) {
+        let Some(row) = self.selected_facet_row() else {
+            return;
+        };
+
+        let changed = match row.facet {
+            FacetKind::Source => self.filter_workflow.replace_source_from_facet(&row.value),
+            FacetKind::Level => Level::parse(&row.value)
+                .is_some_and(|level| self.filter_workflow.replace_level_from_facet(level)),
+            FacetKind::PropertyKey => {
+                self.open_facet_values(row.value);
+                return;
+            }
+            FacetKind::PropertyValue => {
+                let Some(key) = self.facet_snapshot.property_key.clone() else {
+                    return;
+                };
+                self.filter_workflow
+                    .replace_property_value_from_facet(&key, &row.value)
+            }
+        };
+
+        if changed {
+            self.sync_visible_cache();
+            self.sync_selection();
+        }
+        self.close_dialog();
+    }
+
+    /// Drill into `property_key`'s values, refreshing every facet group from the buffer
+    /// while keeping the root query and re-selecting the chosen key row.
+    fn open_facet_values(&mut self, property_key: String) {
+        if property_key.trim().is_empty() {
+            return;
+        }
+        let selected = self.selected_facet_row().map(|row| (row.facet, row.value));
+
+        self.facet_snapshot =
+            FacetSnapshot::from_groups(&self.aggregate_facets(Some(&property_key)));
+        let root_rows = self.facet_rows();
+        let root_len = root_rows.len();
+        let restored = selected
+            .and_then(|(facet, value)| {
+                root_rows
+                    .iter()
+                    .position(|row| row.facet == facet && row.value == value)
+            })
+            .unwrap_or_else(|| self.selected_dialog_index(DialogKind::Facets));
+        self.dialogs.select_facet_root(restored, root_len);
+        self.dialogs.open_facet_values();
+        self.sync_dialog_selection(DialogKind::Facets);
+    }
+
+    fn return_to_facet_root(&mut self) {
+        if self.dialogs.close_facet_values() {
+            self.sync_dialog_selection(DialogKind::Facets);
+        }
     }
 }
 

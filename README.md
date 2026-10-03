@@ -378,6 +378,8 @@ visible by abbreviating filter labels (`s`, `l`, `/`, `p`) and their values.
 - `V`: open searchable saved filter presets
 - `e`: export the current visible rows to `loggle-export.log`
 - `T`: mark or unmark the selected row
+- `F`: open searchable filter facets; pick a source or level to filter by it,
+  or a property key to drill into its values
 - `O`: open observed source status counts
 
 ### Details and Properties
@@ -400,6 +402,13 @@ and `Esc` closes. In addition:
   selected field when the search is empty
 - Property filter manager: type to search; `Enter` edits; `Backspace` or
   `Delete` removes the selected filter when the search is empty
+- Filter facets: counts sources, levels, and property keys over the newest
+  100,000 retained rows when opened, applying every active filter except the
+  facet's own so alternatives stay visible. Type to search; `Enter` on a source
+  or level replaces that filter, and on a property key opens its values;
+  `Enter` on a value replaces that key's property filters with `key=value`;
+  `Backspace` or `Delete` with an empty search returns from values to the
+  keys. Facet choices are undoable with `u`
 - Command palette: `Enter` runs the selected command
 
 ### Process Control

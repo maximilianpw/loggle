@@ -153,6 +153,7 @@ fn execute_command(app: &mut App, action: CommandAction) -> KeyOutcome {
         CommandAction::FilterPresets => app.open_dialog(DialogKind::FilterPresets),
         CommandAction::ExportVisibleLogs => app.export_visible_logs_default(),
         CommandAction::ToggleMarker => app.toggle_selected_marker(),
+        CommandAction::Facets => app.open_dialog(DialogKind::Facets),
         CommandAction::Sources => app.open_dialog(DialogKind::Sources),
         CommandAction::NextMatch => app.next_search_match(),
         CommandAction::PreviousMatch => app.previous_search_match(),
@@ -179,6 +180,8 @@ fn copy_outcome(yanked: Option<YankedLines>) -> KeyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facet::FacetKind;
+    use crate::filter::PropertyPredicate;
     use crate::model::Level;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -370,6 +373,70 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('O')), 5);
 
         assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Sources));
+    }
+
+    fn select_facet_row(app: &mut App, facet: FacetKind, value: &str) {
+        let index = app
+            .facet_rows()
+            .iter()
+            .position(|row| row.facet == facet && row.value == value)
+            .unwrap();
+        app.move_dialog_up(DialogKind::Facets, usize::MAX);
+        app.move_dialog_down(DialogKind::Facets, index);
+    }
+
+    #[test]
+    fn capital_f_opens_facets_and_empty_backspace_returns_from_drilldown() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO row tenant=one".to_string());
+
+        handle_key(&mut app, key(KeyCode::Char('F')), 5);
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Facets));
+
+        select_facet_row(&mut app, FacetKind::PropertyKey, "tenant");
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+        assert!(app.facet_dialog_is_drilldown());
+
+        handle_key(&mut app, key(KeyCode::Backspace), 5);
+        assert!(!app.facet_dialog_is_drilldown());
+        assert_eq!(app.mode(), &Mode::Dialog(DialogKind::Facets));
+    }
+
+    #[test]
+    fn facet_enter_applies_filter_and_u_undoes_it() {
+        let mut app = App::new(10);
+        app.push_line("api | INFO one tenant=a".to_string());
+        app.push_line("web | ERROR two tenant=b".to_string());
+
+        handle_key(&mut app, key(KeyCode::Char('F')), 5);
+        select_facet_row(&mut app, FacetKind::Source, "web");
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(app.filters().source.as_deref(), Some("web"));
+        assert_eq!(app.filter_history_len(), 1);
+        assert_eq!(app.visible_count(), 1);
+
+        handle_key(&mut app, key(KeyCode::Char('u')), 5);
+        assert_eq!(app.filters().source, None);
+        assert_eq!(app.visible_count(), 2);
+
+        handle_key(&mut app, key(KeyCode::Char('F')), 5);
+        select_facet_row(&mut app, FacetKind::PropertyKey, "tenant");
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+        select_facet_row(&mut app, FacetKind::PropertyValue, "b");
+        handle_key(&mut app, key(KeyCode::Enter), 5);
+
+        assert_eq!(app.mode(), &Mode::Normal);
+        assert_eq!(
+            app.filters().property_includes,
+            vec![PropertyPredicate::exact("tenant", "b")]
+        );
+        assert_eq!(app.visible_count(), 1);
+
+        handle_key(&mut app, key(KeyCode::Char('u')), 5);
+        assert!(app.filters().property_includes.is_empty());
+        assert_eq!(app.visible_count(), 2);
     }
 
     #[test]

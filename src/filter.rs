@@ -110,6 +110,29 @@ impl LogFilter {
             .collect()
     }
 
+    pub(crate) fn without_source(&self) -> Self {
+        let mut filter = self.clone();
+        filter.source = None;
+        filter
+    }
+
+    pub(crate) fn without_level(&self) -> Self {
+        let mut filter = self.clone();
+        filter.level = None;
+        filter
+    }
+
+    pub(crate) fn without_property_key(&self, key: &str) -> Self {
+        let mut filter = self.clone();
+        filter
+            .property_includes
+            .retain(|predicate| predicate.key != key);
+        filter
+            .property_excludes
+            .retain(|predicate| predicate.key != key);
+        filter
+    }
+
     fn matches_text(&self, event: &LogEvent) -> bool {
         let Some(query) = self.text.as_ref().filter(|query| !query.is_empty()) else {
             return true;

@@ -14,7 +14,8 @@ use ratatui::{
 
 use crate::{
     LogPageId,
-    app::{App, DialogKind, Mode, PromptKind},
+    app::{App, DialogKind, FacetDialogRow, Mode, PromptKind},
+    facet::{FacetKind, escape_facet_text},
 };
 
 use theme::THEME;
@@ -273,6 +274,8 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
         DialogKind::MessageFields => "Pinned fields",
         DialogKind::FilterPresets => "Filter presets",
         DialogKind::Sources => "Sources",
+        DialogKind::Facets if app.facet_dialog_is_drilldown() => "Facet values",
+        DialogKind::Facets => "Filter facets",
     };
     let empty_item = empty_dialog_item(kind);
     let property_rows;
@@ -280,6 +283,9 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
     let preset_rows;
     let source_rows;
     let source_summaries;
+    let facet_rows;
+    let facet_labels;
+    let facet_descriptions;
     let items;
     let rendered = match kind {
         DialogKind::PropertyFilters => {
@@ -356,6 +362,32 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
                 &items[..]
             }
         }
+        DialogKind::Facets => {
+            facet_rows = app.facet_rows();
+            if facet_rows.is_empty() {
+                std::slice::from_ref(&empty_item)
+            } else {
+                facet_labels = facet_rows
+                    .iter()
+                    .map(|row| escape_facet_text(&row.value))
+                    .collect::<Vec<_>>();
+                facet_descriptions = facet_rows
+                    .iter()
+                    .map(|row| facet_row_description(row))
+                    .collect::<Vec<_>>();
+                items = facet_rows
+                    .iter()
+                    .zip(facet_labels.iter())
+                    .zip(facet_descriptions.iter())
+                    .map(|((row, label), description)| dialog::SelectableListItem {
+                        shortcut: Some(row.facet.as_str()),
+                        label,
+                        description,
+                    })
+                    .collect::<Vec<_>>();
+                &items[..]
+            }
+        }
     };
 
     dialog::draw_searchable_dialog(
@@ -363,9 +395,28 @@ fn draw_searchable_dialog(frame: &mut Frame<'_>, app: &App, kind: DialogKind) {
         frame.area(),
         title,
         app.dialog_query(kind),
+        (kind == DialogKind::Facets).then(|| app.facet_dialog_summary()),
         rendered,
         app.selected_dialog_index(kind),
     );
+}
+
+fn facet_row_description(row: &FacetDialogRow) -> String {
+    let action = if row.facet == FacetKind::PropertyKey {
+        "Enter values"
+    } else {
+        "Enter apply"
+    };
+    if row.value_types.is_empty() {
+        return format!("{} records  {action}", row.count);
+    }
+    let types = row
+        .value_types
+        .iter()
+        .map(|value_type| value_type.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{} records  types={types}  {action}", row.count)
 }
 
 fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
@@ -389,6 +440,11 @@ fn empty_dialog_item(kind: DialogKind) -> dialog::SelectableListItem<'static> {
             shortcut: None,
             label: "No sources",
             description: "Observed sources appear after logs arrive",
+        },
+        DialogKind::Facets => dialog::SelectableListItem {
+            shortcut: None,
+            label: "No facet buckets",
+            description: "Adjust filters or wait for matching logs",
         },
     }
 }
@@ -720,6 +776,57 @@ mod tests {
     }
 
     #[test]
+    fn facet_dialog_draws_title_summary_buckets_and_selected_row() {
+        let mut app = app_with_lines(&["api | INFO one", "api | INFO two", "web | ERROR three"]);
+        app.open_dialog(DialogKind::Facets);
+
+        let buffer = render(&mut app, 100, 24, None, None);
+        let lines = lines(&buffer);
+        let selected = app.selected_facet_row().expect("a facet row is selected");
+        let y = lines
+            .iter()
+            .position(|line| line.contains("> ") && line.contains(&selected.value))
+            .expect("selected facet row rendered");
+        let row = u16::try_from(y).unwrap();
+        let x = column_of(&buffer, row, &selected.value);
+
+        assert!(lines.iter().any(|line| line.contains(" Filter facets ")));
+        assert!(lines.iter().any(|line| line.contains("win=3/3")));
+        assert!(lines.iter().any(|line| line.contains("source")
+            && line.contains("web")
+            && line.contains("1 records")));
+        assert!(
+            lines[y].contains("2 records  Enter apply"),
+            "{:?}",
+            lines[y]
+        );
+        assert_eq!(buffer[(x, row)].bg, THEME.accent);
+    }
+
+    #[test]
+    fn facet_value_dialog_escapes_control_and_literal_values() {
+        let mut app = app_with_lines(&[
+            r#"api | {"message":"literal","value":"\\n"}"#,
+            r#"api | {"message":"control","value":"\n"}"#,
+        ]);
+        app.open_dialog(DialogKind::Facets);
+        let index = app
+            .facet_rows()
+            .iter()
+            .position(|row| row.facet == FacetKind::PropertyKey && row.value == "value")
+            .unwrap();
+        app.move_dialog_down(DialogKind::Facets, index);
+        app.activate_selected_dialog_row(DialogKind::Facets);
+
+        let text = render_lines(&mut app, 100, 24).join("\n");
+
+        assert!(text.contains(" Facet values "), "{text}");
+        assert!(text.contains("val=2/2 key=value"), "{text}");
+        assert!(text.contains(r"\\n"), "{text}");
+        assert!(text.contains(r"\n "), "{text}");
+    }
+
+    #[test]
     fn empty_dialog_shows_placeholder_row() {
         let mut app = app_with_lines(&["api | INFO one"]);
         app.open_dialog(DialogKind::FilterPresets);
@@ -812,6 +919,9 @@ mod tests {
             render(&mut app, width, height, None, Some(&page_id));
 
             app.open_dialog(DialogKind::Sources);
+            render(&mut app, width, height, None, None);
+
+            app.open_dialog(DialogKind::Facets);
             render(&mut app, width, height, None, None);
 
             app.start_prompt(PromptKind::Text);
