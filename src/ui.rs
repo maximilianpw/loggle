@@ -77,49 +77,37 @@ fn draw_header(
         "paused"
     };
     let style = Style::default().fg(THEME.muted).bg(THEME.panel_alt);
-    let accent_style = Style::default()
-        .fg(THEME.accent)
-        .bg(THEME.panel_alt)
-        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(THEME.text).bg(THEME.panel_alt);
 
-    let header = Line::from(vec![
-        Span::styled(" loggle ", accent_style),
-        Span::styled(follow, Style::default().fg(THEME.text).bg(THEME.panel_alt)),
+    let mut spans = vec![
+        Span::styled(" loggle ", panel_accent_style()),
+        Span::styled(follow, value_style),
         Span::styled("  retained ", style),
-        Span::styled(
-            app.retained_len().to_string(),
-            Style::default().fg(THEME.text).bg(THEME.panel_alt),
-        ),
+        Span::styled(app.retained_len().to_string(), value_style),
         Span::styled("  visible ", style),
-        Span::styled(
-            visible_count.to_string(),
-            Style::default().fg(THEME.text).bg(THEME.panel_alt),
-        ),
+        Span::styled(visible_count.to_string(), value_style),
         Span::styled("  markers ", style),
-        Span::styled(
-            app.marker_count().to_string(),
-            Style::default().fg(THEME.text).bg(THEME.panel_alt),
-        ),
-    ]);
-    let header = if app.paused_backlog() == 0 {
-        header
-    } else {
-        let mut spans = header.spans;
+        Span::styled(app.marker_count().to_string(), value_style),
+    ];
+    if app.paused_backlog() != 0 {
         spans.extend([
             Span::styled("  new ", style),
-            Span::styled(
-                app.paused_backlog().to_string(),
-                Style::default().fg(THEME.text).bg(THEME.panel_alt),
-            ),
+            Span::styled(app.paused_backlog().to_string(), value_style),
         ]);
-        Line::from(spans)
-    };
+    }
 
-    frame.render_widget(Paragraph::new(header).style(style), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(style), area);
 
     if let Some(page_id) = page_id {
         draw_page_id(frame, area, page_id, style);
     }
+}
+
+fn panel_accent_style() -> Style {
+    Style::default()
+        .fg(THEME.accent)
+        .bg(THEME.panel_alt)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn draw_page_id(frame: &mut Frame<'_>, area: Rect, page_id: &LogPageId, style: Style) {
@@ -137,13 +125,7 @@ fn draw_page_id(frame: &mut Frame<'_>, area: Rect, page_id: &LogPageId, style: S
         width,
         height: area.height,
     };
-    let line = Line::from(Span::styled(
-        label,
-        Style::default()
-            .fg(THEME.accent)
-            .bg(THEME.panel_alt)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let line = Line::from(Span::styled(label, panel_accent_style()));
     frame.render_widget(Paragraph::new(line).style(style), rect);
 }
 
@@ -155,7 +137,7 @@ fn draw_body(
     visible_count: usize,
 ) {
     if app.details_open() && area.height >= 4 {
-        let details_height = area.height.saturating_sub(1).min(10).max(3);
+        let details_height = area.height.saturating_sub(1).clamp(3, 10);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(details_height)])
@@ -218,10 +200,7 @@ fn draw_logs(
 fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let base = Style::default().fg(THEME.text).bg(THEME.panel_alt);
     let muted = Style::default().fg(THEME.muted).bg(THEME.panel_alt);
-    let accent = Style::default()
-        .fg(THEME.accent)
-        .bg(THEME.panel_alt)
-        .add_modifier(Modifier::BOLD);
+    let accent = panel_accent_style();
 
     frame.render_widget(Block::default().style(base), area);
 
@@ -434,16 +413,10 @@ fn draw_closing_overlay(frame: &mut Frame<'_>, area: Rect, message: &str) {
         x: overlay.x.saturating_add(2),
         y: overlay.y.saturating_add(2),
         width: overlay.width.saturating_sub(4),
-        height: 1,
+        height: overlay.height.saturating_sub(2).min(1),
     };
     let line = Line::from(vec![
-        Span::styled(
-            "* ",
-            Style::default()
-                .fg(THEME.accent)
-                .bg(THEME.panel_alt)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("* ", panel_accent_style()),
         Span::styled(
             message.to_string(),
             Style::default().fg(THEME.text).bg(THEME.panel_alt),
@@ -476,4 +449,373 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(prompt).style(base), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+    fn render(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        closing: Option<&str>,
+        page_id: Option<&LogPageId>,
+    ) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, true, closing, page_id))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        lines(&render(app, width, height, None, None))
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| row_text(buffer, y))
+            .collect()
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn column_of(buffer: &Buffer, y: u16, needle: &str) -> u16 {
+        let row = row_text(buffer, y);
+        let byte_index = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found in {row:?}"));
+        u16::try_from(row[..byte_index].chars().count()).unwrap()
+    }
+
+    fn app_with_lines(lines: &[&str]) -> App {
+        let mut app = App::new(100);
+        for line in lines {
+            app.push_line((*line).to_string());
+        }
+        app
+    }
+
+    #[test]
+    fn header_shows_follow_counts_and_page_id() {
+        let mut app = app_with_lines(&["api | INFO one", "web | INFO two"]);
+        let page_id = LogPageId::parse("page-42").unwrap();
+
+        let buffer = render(&mut app, 100, 8, None, Some(&page_id));
+        let header = row_text(&buffer, 0);
+
+        assert!(header.starts_with(" loggle follow"), "{header:?}");
+        assert!(header.contains("retained 2"), "{header:?}");
+        assert!(header.contains("visible 2"), "{header:?}");
+        assert!(header.contains("markers 0"), "{header:?}");
+        assert!(header.ends_with(" id=page-42 "), "{header:?}");
+    }
+
+    #[test]
+    fn header_omits_page_id_when_absent() {
+        let mut app = app_with_lines(&["api | INFO one"]);
+
+        let header = render_lines(&mut app, 100, 8).remove(0);
+
+        assert!(header.contains("retained 1"), "{header:?}");
+        assert!(!header.contains("id="), "{header:?}");
+    }
+
+    #[test]
+    fn header_shows_paused_state_and_marker_count() {
+        let mut app = app_with_lines(&["api | INFO one", "api | INFO two"]);
+        app.move_up(1);
+        app.toggle_selected_marker();
+
+        let header = render_lines(&mut app, 100, 8).remove(0);
+
+        assert!(header.starts_with(" loggle paused"), "{header:?}");
+        assert!(header.contains("markers 1"), "{header:?}");
+    }
+
+    #[test]
+    fn log_rows_render_sequence_source_level_and_message() {
+        let mut app = app_with_lines(&["api | ERROR boom", "web | INFO hello"]);
+
+        let lines = render_lines(&mut app, 80, 8);
+
+        assert!(
+            lines[1].starts_with("      0 api            error   boom"),
+            "{:?}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("      1 web            info    hello"),
+            "{:?}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn selected_row_is_visually_distinguished() {
+        // Following selects the newest row, so the second row is selected.
+        let mut app = app_with_lines(&["api | INFO boom", "web | INFO hello"]);
+
+        let buffer = render(&mut app, 80, 8, None, None);
+        let unselected_message = column_of(&buffer, 1, "boom");
+        let selected_message = column_of(&buffer, 2, "hello");
+
+        assert_eq!(buffer[(0, 1)].bg, THEME.background);
+        assert_eq!(buffer[(0, 2)].bg, THEME.accent);
+        assert_eq!(buffer[(unselected_message, 1)].bg, THEME.background);
+        assert_eq!(buffer[(selected_message, 2)].bg, THEME.panel_alt);
+    }
+
+    #[test]
+    fn marked_row_renders_marker_in_rail() {
+        let mut app = app_with_lines(&["api | INFO one", "api | INFO two"]);
+        app.toggle_selected_marker();
+
+        let lines = render_lines(&mut app, 80, 8);
+
+        assert!(lines[1].starts_with(' '), "{:?}", lines[1]);
+        assert!(lines[2].starts_with('*'), "{:?}", lines[2]);
+    }
+
+    #[test]
+    fn text_filter_highlights_matching_message_text() {
+        let mut app = app_with_lines(&["api | INFO a boom here", "api | INFO quiet"]);
+        app.start_prompt(PromptKind::Text);
+        for ch in "boom".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.apply_prompt();
+
+        let buffer = render(&mut app, 140, 8, None, None);
+        let lines = lines(&buffer);
+        let start = column_of(&buffer, 1, "boom");
+        let plain = buffer[(start - 2, 1)].style();
+
+        assert!(lines[1].contains("a boom here"), "{:?}", lines[1]);
+        assert!(!lines[2].contains("quiet"), "{:?}", lines[2]);
+        for x in start..start + 4 {
+            assert_eq!(buffer[(x, 1)].bg, THEME.highlight);
+            assert_ne!(buffer[(x, 1)].style(), plain);
+        }
+        assert_eq!(buffer[(start + 4, 1)].style(), plain);
+        assert!(lines[7].contains("search=boom"), "{:?}", lines[7]);
+    }
+
+    #[test]
+    fn pinned_message_field_renders_value_or_dash() {
+        let mut app = app_with_lines(&["api | INFO second", "api | INFO first tenantId=t1"]);
+        app.add_selected_message_field();
+
+        let lines = render_lines(&mut app, 100, 8);
+
+        assert_eq!(app.message_field_keys(), ["tenantId".to_string()]);
+        assert!(
+            lines[1].contains(&format!("{:<20} second", "-")),
+            "{:?}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains(&format!("{:<20} first tenantId=t1", "tenantId=t1")),
+            "{:?}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn details_pane_renders_when_open_and_tall_enough() {
+        let mut app = app_with_lines(&["api | WARN slow request tenantId=t1 durationMs=96"]);
+        app.toggle_details();
+
+        let text = render_lines(&mut app, 80, 12).join("\n");
+
+        assert!(
+            text.contains(" details source=api level=warn time=-"),
+            "{text}"
+        );
+        assert!(text.contains(" message slow request"), "{text}");
+        assert!(text.contains("> tenantId = t1"), "{text}");
+        assert!(text.contains("  durationMs = 96"), "{text}");
+    }
+
+    #[test]
+    fn details_pane_reports_missing_properties() {
+        let mut app = app_with_lines(&["api | INFO plain"]);
+        app.toggle_details();
+
+        let text = render_lines(&mut app, 80, 12).join("\n");
+
+        assert!(text.contains(" no properties"), "{text}");
+    }
+
+    #[test]
+    fn details_pane_is_skipped_when_body_is_too_short() {
+        let mut app = app_with_lines(&["api | INFO slow request tenantId=t1"]);
+        app.toggle_details();
+
+        // Header and footer take two rows, leaving a body of height 3.
+        let text = render_lines(&mut app, 80, 5).join("\n");
+
+        assert!(app.details_open());
+        assert!(!text.contains(" details "), "{text}");
+        assert!(text.contains("slow request"), "{text}");
+    }
+
+    #[test]
+    fn prompt_footer_shows_label_and_prompt_text() {
+        let mut app = app_with_lines(&["api | INFO one"]);
+        app.start_prompt(PromptKind::Source);
+        for ch in "web".chars() {
+            app.push_prompt_char(ch);
+        }
+
+        let footer = render_lines(&mut app, 80, 6).pop().unwrap();
+
+        assert!(footer.starts_with(" source: web"), "{footer:?}");
+    }
+
+    #[test]
+    fn status_footer_shows_notice() {
+        let mut app = app_with_lines(&["api | INFO one"]);
+        app.set_notice("copied 1 line");
+
+        let footer = render_lines(&mut app, 80, 6).pop().unwrap();
+
+        assert!(footer.starts_with(" copied 1 line"), "{footer:?}");
+    }
+
+    #[test]
+    fn status_footer_shows_visual_selection() {
+        let mut app = app_with_lines(&["api | INFO one", "api | INFO two"]);
+        app.start_visual_selection();
+        app.move_up(1);
+
+        let footer = render_lines(&mut app, 80, 6).pop().unwrap();
+
+        assert!(footer.starts_with(" visual 2 lines  y copy"), "{footer:?}");
+    }
+
+    #[test]
+    fn message_fields_dialog_draws_title_and_selected_row() {
+        let mut app = app_with_lines(&["api | INFO first tenantId=t1"]);
+        app.add_selected_message_field();
+        app.open_dialog(DialogKind::MessageFields);
+
+        let buffer = render(&mut app, 100, 24, None, None);
+        let lines = lines(&buffer);
+        let y = lines
+            .iter()
+            .position(|line| line.contains("Backspace/Delete remove"))
+            .expect("pinned field row rendered");
+
+        assert!(lines.iter().any(|line| line.contains(" Pinned fields ")));
+        assert!(lines.iter().any(|line| line.contains(" search ")));
+        assert!(lines[y].contains("> "), "{:?}", lines[y]);
+        assert!(lines[y].contains("tenantId"), "{:?}", lines[y]);
+    }
+
+    #[test]
+    fn empty_dialog_shows_placeholder_row() {
+        let mut app = app_with_lines(&["api | INFO one"]);
+        app.open_dialog(DialogKind::FilterPresets);
+
+        let text = render_lines(&mut app, 100, 24).join("\n");
+
+        assert!(text.contains(" Filter presets "), "{text}");
+        assert!(text.contains("No filter presets"), "{text}");
+    }
+
+    #[test]
+    fn palette_draws_commands_with_selected_row_highlighted() {
+        let mut app = app_with_lines(&["api | INFO one"]);
+        app.open_palette();
+
+        let buffer = render(&mut app, 100, 24, None, None);
+        let lines = lines(&buffer);
+        let label = app.palette_commands()[app.palette_selected()].label;
+        let y = lines
+            .iter()
+            .position(|line| line.contains(label))
+            .expect("selected command rendered");
+        let row = u16::try_from(y).unwrap();
+        let x = column_of(&buffer, row, label);
+
+        assert!(lines.iter().any(|line| line.contains(" Commands ")));
+        assert!(lines[y].contains("> "), "{:?}", lines[y]);
+        assert_eq!(buffer[(x, row)].bg, THEME.accent);
+    }
+
+    #[test]
+    fn closing_overlay_renders_message() {
+        let mut app = app_with_lines(&["api | INFO one"]);
+
+        let buffer = render(&mut app, 80, 12, Some("Stopping sources..."), None);
+        let text = lines(&buffer).join("\n");
+
+        assert!(text.contains("* Stopping sources..."), "{text}");
+    }
+
+    #[test]
+    fn page_id_is_skipped_for_narrow_areas() {
+        let page_id = LogPageId::parse("page-42").unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(7, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_page_id(frame, frame.area(), &page_id, Style::default());
+            })
+            .unwrap();
+
+        assert_eq!(row_text(terminal.backend().buffer(), 0), "       ");
+    }
+
+    #[test]
+    fn page_id_is_truncated_to_fit() {
+        let page_id = LogPageId::parse("a-very-long-page-identifier").unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(12, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_page_id(frame, frame.area(), &page_id, Style::default());
+            })
+            .unwrap();
+
+        let row = row_text(terminal.backend().buffer(), 0);
+        assert!(row.contains(" id="), "{row:?}");
+        assert!(!row.contains("identifier"), "{row:?}");
+    }
+
+    #[test]
+    fn tiny_and_empty_areas_do_not_panic() {
+        let page_id = LogPageId::parse("page-42").unwrap();
+        let sizes = [
+            (1, 1),
+            (1, 0),
+            (0, 1),
+            (80, 0),
+            (80, 1),
+            (80, 2),
+            (5, 3),
+            (7, 4),
+        ];
+        for (width, height) in sizes {
+            let mut app = app_with_lines(&["api | INFO one tenantId=t1"]);
+            app.toggle_details();
+            render(&mut app, width, height, Some("closing"), Some(&page_id));
+
+            app.open_palette();
+            render(&mut app, width, height, None, Some(&page_id));
+
+            app.open_dialog(DialogKind::Sources);
+            render(&mut app, width, height, None, None);
+
+            app.start_prompt(PromptKind::Text);
+            render(&mut app, width, height, None, None);
+        }
+    }
 }
