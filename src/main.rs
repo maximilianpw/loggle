@@ -17,6 +17,7 @@ const USAGE: &str = "loggle reads newline-delimited logs from stdin or runs comm
 #[derive(Debug, Parser)]
 #[command(
     name = "loggle",
+    version,
     about = "A terminal log viewer for piped Docker Compose-style logs.",
     dont_delimit_trailing_values = true,
     // `loggle help` must stay a bare command, as it was before subcommands.
@@ -27,13 +28,23 @@ const USAGE: &str = "loggle reads newline-delimited logs from stdin or runs comm
     after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1"
 )]
 struct Cli {
-    #[arg(long, default_value_t = 100_000, value_parser = parse_buffer_lines)]
+    #[arg(
+        long,
+        default_value_t = 100_000,
+        value_name = "N",
+        value_parser = parse_buffer_lines,
+        help = "Maximum number of retained log lines"
+    )]
     buffer_lines: usize,
 
-    #[arg(long)]
+    #[arg(long, help = "Disable source and severity coloring")]
     no_color: bool,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write every raw incoming line to this session log file"
+    )]
     record: Option<std::path::PathBuf>,
 
     #[arg(
@@ -51,7 +62,13 @@ struct Cli {
     )]
     no_page_log: bool,
 
-    #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
+    #[arg(
+        long = "source-field",
+        value_name = "FIELD",
+        value_delimiter = ',',
+        value_parser = parse_source_field,
+        help = "Promote a parsed property to the source column when no prefix exists (repeatable or comma-separated)"
+    )]
     source_fields: Vec<String>,
 
     #[command(subcommand)]
@@ -555,6 +572,13 @@ mod tests {
     fn assert_help(raw_args: &[&str]) {
         let error = try_parse_cli(raw_args).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::DisplayHelp, "{raw_args:?}");
+    }
+
+    #[test]
+    fn version_flag_prints_version_instead_of_running_a_command() {
+        let error = try_parse_cli(&["--version"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
