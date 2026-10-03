@@ -8,6 +8,7 @@ license = "MIT"
 repository = "https://github.com/maximilianpw/loggle"
 homepage = "https://github.com/maximilianpw/loggle"
 readme = "README.md"
+default-run = "loggle"
 keywords = ["logs", "tui", "docker", "compose"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/.github", "/dist-workspace.toml", "/dist.toml", "/public"]
