@@ -2,7 +2,7 @@
 name = "loggle"
 version = "0.1.4"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A terminal log viewer for local, newline-delimited logs."
 license = "MIT"
 repository = "https://github.com/maximilianpw/loggle"
