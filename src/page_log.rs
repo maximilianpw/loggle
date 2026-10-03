@@ -516,7 +516,7 @@ fn parse_log_page<R: BufRead>(reader: R, source_config: SourceConfig) -> io::Res
     for line in reader.lines() {
         buffer.push_line(line?);
     }
-    buffer.finish_input();
+    let _ = buffer.finish_input();
     Ok(buffer)
 }
 
@@ -900,18 +900,27 @@ fn tail_matching_records<R: BufRead>(
         let change = buffer.push_line(line.clone());
         let removed_group_lines =
             take_removed_group_lines(&groups, &mut group_of_sequence, &change.removed);
-        if let Some(sequence) = change.appended {
+        if let Some((&last, replayed)) = change.appended.split_last() {
+            // An abandoned fold replays lines that were filed as continuations
+            // of the current group; move each back out into its own record.
+            regroup_replayed_lines(&mut groups, &mut group_of_sequence, current_group, replayed);
             let index = groups.len();
             let mut group = removed_group_lines;
             group.push(line);
             groups.push(group);
-            group_of_sequence.insert(sequence, index);
+            group_of_sequence.insert(last, index);
             current_group = Some(index);
         } else if let Some(index) = current_group {
             groups[index].push(line);
         }
     }
-    buffer.finish_input();
+    let change = buffer.finish_input();
+    regroup_replayed_lines(
+        &mut groups,
+        &mut group_of_sequence,
+        current_group,
+        &change.appended,
+    );
 
     let filter = log_filter_for_options(options)?;
     let matching = buffer
@@ -932,6 +941,31 @@ fn tail_matching_records<R: BufRead>(
     }
 
     Ok(records)
+}
+
+/// Gives each replayed event its own record group. The replayed lines are the
+/// most recent continuation lines of `current_group`, in order, because every
+/// line a fold buffered was filed there while the fold was open.
+fn regroup_replayed_lines(
+    groups: &mut Vec<Vec<String>>,
+    group_of_sequence: &mut HashMap<u64, usize>,
+    current_group: Option<usize>,
+    replayed: &[u64],
+) {
+    let Some(current) = current_group else {
+        return;
+    };
+    if replayed.is_empty() {
+        return;
+    }
+
+    let keep = groups[current].len().saturating_sub(replayed.len());
+    let lines = groups[current].split_off(keep);
+    for (sequence, line) in replayed.iter().zip(lines) {
+        let index = groups.len();
+        groups.push(vec![line]);
+        group_of_sequence.insert(*sequence, index);
+    }
 }
 
 fn take_removed_group_lines(
@@ -1881,6 +1915,40 @@ mod tests {
                 "[api] }".to_string(),
                 "[api] 21:05:37.312 INFO http.request ok".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn abandoned_fold_lines_become_their_own_records() {
+        // The fold is interrupted by a new summary and again by EOF; every
+        // buffered line must come back as a record of its own rather than be
+        // folded into the preceding summary or lost.
+        let input = "[api] 10:00:00.000 INFO first\n[api] [10:00:00.000] INFO (#1):\n[api] {\n[api] partial: true,\n[api] 10:00:01.000 INFO second\n[api] [10:00:01.000] INFO (#2):\n[api] {\n[api] tail: 1,\n"
+            .as_bytes();
+        let options = LogPageTailOptions {
+            line_count: 100,
+            clean: false,
+            source: None,
+            text: Some("partial".to_string()),
+            property_filters: Vec::new(),
+            source_config: SourceConfig::default(),
+            level: None,
+            format: LogOutputFormat::Text,
+        };
+        let replay = |options: &LogPageTailOptions| {
+            filtered_tail_lines(BufReader::new(input), options, Path::new("test.log")).unwrap()
+        };
+
+        assert_eq!(replay(&options), vec!["[api] partial: true,".to_string()]);
+
+        let mut options = options;
+        options.text = Some("tail".to_string());
+        assert_eq!(replay(&options), vec!["[api] tail: 1,".to_string()]);
+
+        options.text = Some("second".to_string());
+        assert_eq!(
+            replay(&options),
+            vec!["[api] 10:00:01.000 INFO second".to_string()]
         );
     }
 

@@ -123,10 +123,12 @@ impl App {
         }
     }
 
-    /// Marks the end of input so an unterminated property block is dropped
-    /// rather than left waiting for lines that will never arrive.
+    /// Marks the end of input so an unterminated property block is shown as
+    /// ordinary rows rather than left waiting for lines that will never arrive.
     pub fn finish_input(&mut self) {
-        self.buffer.finish_input();
+        let change = self.buffer.finish_input();
+        self.apply_buffer_change(change);
+        self.sync_selection();
     }
 
     pub fn push_line(&mut self, line: String) {

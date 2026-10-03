@@ -261,8 +261,8 @@ impl VisibleLogView {
             return;
         }
 
-        if let Some(sequence) = change.appended {
-            self.refresh_sequence(sequence, buffer, filters);
+        for sequence in &change.appended {
+            self.refresh_sequence(*sequence, buffer, filters);
         }
 
         for sequence in &change.updated {

@@ -586,6 +586,12 @@ previous event instead of shown as separate rows:
   }
 ```
 
+A block is folded only once its closing `}` arrives. If it never closes — the
+process exits mid-print, another service's output interrupts it, a new summary
+line starts, or it exceeds 256 lines or 256 KiB — Loggle gives up on the fold
+and shows the buffered lines as ordinary rows instead. No input is hidden; the
+summary just does not gain those properties.
+
 Inline `key=value` and logfmt-style tokens in the displayed message are also
 parsed as properties. Quoted values such as `service="api server"` are supported
 for filtering and source promotion. Flat single-line JSON objects are parsed as

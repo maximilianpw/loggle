@@ -30,7 +30,9 @@ pub struct LogBuffer {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct BufferChange {
-    pub(crate) appended: Option<u64>,
+    /// Events appended by this push, oldest first. Usually one; more when an
+    /// abandoned property fold replays its buffered lines as ordinary events.
+    pub(crate) appended: Vec<u64>,
     pub(crate) removed: Vec<u64>,
     pub(crate) updated: Vec<u64>,
 }
@@ -45,6 +47,10 @@ struct PendingPropertyBlock {
     /// The header had no summary yet, so it was kept as its own event and the
     /// properties move to the summary when it arrives.
     deferred_header: bool,
+    /// Raw input lines held by the fold so far, including a header line that
+    /// was consumed without becoming an event. Replayed as ordinary events if
+    /// the fold is abandoned, so no input is ever hidden from the viewer.
+    raw_lines: Vec<String>,
     lines: Vec<String>,
     bytes: usize,
     brace_depth: i32,
@@ -58,8 +64,9 @@ enum PendingPushResult {
     /// The line closed the block.
     Complete,
     /// The line cannot belong to the block (a new record or header, another
-    /// source, or a cap was hit). The block is dropped without applying any
-    /// properties and the line is pushed as an ordinary line.
+    /// source, or a cap was hit). The block's buffered lines are replayed as
+    /// ordinary events without applying any properties, then the line is
+    /// pushed as an ordinary line.
     AbandonAndRetry,
 }
 
@@ -110,10 +117,21 @@ impl LogBuffer {
         change
     }
 
-    /// Ends input: an unclosed property block is dropped without applying any
-    /// of its partial properties. Call once the source reaches EOF.
-    pub(crate) fn finish_input(&mut self) {
-        self.pending_properties = None;
+    /// Ends input: an unclosed property block is abandoned without applying
+    /// any of its partial properties, and its buffered lines are replayed as
+    /// ordinary events. Call once the source reaches EOF.
+    pub(crate) fn finish_input(&mut self) -> BufferChange {
+        let mut change = BufferChange::default();
+        if let Some(pending) = self.pending_properties.take() {
+            self.replay_abandoned_fold(pending, &mut change);
+        }
+        change
+    }
+
+    fn replay_abandoned_fold(&mut self, pending: PendingPropertyBlock, change: &mut BufferChange) {
+        for line in pending.raw_lines {
+            self.push_event(line, change);
+        }
     }
 
     fn push_ordinary_line(&mut self, line: String, change: &mut BufferChange) {
@@ -123,8 +141,11 @@ impl LogBuffer {
         };
 
         if let Some(target_sequence) = self.property_target_sequence(&header) {
-            self.pending_properties =
-                Some(PendingPropertyBlock::new(target_sequence, header, false));
+            let mut pending = PendingPropertyBlock::new(target_sequence, header, false);
+            // The header is not an event of its own; keep it so an abandoned
+            // fold can still show it.
+            pending.raw_lines.push(line);
+            self.pending_properties = Some(pending);
             return;
         }
 
@@ -156,7 +177,7 @@ impl LogBuffer {
             .event_from_source_line(self.next_sequence, line, parsed);
         self.next_sequence += 1;
         self.events.push_back(event);
-        change.appended = Some(sequence);
+        change.appended.push(sequence);
         self.apply_completed_property_block_to_back(change);
         Some(sequence)
     }
@@ -215,7 +236,7 @@ impl LogBuffer {
         match result {
             PendingPushResult::Accepted => self.pending_properties = Some(pending),
             PendingPushResult::Complete => self.apply_pending_properties(pending, change),
-            PendingPushResult::AbandonAndRetry => {}
+            PendingPushResult::AbandonAndRetry => self.replay_abandoned_fold(pending, change),
         }
 
         Some(result)
@@ -469,6 +490,7 @@ impl PendingPropertyBlock {
             target_sequence,
             header,
             deferred_header,
+            raw_lines: Vec::new(),
             lines: Vec::new(),
             bytes: 0,
             brace_depth: 0,
@@ -526,6 +548,7 @@ impl PendingPropertyBlock {
         if track_braces {
             self.update_brace_depth(&parsed.message);
         }
+        self.raw_lines.push(line.to_string());
         self.lines.push(parsed.message);
         self.bytes = bytes;
         if self.is_complete() {
@@ -734,7 +757,7 @@ mod tests {
         buffer.push_line("[api] requestId: \"abc-123\",".to_string());
         buffer.push_line("[api] }".to_string());
         let change = buffer.push_line("[api] 21:05:37.312 INFO http.request ok".to_string());
-        assert_eq!(change.appended, Some(2));
+        assert_eq!(change.appended, vec![2]);
         assert_eq!(change.removed, vec![1]);
 
         for index in 0..2_000 {
@@ -1306,10 +1329,15 @@ mod tests {
         let change = buffer.push_line("[api] 10:00:01.000 ERROR recovered".to_string());
         buffer.push_line("[api] INFO later".to_string());
 
-        assert_eq!(change.appended, Some(1));
-        assert_eq!(buffer.events().len(), 3);
-        assert_eq!(buffer.events()[1].message, "recovered");
-        assert_eq!(buffer.events()[2].message, "later");
+        // The abandoned fold's header and body are replayed as rows so no
+        // input disappears, then the trigger line follows.
+        assert_eq!(change.appended, vec![1, 2, 3, 4]);
+        assert_eq!(buffer.events().len(), 6);
+        assert_eq!(buffer.events()[1].raw, "[api] [10:00:00.000] INFO (#1):");
+        assert_eq!(buffer.events()[2].message, "{");
+        assert_eq!(buffer.events()[3].message, "partial: true,");
+        assert_eq!(buffer.events()[4].message, "recovered");
+        assert_eq!(buffer.events()[5].message, "later");
         assert!(buffer.events()[0].property("partial").is_none());
         assert_eq!(
             buffer
@@ -1331,10 +1359,12 @@ mod tests {
         buffer.push_line("partial: true,".to_string());
         let change = buffer.push_line("[10:00:01.000] ERROR recovered".to_string());
 
-        assert_eq!(change.appended, Some(1));
-        assert_eq!(buffer.events().len(), 2);
-        assert_eq!(buffer.events()[1].raw, "[10:00:01.000] ERROR recovered");
-        assert_eq!(buffer.events()[1].level, crate::model::Level::Error);
+        assert_eq!(change.appended, vec![1, 2, 3, 4]);
+        assert_eq!(buffer.events().len(), 5);
+        assert_eq!(buffer.events()[1].raw, "[10:00:00.000] INFO (#1):");
+        assert_eq!(buffer.events()[3].raw, "partial: true,");
+        assert_eq!(buffer.events()[4].raw, "[10:00:01.000] ERROR recovered");
+        assert_eq!(buffer.events()[4].level, crate::model::Level::Error);
         assert!(buffer.events()[0].property("partial").is_none());
     }
 
@@ -1345,7 +1375,7 @@ mod tests {
         let change = conflict.push_line("[worker] {".to_string());
         conflict.push_line("[worker] INFO continued".to_string());
 
-        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.appended, vec![1]);
         assert_eq!(conflict.events()[1].source, "worker");
         assert_eq!(conflict.events()[1].message, "{");
         assert_eq!(conflict.events()[2].message, "continued");
@@ -1355,19 +1385,22 @@ mod tests {
         status.push_line("[api] {".to_string());
         let change = status.push_line("worker Started container".to_string());
 
-        assert_eq!(change.appended, Some(1));
-        assert_eq!(status.events()[1].source, "worker");
-        assert_eq!(status.events()[1].message, "Started container");
+        // The buffered `{` is replayed before the interrupting line.
+        assert_eq!(change.appended, vec![1, 2]);
+        assert_eq!(status.events()[1].source, "api");
+        assert_eq!(status.events()[1].message, "{");
+        assert_eq!(status.events()[2].source, "worker");
+        assert_eq!(status.events()[2].message, "Started container");
 
         let mut buildkit = LogBuffer::new(10);
         buildkit.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
         buildkit.push_line("[api] {".to_string());
         let change = buildkit.push_line("#35 [worker internal] load metadata for node".to_string());
 
-        assert_eq!(change.appended, Some(1));
-        assert_eq!(buildkit.events()[1].source, "worker");
+        assert_eq!(change.appended, vec![1, 2]);
+        assert_eq!(buildkit.events()[2].source, "worker");
         assert_eq!(
-            buildkit.events()[1].message,
+            buildkit.events()[2].message,
             "#35 [internal] load metadata for node"
         );
 
@@ -1377,8 +1410,9 @@ mod tests {
         buildkit_continuation.push_line("[api] {".to_string());
         let change = buildkit_continuation.push_line("#35 DONE 1.4s".to_string());
 
-        assert_eq!(change.appended, Some(2));
-        assert_eq!(buildkit_continuation.events()[2].source, "worker");
+        assert_eq!(change.appended, vec![2, 3]);
+        assert_eq!(buildkit_continuation.events()[2].source, "api");
+        assert_eq!(buildkit_continuation.events()[3].source, "worker");
 
         let mut headers = LogBuffer::new(10);
         headers.push_line("[api] [10:00:00.000] INFO (#1):".to_string());
@@ -1386,7 +1420,7 @@ mod tests {
         headers.push_line("[worker] { owner: \"worker\" }".to_string());
         headers.push_line("[worker] 10:00:01.000 WARN summary".to_string());
 
-        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.appended, vec![1]);
         assert_eq!(headers.events().len(), 2);
         assert_eq!(headers.events()[0].source, "api");
         assert_eq!(headers.events()[1].source, "worker");
@@ -1453,9 +1487,10 @@ mod tests {
         recovered.push_line("[api] partial: true,".to_string());
         let change = recovered.push_line("[api] } recovered".to_string());
 
-        assert_eq!(change.appended, Some(1));
-        assert_eq!(recovered.events().len(), 2);
-        assert_eq!(recovered.events()[1].message, "} recovered");
+        assert_eq!(change.appended, vec![1, 2, 3, 4]);
+        assert_eq!(recovered.events().len(), 5);
+        assert_eq!(recovered.events()[3].message, "partial: true,");
+        assert_eq!(recovered.events()[4].message, "} recovered");
         assert!(recovered.events()[0].property("partial").is_none());
     }
 
@@ -1470,11 +1505,15 @@ mod tests {
         buffer.push_line("[api] info: true,".to_string());
         let change = buffer.push_line("[api] ERROR recovered".to_string());
 
-        assert_eq!(change.appended, Some(1));
-        assert_eq!(buffer.events().len(), 2);
+        assert_eq!(change.appended, vec![1, 2, 3, 4, 5]);
+        assert_eq!(buffer.events().len(), 6);
         assert!(buffer.events()[0].property("error").is_none());
         assert!(buffer.events()[0].property("info").is_none());
-        assert_eq!(buffer.events()[1].message, "recovered");
+        // Replayed body lines are parsed like any other input: the level-
+        // named key reads as a level token on its own.
+        assert_eq!(buffer.events()[3].raw, "[api] error: \"failed\",");
+        assert_eq!(buffer.events()[3].level, crate::model::Level::Error);
+        assert_eq!(buffer.events()[5].message, "recovered");
     }
 
     #[test]
@@ -1504,9 +1543,15 @@ mod tests {
         assert!(pending.bytes <= MAX_PENDING_PROPERTY_BYTES);
         let change = overflow.push_line("}".to_string());
 
-        assert_eq!(change.appended, Some(1));
+        // Header + `{` + the capped body lines replay, then the trigger `}`.
+        assert_eq!(change.appended.len(), MAX_PENDING_PROPERTY_LINES + 2);
+        assert_eq!(change.appended.first(), Some(&1));
         assert!(overflow.pending_properties.is_none());
-        assert_eq!(overflow.events()[1].raw, "}");
+        // The 10-line buffer evicts the oldest replayed rows; the newest
+        // replayed blanks and the trigger remain.
+        assert_eq!(overflow.events().len(), 10);
+        assert_eq!(overflow.event_by_sequence(1).map(|e| e.raw.as_str()), None);
+        assert_eq!(overflow.events().back().unwrap().raw, "}");
     }
 
     #[test]
@@ -1549,14 +1594,16 @@ mod tests {
         assert_eq!(oversized.len() + 3, MAX_PENDING_PROPERTY_BYTES + 1);
         let change = overflow.push_line(oversized.clone());
 
-        assert_eq!(change.appended, Some(1));
+        assert_eq!(change.appended, vec![1, 2, 3]);
         assert!(overflow.pending_properties.is_none());
-        assert_eq!(overflow.events()[1].raw, oversized);
+        assert_eq!(overflow.events()[1].raw, "[10:00:00.000] INFO (#1):");
+        assert_eq!(overflow.events()[2].raw, "{");
+        assert_eq!(overflow.events()[3].raw, oversized);
         assert!(overflow.events()[0].properties.is_empty());
     }
 
     #[test]
-    fn eof_drops_incomplete_fold_without_applying_partial_properties() {
+    fn eof_replays_incomplete_fold_without_applying_partial_properties() {
         let mut buffer = LogBuffer::new(10);
 
         buffer.push_line("[api] 10:00:00.000 INFO summary stable=true".to_string());
@@ -1565,9 +1612,13 @@ mod tests {
         buffer.push_line("[api] partial: true,".to_string());
         assert!(buffer.pending_properties.is_some());
 
-        buffer.finish_input();
+        let change = buffer.finish_input();
 
         assert!(buffer.pending_properties.is_none());
+        assert_eq!(change.appended, vec![1, 2, 3]);
+        assert_eq!(buffer.events().len(), 4);
+        assert_eq!(buffer.events()[3].raw, "[api] partial: true,");
+        assert_eq!(buffer.events()[3].source, "api");
         assert!(buffer.events()[0].property("stable").is_some());
         assert!(buffer.events()[0].property("partial").is_none());
     }
