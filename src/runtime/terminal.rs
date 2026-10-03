@@ -27,7 +27,6 @@ use super::{
     keys::{self, KeyOutcome},
 };
 
-// Plain runtime plumbing from `RuntimeConfig`; a parameter struct would only rename it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     mut rx: mpsc::Receiver<String>,
