@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{self, BufWriter, Write},
     path::PathBuf,
+    sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
 
@@ -12,46 +13,32 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use tokio::sync::mpsc;
 
 use crate::{
     app::App,
-    model::SourceConfig,
     page_log::{ActiveLogPageRegistration, LogPageId, PageLogRecorder, claim_active_log_page},
     ui,
 };
 
 use super::{
-    clipboard,
+    RuntimeConfig, clipboard,
     input::{self, Child, ChildShutdown, ShutdownSignal, ShutdownStatus},
     keys::{self, KeyOutcome},
 };
 
 pub(super) fn run(
-    mut rx: mpsc::Receiver<String>,
+    rx: Receiver<String>,
     startup_lines: Vec<String>,
-    buffer_lines: usize,
-    color_enabled: bool,
-    source_config: SourceConfig,
-    record_path: Option<PathBuf>,
-    page_id: Option<LogPageId>,
-    page_command: String,
-    page_logging: bool,
     mut children: Vec<Child>,
+    config: RuntimeConfig,
 ) -> io::Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let result = run_app(
         terminal.terminal_mut(),
-        &mut rx,
+        &rx,
         startup_lines,
-        buffer_lines,
-        color_enabled,
-        source_config,
-        record_path,
-        page_id,
-        page_command,
-        page_logging,
         &mut children,
+        config,
     );
 
     drop(children);
@@ -164,31 +151,37 @@ impl Drop for TerminalModeGuard {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    rx: &mut mpsc::Receiver<String>,
+    rx: &Receiver<String>,
     startup_lines: Vec<String>,
-    buffer_lines: usize,
-    color_enabled: bool,
-    source_config: SourceConfig,
-    record_path: Option<PathBuf>,
-    page_id: Option<LogPageId>,
-    page_command: String,
-    page_logging: bool,
     children: &mut Vec<Child>,
+    config: RuntimeConfig,
 ) -> io::Result<()> {
+    let RuntimeConfig {
+        buffer_lines,
+        color_enabled,
+        source_config,
+        input: _,
+        record_path,
+        page_id,
+        page_command,
+        page_logging,
+    } = config;
     let mut app = App::with_source_config(buffer_lines, source_config);
     let mut shutdown: Option<Vec<ChildShutdown>> = None;
     let mut dirty = true;
-    let mut recorder = record_path.map(SessionRecorder::create).transpose()?;
+    let mut recorders = Recorders {
+        session: record_path.map(SessionRecorder::create).transpose()?,
+        page: None,
+    };
     // The page log is an auxiliary, always-on feature; failures disable it with
     // a notice rather than tearing down the viewer the user actually asked for.
-    let mut page_recorder = None;
     let mut page_id_for_header = None;
     let mut active_page = None;
     if page_logging {
         match start_page_log(page_id, &page_command, buffer_lines) {
             Ok((id, recorder, registration)) => {
                 page_id_for_header = Some(id);
-                page_recorder = Some(recorder);
+                recorders.page = Some(recorder);
                 active_page = Some(registration);
             }
             Err(error) => app.set_notice(format!("page log disabled: {error}")),
@@ -198,16 +191,18 @@ fn run_app(
 
     let had_startup_lines = !startup_lines.is_empty();
     for line in startup_lines {
-        ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
+        recorders.ingest(&mut app, &line)?;
+        app.push_line(line);
     }
     if had_startup_lines {
-        flush_page_recorder(&mut app, &mut page_recorder);
+        recorders.flush(&mut app);
     }
 
     loop {
         let mut received = false;
         while let Ok(line) = rx.try_recv() {
-            ingest_line(&mut app, &mut recorder, &mut page_recorder, line)?;
+            recorders.ingest(&mut app, &line)?;
+            app.push_line(line);
             received = true;
             dirty = true;
         }
@@ -215,7 +210,7 @@ fn run_app(
         // Flush once per drain instead of per line, so the read command sees
         // fresh data without a syscall on every ingested line.
         if received {
-            flush_page_recorder(&mut app, &mut page_recorder);
+            recorders.flush(&mut app);
         }
 
         if let Some(active_shutdowns) = shutdown.as_mut() {
@@ -235,7 +230,7 @@ fn run_app(
             }
 
             if all_exited {
-                flush_recorders(&mut recorder, &mut page_recorder)?;
+                recorders.finish()?;
                 children.clear();
                 return Ok(());
             }
@@ -274,7 +269,7 @@ fn run_app(
                     if requested_quit {
                         match shutdown.as_mut() {
                             _ if children.is_empty() => {
-                                flush_recorders(&mut recorder, &mut page_recorder)?;
+                                recorders.finish()?;
                                 return Ok(());
                             }
                             None => {
@@ -306,31 +301,47 @@ fn run_app(
     }
 }
 
-fn ingest_line(
-    app: &mut App,
-    recorder: &mut Option<SessionRecorder>,
-    page_recorder: &mut Option<PageLogRecorder>,
-    line: String,
-) -> io::Result<()> {
-    if let Some(recorder) = recorder.as_mut() {
-        recorder.record_line(&line)?;
-    }
-    if let Some(active_recorder) = page_recorder.as_mut() {
-        if let Err(error) = active_recorder.record_line(&line) {
-            app.set_notice(format!("page log disabled: {error}"));
-            *page_recorder = None;
-        }
-    }
-    app.push_line(line);
-    Ok(())
+/// The `--record` session recorder and the auxiliary page log. Session
+/// recording failures are fatal; page log failures only disable the page log.
+struct Recorders {
+    session: Option<SessionRecorder>,
+    page: Option<PageLogRecorder>,
 }
 
-fn flush_page_recorder(app: &mut App, page_recorder: &mut Option<PageLogRecorder>) {
-    if let Some(active_recorder) = page_recorder.as_mut() {
-        if let Err(error) = active_recorder.flush() {
-            app.set_notice(format!("page log disabled: {error}"));
-            *page_recorder = None;
+impl Recorders {
+    /// Records a line; the caller then hands the owned line to the app.
+    fn ingest(&mut self, app: &mut App, line: &str) -> io::Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.record_line(line)?;
         }
+        if let Some(Err(error)) = self.page.as_mut().map(|page| page.record_line(line)) {
+            self.disable_page_log(app, &error);
+        }
+        Ok(())
+    }
+
+    /// Flushes the page log once per drain so readers see fresh data.
+    fn flush(&mut self, app: &mut App) {
+        if let Some(Err(error)) = self.page.as_mut().map(PageLogRecorder::flush) {
+            self.disable_page_log(app, &error);
+        }
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.flush()?;
+        }
+        // Best-effort: a failure flushing the auxiliary page log must not fail the
+        // session's clean shutdown.
+        if let Some(page) = self.page.as_mut() {
+            let _ = page.flush();
+        }
+        Ok(())
+    }
+
+    fn disable_page_log(&mut self, app: &mut App, error: &io::Error) {
+        app.set_notice(format!("page log disabled: {error}"));
+        self.page = None;
     }
 }
 
@@ -363,21 +374,6 @@ fn start_page_log(
         claim_active_log_page(page_id, page_command).map_err(io::Error::other)?;
     let recorder = PageLogRecorder::create(&id, buffer_lines).map_err(io::Error::other)?;
     Ok((id, recorder, registration))
-}
-
-fn flush_recorders(
-    recorder: &mut Option<SessionRecorder>,
-    page_recorder: &mut Option<PageLogRecorder>,
-) -> io::Result<()> {
-    if let Some(recorder) = recorder.as_mut() {
-        recorder.flush()?;
-    }
-    // Best-effort: a failure flushing the auxiliary page log must not fail the
-    // session's clean shutdown.
-    if let Some(page_recorder) = page_recorder.as_mut() {
-        let _ = page_recorder.flush();
-    }
-    Ok(())
 }
 
 fn copy_to_clipboard(app: &mut App, text: &str, line_count: usize) {

@@ -6,9 +6,7 @@ mod terminal;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
-use std::{collections::BTreeMap, fmt, io, path::PathBuf, time::Duration};
-
-use tokio::sync::mpsc;
+use std::{collections::BTreeMap, fmt, io, path::PathBuf, sync::mpsc, time::Duration};
 
 use crate::{model::SourceConfig, page_log::LogPageId};
 
@@ -74,9 +72,9 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingInput => f.write_str(
-                "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --property tenantId=tenant-1\n  loggle run --name api -- pnpm start --name web -- pnpm dev\n  loggle start [name]",
-            ),
+            Self::MissingInput => {
+                f.write_str("no input: stdin is a terminal and no command was given")
+            }
             Self::Io(error) => write!(f, "{error}"),
         }
     }
@@ -98,22 +96,10 @@ impl From<io::Error> for RuntimeError {
 }
 
 pub fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
-    let (tx, mut rx) = mpsc::channel(input::LINE_CHANNEL_CAPACITY);
-    let started = start_input(&config.input, tx, &mut rx, config.buffer_lines)?;
+    let (tx, rx) = mpsc::sync_channel(input::LINE_CHANNEL_CAPACITY);
+    let started = start_input(&config.input, tx, &rx, config.buffer_lines)?;
 
-    terminal::run(
-        rx,
-        started.startup_lines,
-        config.buffer_lines,
-        config.color_enabled,
-        config.source_config,
-        config.record_path,
-        config.page_id,
-        config.page_command,
-        config.page_logging,
-        started.children,
-    )
-    .map_err(RuntimeError::from)
+    terminal::run(rx, started.startup_lines, started.children, config).map_err(RuntimeError::from)
 }
 
 struct StartedInput {
@@ -123,8 +109,8 @@ struct StartedInput {
 
 fn start_input(
     input_mode: &RuntimeInput,
-    tx: mpsc::Sender<String>,
-    rx: &mut mpsc::Receiver<String>,
+    tx: mpsc::SyncSender<String>,
+    rx: &mpsc::Receiver<String>,
     startup_line_capacity: usize,
 ) -> Result<StartedInput, RuntimeError> {
     match input_mode {

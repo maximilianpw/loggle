@@ -6,12 +6,10 @@ use std::{
     os::unix::process::CommandExt,
     path::Path,
     process::{Child as ProcessChild, Command, Stdio},
-    sync::mpsc as std_mpsc,
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
-
-use tokio::sync::mpsc;
 
 use super::{NamedCommand, ReadySpec, StartCommand, StartPlan};
 
@@ -48,13 +46,13 @@ pub(super) fn stdin_is_terminal() -> bool {
     io::stdin().is_terminal()
 }
 
-pub(super) fn spawn_stdin_reader(tx: mpsc::Sender<String>) -> io::Result<()> {
+pub(super) fn spawn_stdin_reader(tx: mpsc::SyncSender<String>) -> io::Result<()> {
     let input = prepare_terminal_input()?;
     spawn_line_reader(input, tx, LineReaderConfig::default());
     Ok(())
 }
 
-pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io::Result<Child> {
+pub(super) fn spawn_command(command: &[String], tx: mpsc::SyncSender<String>) -> io::Result<Child> {
     let mut child = spawn_child(command, None)?;
     spawn_output_readers(&mut child, tx, LineReaderConfig::default());
 
@@ -63,7 +61,7 @@ pub(super) fn spawn_command(command: &[String], tx: mpsc::Sender<String>) -> io:
 
 pub(super) fn spawn_named_commands(
     commands: &[NamedCommand],
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
 ) -> io::Result<Vec<Child>> {
     let mut children = Vec::with_capacity(commands.len());
 
@@ -77,7 +75,7 @@ pub(super) fn spawn_named_commands(
 #[cfg(test)]
 pub(super) fn spawn_start_commands(
     commands: &[StartCommand],
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
 ) -> io::Result<Vec<Child>> {
     let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
     StartScheduler::new(plan, tx).run(None, None)
@@ -85,8 +83,8 @@ pub(super) fn spawn_start_commands(
 
 pub(super) fn spawn_start_commands_draining(
     commands: &[StartCommand],
-    tx: mpsc::Sender<String>,
-    rx: &mut mpsc::Receiver<String>,
+    tx: mpsc::SyncSender<String>,
+    rx: &mpsc::Receiver<String>,
     retained_lines: usize,
 ) -> io::Result<(Vec<String>, Vec<Child>)> {
     let plan = StartPlan::new(commands).map_err(|error| io::Error::other(error.to_string()))?;
@@ -95,7 +93,7 @@ pub(super) fn spawn_start_commands_draining(
     Ok((startup_lines.into_vec(), children))
 }
 
-fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::Result<Child> {
+fn spawn_named_command(command: &NamedCommand, tx: mpsc::SyncSender<String>) -> io::Result<Child> {
     let mut child = spawn_child(&command.command, command.cwd.as_deref())?;
     spawn_output_readers(
         &mut child,
@@ -108,7 +106,7 @@ fn spawn_named_command(command: &NamedCommand, tx: mpsc::Sender<String>) -> io::
 
 fn spawn_start_command(
     command: &StartCommand,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
 ) -> io::Result<SpawnedStartCommand> {
     let mut child = spawn_child_with_env(&command.argv, command.cwd.as_deref(), &command.env)?;
     let ready_line = match &command.ready {
@@ -117,7 +115,7 @@ fn spawn_start_command(
     };
     let (ready_tx, ready_rx) = ready_line
         .as_ref()
-        .map(|_| std_mpsc::channel())
+        .map(|_| mpsc::channel())
         .map(|(tx, rx)| (Some(tx), Some(rx)))
         .unwrap_or((None, None));
 
@@ -187,7 +185,7 @@ fn prepare_terminal_input() -> io::Result<File> {
 struct LineReaderConfig {
     source: Option<String>,
     ready_line: Option<String>,
-    ready_tx: Option<std_mpsc::Sender<()>>,
+    ready_tx: Option<mpsc::Sender<()>>,
 }
 
 impl LineReaderConfig {
@@ -202,7 +200,7 @@ impl LineReaderConfig {
     fn with_source_and_ready(
         source: String,
         ready_line: Option<String>,
-        ready_tx: Option<std_mpsc::Sender<()>>,
+        ready_tx: Option<mpsc::Sender<()>>,
     ) -> Self {
         Self {
             source: Some(source),
@@ -212,7 +210,7 @@ impl LineReaderConfig {
     }
 }
 
-fn spawn_output_readers(child: &mut Child, tx: mpsc::Sender<String>, config: LineReaderConfig) {
+fn spawn_output_readers(child: &mut Child, tx: mpsc::SyncSender<String>, config: LineReaderConfig) {
     if let Some(stdout) = child.stdout.take() {
         spawn_line_reader(stdout, tx.clone(), config.clone());
     }
@@ -221,14 +219,14 @@ fn spawn_output_readers(child: &mut Child, tx: mpsc::Sender<String>, config: Lin
     }
 }
 
-fn spawn_line_reader<R>(input: R, tx: mpsc::Sender<String>, config: LineReaderConfig)
+fn spawn_line_reader<R>(input: R, tx: mpsc::SyncSender<String>, config: LineReaderConfig)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || read_lines(input, tx, config));
 }
 
-fn read_lines<R>(input: R, tx: mpsc::Sender<String>, config: LineReaderConfig)
+fn read_lines<R>(input: R, tx: mpsc::SyncSender<String>, config: LineReaderConfig)
 where
     R: Read,
 {
@@ -248,7 +246,7 @@ where
                     .map(|source| format!("[{source}] {line}"))
                     .unwrap_or(line);
 
-                if tx.blocking_send(line).is_err() {
+                if tx.send(line).is_err() {
                     break;
                 }
 
@@ -267,20 +265,20 @@ where
 #[derive(Debug)]
 struct SpawnedStartCommand {
     child: Child,
-    line_ready_rx: Option<std_mpsc::Receiver<()>>,
+    line_ready_rx: Option<mpsc::Receiver<()>>,
 }
 
 struct StartScheduler<'a> {
     plan: StartPlan<'a>,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
     states: Vec<StartState>,
     children: Vec<Option<Child>>,
-    line_ready: Vec<Option<std_mpsc::Receiver<()>>>,
+    line_ready: Vec<Option<mpsc::Receiver<()>>>,
     command_ready: Vec<Option<CommandReadyState>>,
 }
 
 impl<'a> StartScheduler<'a> {
-    fn new(plan: StartPlan<'a>, tx: mpsc::Sender<String>) -> Self {
+    fn new(plan: StartPlan<'a>, tx: mpsc::SyncSender<String>) -> Self {
         let len = plan.len();
 
         Self {
@@ -295,7 +293,7 @@ impl<'a> StartScheduler<'a> {
 
     fn run(
         mut self,
-        mut startup_rx: Option<&mut mpsc::Receiver<String>>,
+        startup_rx: Option<&mpsc::Receiver<String>>,
         mut startup_lines: Option<&mut StartupLineBuffer>,
     ) -> io::Result<Vec<Child>> {
         while !self.all_ready() {
@@ -307,10 +305,10 @@ impl<'a> StartScheduler<'a> {
                 thread::sleep(Duration::from_millis(10));
             }
 
-            drain_startup_lines(&mut startup_rx, &mut startup_lines);
+            drain_startup_lines(startup_rx, &mut startup_lines);
         }
 
-        drain_startup_lines(&mut startup_rx, &mut startup_lines);
+        drain_startup_lines(startup_rx, &mut startup_lines);
 
         Ok(self
             .children
@@ -397,11 +395,7 @@ impl<'a> StartScheduler<'a> {
             if let Some(command_ready) = self.command_ready[index].as_mut() {
                 if command_ready.is_command_probe_due(now) {
                     let probe_outcome =
-                        command_ready.run_probe(command.cwd.as_deref(), &command.env, now);
-                    let probe_outcome = match probe_outcome {
-                        Ok(outcome) => outcome,
-                        Err(error) => return Err(error),
-                    };
+                        command_ready.run_probe(command.cwd.as_deref(), &command.env, now)?;
 
                     match probe_outcome {
                         ProbeOutcome::Ready => {
@@ -440,10 +434,10 @@ impl<'a> StartScheduler<'a> {
 }
 
 fn drain_startup_lines(
-    startup_rx: &mut Option<&mut mpsc::Receiver<String>>,
+    startup_rx: Option<&mpsc::Receiver<String>>,
     startup_lines: &mut Option<&mut StartupLineBuffer>,
 ) {
-    let Some(rx) = startup_rx.as_deref_mut() else {
+    let Some(rx) = startup_rx else {
         return;
     };
     let Some(lines) = startup_lines.as_deref_mut() else {
@@ -467,14 +461,10 @@ impl StartupLineBuffer {
         }
     }
 
-    fn drain(&mut self, rx: &mut mpsc::Receiver<String>) {
-        loop {
-            match rx.try_recv() {
-                Ok(line) => self.push(line),
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
+    fn drain(&mut self, rx: &mpsc::Receiver<String>) {
+        // Stops on both empty and disconnected: startup only takes what is queued.
+        while let Ok(line) = rx.try_recv() {
+            self.push(line);
         }
     }
 
@@ -882,15 +872,15 @@ mod tests {
         }
     }
 
-    fn recv_lines(rx: &mut mpsc::Receiver<String>, count: usize) -> Vec<String> {
+    fn recv_lines(rx: &mpsc::Receiver<String>, count: usize) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut lines = Vec::new();
 
         while lines.len() < count && Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(line) => lines.push(line),
-                Err(mpsc::error::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
+                Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
 
@@ -911,18 +901,18 @@ mod tests {
 
     #[test]
     fn read_lines_sends_each_line_until_eof() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::sync_channel(4);
 
         read_lines("one\ntwo\n".as_bytes(), tx, LineReaderConfig::default());
 
-        assert_eq!(rx.blocking_recv(), Some("one".to_string()));
-        assert_eq!(rx.blocking_recv(), Some("two".to_string()));
-        assert_eq!(rx.blocking_recv(), None);
+        assert_eq!(rx.recv().ok(), Some("one".to_string()));
+        assert_eq!(rx.recv().ok(), Some("two".to_string()));
+        assert_eq!(rx.recv().ok(), None);
     }
 
     #[test]
     fn prefixed_line_reader_marks_each_line_with_source_name() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::sync_channel(4);
 
         read_lines(
             "one\ntwo\n".as_bytes(),
@@ -930,16 +920,16 @@ mod tests {
             LineReaderConfig::with_source("api".to_string()),
         );
 
-        assert_eq!(rx.blocking_recv(), Some("[api] one".to_string()));
-        assert_eq!(rx.blocking_recv(), Some("[api] two".to_string()));
-        assert_eq!(rx.blocking_recv(), None);
+        assert_eq!(rx.recv().ok(), Some("[api] one".to_string()));
+        assert_eq!(rx.recv().ok(), Some("[api] two".to_string()));
+        assert_eq!(rx.recv().ok(), None);
     }
 
     #[test]
     fn named_commands_run_from_configured_cwd_and_keep_source_prefix() {
         let cwd = temp_dir("cwd");
         fs::write(cwd.join("marker"), "").unwrap();
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::sync_channel(4);
         let mut children = spawn_named_commands(
             &[NamedCommand {
                 name: "api".to_string(),
@@ -954,14 +944,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rx.blocking_recv(), Some("[api] cwd-ok".to_string()));
+        assert_eq!(rx.recv().ok(), Some("[api] cwd-ok".to_string()));
         assert!(children.pop().unwrap().wait().unwrap().success());
         let _ = fs::remove_dir_all(cwd);
     }
 
     #[test]
     fn start_commands_wait_for_ready_line_before_starting_dependents() {
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::sync_channel(16);
         let mut db = start_command(
             "db",
             &[
@@ -978,7 +968,7 @@ mod tests {
         api.wait_for = command(&["db"]);
 
         let mut children = spawn_start_commands(&[db, api], tx).unwrap();
-        let lines = recv_lines(&mut rx, 3);
+        let lines = recv_lines(&rx, 3);
 
         cleanup_children(&mut children);
         assert_eq!(
@@ -994,7 +984,7 @@ mod tests {
     #[test]
     fn start_commands_wait_for_ready_command_before_starting_dependents() {
         let cwd = temp_dir("ready-command");
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::sync_channel(16);
         let mut db = start_command("db", &["/bin/sh", "-c", "sleep 0.1; touch ready; sleep 1"]);
         db.cwd = Some(cwd.clone());
         db.ready = Some(ReadySpec::Command {
@@ -1007,7 +997,7 @@ mod tests {
         api.wait_for = command(&["db"]);
 
         let mut children = spawn_start_commands(&[db, api], tx).unwrap();
-        let lines = recv_lines(&mut rx, 1);
+        let lines = recv_lines(&rx, 1);
 
         cleanup_children(&mut children);
         assert_eq!(lines, vec!["[api] api-started".to_string()]);
@@ -1017,13 +1007,13 @@ mod tests {
 
     #[test]
     fn start_command_without_ready_unblocks_dependents_after_spawn() {
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::sync_channel(16);
         let db = start_command("db", &["/bin/sh", "-c", "sleep 1"]);
         let mut api = start_command("api", &["/bin/sh", "-c", "echo api-started"]);
         api.wait_for = command(&["db"]);
 
         let mut children = spawn_start_commands(&[db, api], tx).unwrap();
-        let lines = recv_lines(&mut rx, 1);
+        let lines = recv_lines(&rx, 1);
 
         cleanup_children(&mut children);
         assert_eq!(lines, vec!["[api] api-started".to_string()]);
@@ -1031,13 +1021,13 @@ mod tests {
 
     #[test]
     fn start_commands_apply_configured_env() {
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::sync_channel(16);
         let mut api = start_command("api", &["/bin/sh", "-c", "echo env=$LOGGLE_TEST_ENV"]);
         api.env
             .insert("LOGGLE_TEST_ENV".to_string(), "configured".to_string());
 
         let mut children = spawn_start_commands(&[api], tx).unwrap();
-        let lines = recv_lines(&mut rx, 1);
+        let lines = recv_lines(&rx, 1);
 
         cleanup_children(&mut children);
         assert_eq!(lines, vec!["[api] env=configured".to_string()]);
@@ -1045,7 +1035,7 @@ mod tests {
 
     #[test]
     fn ready_command_uses_configured_env() {
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::sync_channel(16);
         let mut db = start_command("db", &["/bin/sh", "-c", "sleep 1"]);
         db.env.insert("LOGGLE_READY".to_string(), "yes".to_string());
         db.ready = Some(ReadySpec::Command {
@@ -1057,7 +1047,7 @@ mod tests {
         api.wait_for = command(&["db"]);
 
         let mut children = spawn_start_commands(&[db, api], tx).unwrap();
-        let lines = recv_lines(&mut rx, 1);
+        let lines = recv_lines(&rx, 1);
 
         cleanup_children(&mut children);
         assert_eq!(lines, vec!["[api] api-started".to_string()]);
@@ -1065,14 +1055,14 @@ mod tests {
 
     #[test]
     fn startup_line_buffer_drains_channel_and_keeps_tail() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::sync_channel(4);
         for index in 0..4 {
             tx.try_send(format!("line {index}")).unwrap();
         }
         assert!(tx.try_send("would-block".to_string()).is_err());
 
         let mut buffer = StartupLineBuffer::new(2);
-        buffer.drain(&mut rx);
+        buffer.drain(&rx);
 
         assert_eq!(
             buffer.into_vec(),
@@ -1085,7 +1075,7 @@ mod tests {
     fn start_command_ready_timeout_kills_started_children() {
         let cwd = temp_dir("ready-timeout");
         let pid_file = cwd.join("pid");
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, _rx) = mpsc::sync_channel(16);
         let mut db = start_command(
             "db",
             &[
@@ -1113,7 +1103,7 @@ mod tests {
 
     #[test]
     fn start_command_dependency_exit_before_ready_fails() {
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::sync_channel(16);
         let mut db = start_command("db", &["/bin/sh", "-c", "exit 7"]);
         db.ready = Some(ReadySpec::Line {
             text: "ready".to_string(),
@@ -1125,7 +1115,7 @@ mod tests {
         let error = spawn_start_commands(&[db, api], tx).unwrap_err();
 
         assert!(error.to_string().contains("exited before readiness"));
-        assert!(recv_lines(&mut rx, 1).is_empty());
+        assert!(recv_lines(&rx, 1).is_empty());
     }
 
     #[test]

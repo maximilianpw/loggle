@@ -12,6 +12,9 @@ use loggle::{
     load_project_config, print_log_page_sources, print_log_page_tail_with_options, run,
 };
 
+/// Printed when loggle is started from a terminal with nothing to read.
+const USAGE: &str = "loggle reads newline-delimited logs from stdin or runs commands.\n\nUsage:\n  docker compose up 2>&1 | loggle\n  loggle -- docker compose up\n  loggle pages\n  loggle log -i 1 -n 5\n  loggle log -i 1 -n 5 --service api --property tenantId=tenant-1\n  loggle run --name api -- pnpm start --name web -- pnpm dev\n  loggle start [name]";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "loggle",
@@ -211,7 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }) {
         Ok(()) => Ok(()),
         Err(RuntimeError::MissingInput) => {
-            eprintln!("{}", RuntimeError::MissingInput);
+            eprintln!("{USAGE}");
             std::process::exit(1);
         }
         Err(error) => Err(Box::new(error)),
