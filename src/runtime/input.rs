@@ -466,19 +466,19 @@ impl StartScheduler {
                 }
             }
 
-            if let Some(child) = self.child_slots[index].map(|slot| &mut children[slot]) {
-                if let Some(status) = child.try_wait()? {
-                    input_reap_child(child);
-                    let message = format!(
-                        "command '{}' exited before readiness{}",
-                        command.name,
-                        status
-                            .code()
-                            .map(|code| format!(" with status {code}"))
-                            .unwrap_or_default()
-                    );
-                    return Err(io::Error::other(message));
-                }
+            if let Some(child) = self.child_slots[index].map(|slot| &mut children[slot])
+                && let Some(status) = child.try_wait()?
+            {
+                input_reap_child(child);
+                let message = format!(
+                    "command '{}' exited before readiness{}",
+                    command.name,
+                    status
+                        .code()
+                        .map(|code| format!(" with status {code}"))
+                        .unwrap_or_default()
+                );
+                return Err(io::Error::other(message));
             }
         }
 
