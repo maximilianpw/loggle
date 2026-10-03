@@ -111,14 +111,6 @@ Then run it from any Compose project:
 ```sh
 loggle dc
 loggle -- docker compose up
-loggle pages
-loggle log -i 1 -n 5
-loggle log -i 1 -n 5 --service api
-loggle log -i 1 -n 5 --text database
-loggle log -i 1 -n 5 --property requestId=716d1e62
-loggle --id api -- docker compose up
-loggle start
-loggle start libre
 ```
 
 `loggle dc` is an exact shortcut for `loggle -- docker compose up`. Only bare
@@ -126,8 +118,8 @@ loggle start libre
 commands.
 
 The `--` form is recommended because Loggle starts the command itself and
-captures both stdout and stderr. That prevents Docker Compose or service output
-from writing directly over the TUI.
+captures both stdout and stderr, so neither Docker Compose nor service output
+writes directly over the TUI.
 
 Pipe mode also works:
 
@@ -301,7 +293,8 @@ loggle --buffer-lines 50000 -- docker compose up
 loggle --no-color -- docker compose logs -f
 loggle --record session.log -- docker compose up
 loggle pages
-loggle log -i 1 -n 5
+loggle sources -i 1
+loggle log -i 1 -n 5 --clean
 loggle log -i 1 -n 5 --service api --property tenantId=tenant-1
 loggle --id api -- docker compose up
 loggle --source-field service,app < app.log
@@ -313,39 +306,32 @@ loggle start libre
 - `--buffer-lines <N>`: maximum retained lines, default `100000`
 - `--no-color`: disables Loggle's source and severity coloring
 - `--record <PATH>`: writes every raw incoming line to a session log file
-- `--id <ID>` / `-i <ID>`: uses this page ID instead of an auto-generated ID
+- `--id <ID>` / `-i <ID>` (alias `--page-id`): uses this page ID instead of an
+  auto-generated ID
 - `--no-page-log`: disables the per-session page log used by `loggle log`/`pages`
-- `pages`: lists active Loggle pages with ID, PID, age, and command
 - `--source-field <FIELD>`: promotes matching parsed properties to the source
   column when no explicit prefix exists. Repeat it or pass comma-separated
   fields, e.g. `--source-field service,app`
+- `pages`: lists active Loggle pages with ID, PID, age, and command
+- `sources -i <ID>`: lists observed source names and record counts for a page;
+  accepts `--source-field`
 - `log -i <ID> -n <N>`: prints the last `N` raw lines from a tagged Loggle page
-- `log --source <SOURCE>` / `log --service <SERVICE>`: limits page output to a
-  parsed source/service
+  (`-n` / `--lines`, default `100`)
+- `log --source <SOURCE>` / `log --service <SERVICE>` / `log -s <SOURCE>`:
+  limits page output to a parsed source/service
+- `log --text <QUERY>` / `log --search <QUERY>` / `log -t <QUERY>`: limits page
+  output to records matching a text query
 - `log --property <FILTER>` / `log -p <FILTER>`: limits page output by parsed
   properties. Repeat for multiple required predicates
+- `log --clean`: strips ANSI/control codes from printed lines
+- `log --source-field <FIELD>`: applies custom source promotion when reading a
+  page
 - `dc`: shortcut for `docker compose up`
 - `[COMMAND]...`: optional command to run under Loggle after `--`
 - `run --name <NAME> -- <COMMAND...>`: launches one or more named commands,
   prefixes each output line with `[NAME]`, and shows them in one Loggle session
 - `start [NAME]`: launches commands from `.loggle.toml` in the current
   directory, or from a named config in the Loggle user config directory
-
-## Performance Harness
-
-Run synthetic ingestion, filtering, viewport iteration, and draw timings with:
-
-```sh
-cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000 --filter text
-```
-
-`--filter` accepts `none`, `text`, `source`, `level`, or `property`.
-
-Add `--json` to emit machine-readable results with timings in microseconds:
-
-```sh
-cargo run --release --features perf-harness --bin loggle-bench -- --lines 100000 --filter property --json
-```
 
 ## Controls
 
@@ -365,7 +351,8 @@ visible by abbreviating filter labels (`s`, `l`, `/`, `p`) and their values.
 - `n` / `N`: next/previous search match
 - `Space` or `p`: pause/resume following
 - `y`: copy the selected raw log line to the clipboard
-- `v`: start visual-line selection; move with `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u`, `gg`, or `G`; `y` copies the selected lines and `Esc` cancels
+- `v`: start visual-line selection; move with `j` / `k`, arrows, `Ctrl-d` /
+  `Ctrl-u`, `gg`, or `G`; `y` copies the selected lines and `Esc` cancels
 
 ### Filtering
 
@@ -394,9 +381,15 @@ visible by abbreviating filter labels (`s`, `l`, `/`, `p`) and their values.
 - `M`: open searchable pinned field manager
 - `P`: open searchable property filter manager
 - `?`: open/close the command palette
-- Message field manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Backspace` or `Delete` removes when search is empty; `Esc` closes
-- Property filter manager: type to search; `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` edits; `Backspace` or `Delete` removes when search is empty; `Esc` closes
-- Command palette: `j` / `k`, arrows, `Ctrl-d` / `Ctrl-u` move selection; `Enter` runs; `Esc` closes
+
+In every dialog, `j` / `k`, arrows, and `Ctrl-d` / `Ctrl-u` move the selection
+and `Esc` closes. In addition:
+
+- Pinned field manager: type to search; `Backspace` or `Delete` removes the
+  selected field when the search is empty
+- Property filter manager: type to search; `Enter` edits; `Backspace` or
+  `Delete` removes the selected filter when the search is empty
+- Command palette: `Enter` runs the selected command
 
 ### Process Control
 
@@ -489,110 +482,6 @@ Pinned fields are session-local property keys rendered as stable columns before
 the parsed message. Rows that do not have a selected property show `-` in that
 column.
 
-## Development
+## Contributing
 
-Enter the Nix development shell to get Rust, a native linker, and the release
-tools used by this repository:
-
-```sh
-nix develop
-```
-
-Run tests:
-
-```sh
-cargo test
-```
-
-### Synthetic Investigation Regression
-
-`fixtures/mixed-service-investigation.log` is a Loggle-owned, deterministic
-synthetic scenario, not a recording from a real application. It needs no Docker,
-network, private repository, secrets, or service installations. Replay it locally:
-
-```sh
-cargo run -- --id fixture -- cat fixtures/mixed-service-investigation.log
-```
-
-While the page remains open, query it from another terminal:
-
-```sh
-cargo run -- log -i fixture -n 10 --property requestId=fixture-failed
-cargo run -- log -i fixture -n 1 --property requestId=fixture-failed
-cargo run -- log -i fixture -n 10 --service database --property requestId=fixture-failed
-cargo run -- log -i fixture -n 10 --property requestId=fixture-success
-```
-
-Expected evidence: 18 raw lines become 12 events. `fixture-failed` selects five
-API/worker/database events: job insert rejection (`23503`), worker failure, and
-API status `500`. The last matching record includes all seven lines of the API
-summary/property block, including the synthetic cause. The interleaved
-`fixture-failed-extra` request must not match that exact property filter.
-`fixture-success` selects five events for a second POST `/jobs` attempt, ending
-with a database insert, worker completion, and API status `201`.
-
-Bracket-prefixed API/worker output and Compose-style database output use existing
-Loggle formats. The separately sourced `minio-init` line represents one-shot
-initialization output; it does not test capturing an actual `--rm` container.
-Database correlation is synthetic instrumentation, not a claim that native
-database logs automatically contain application request IDs.
-
-Run the focused regression with `cargo test --locked mixed_service_fixture` and
-the full suite with `cargo test --locked --all-targets --all-features` (inside
-`nix develop` in an orb). Tests cover source identity, exact property correlation,
-raw summary preservation, whole multiline page-log evidence, and exclusion of
-unrelated traffic. This supports the PRS-293 reproducibility baseline only:
-real-app failure reproduction and user acceptance remain unproven. It is **not
-proof of real-app acceptance**, Stocket source framing, or live service capture.
-
-Check compilation:
-
-```sh
-cargo check
-```
-
-Build the debug binary:
-
-```sh
-cargo build
-```
-
-The debug binary is written to:
-
-```sh
-target/debug/loggle
-```
-
-## Release
-
-Before the first public release:
-
-- Create or confirm the `maximilianpw/homebrew-tap` GitHub repository.
-- Add a GitHub Actions secret named `HOMEBREW_TAP_TOKEN` to this repository.
-  The token needs write access to `maximilianpw/homebrew-tap`.
-- Add a GitHub Actions secret named `CARGO_REGISTRY_TOKEN` to this repository.
-  The token needs permission to publish the `loggle` crate on crates.io.
-
-For each release:
-
-Update `version` in `Cargo.toml`, then run the local checks:
-
-```sh
-cargo fmt --all -- --check
-cargo test --locked --all-targets
-cargo publish --locked --dry-run
-```
-
-Commit the release, push it to `main`, then push a matching semver tag:
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Pushing the tag runs the generated `cargo-dist` release workflow. It builds
-Linux and macOS archives, creates the GitHub Release, publishes the Homebrew
-formula to `maximilianpw/homebrew-tap`, publishes the crate to crates.io, and
-renders the release body with install commands.
-
-Crates.io versions are permanent: a published version cannot be overwritten.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and release.

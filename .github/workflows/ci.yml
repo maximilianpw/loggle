@@ -50,10 +50,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check crate
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets --all-features
 
       - name: Run clippy
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.runner }})
@@ -87,4 +87,4 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets --all-features
