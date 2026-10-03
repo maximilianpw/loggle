@@ -156,7 +156,7 @@ fn draw_body(
     visible_count: usize,
 ) {
     if app.details_open() && area.height >= 4 {
-        let details_height = area.height.saturating_sub(1).min(10).max(3);
+        let details_height = area.height.saturating_sub(1).clamp(3, 10);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(details_height)])

@@ -99,10 +99,10 @@ impl FilterWorkflow {
                 }
             }
             FilterEdit::EditPropertyFilter => {
-                if let Some(update) = PropertyFilterUpdate::parse(&value, false) {
-                    if let Some(id) = editing_property_filter {
-                        self.filters.replace_property_filter(id, update);
-                    }
+                if let Some(update) = PropertyFilterUpdate::parse(&value, false)
+                    && let Some(id) = editing_property_filter
+                {
+                    self.filters.replace_property_filter(id, update);
                 }
             }
         }

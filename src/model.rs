@@ -832,12 +832,11 @@ fn parse_embedded_json_log(object: &Map<String, Value>) -> Option<StructuredJson
         inner_log.timestamp = inner_log
             .timestamp
             .or_else(|| first_json_string_field(object, JSON_TIMESTAMP_KEYS));
-        if inner_log.level == Level::Unknown {
-            if let Some(level) = first_json_string_field(object, JSON_LEVEL_KEYS)
+        if inner_log.level == Level::Unknown
+            && let Some(level) = first_json_string_field(object, JSON_LEVEL_KEYS)
                 .and_then(|level| Level::parse(&level))
-            {
-                inner_log.level = level;
-            }
+        {
+            inner_log.level = level;
         }
 
         let mut properties = json_object_properties(object, JSON_ROW_KEYS);
@@ -850,9 +849,7 @@ fn parse_embedded_json_log(object: &Map<String, Value>) -> Option<StructuredJson
 }
 
 fn clean_json_message(message: &str) -> String {
-    message
-        .trim_end_matches(|ch| ch == '\r' || ch == '\n')
-        .to_string()
+    message.trim_end_matches(['\r', '\n']).to_string()
 }
 
 fn first_json_string_field(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {

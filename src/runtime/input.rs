@@ -398,10 +398,7 @@ impl<'a> StartScheduler<'a> {
                 if command_ready.is_command_probe_due(now) {
                     let probe_outcome =
                         command_ready.run_probe(command.cwd.as_deref(), &command.env, now);
-                    let probe_outcome = match probe_outcome {
-                        Ok(outcome) => outcome,
-                        Err(error) => return Err(error),
-                    };
+                    let probe_outcome = probe_outcome?;
 
                     match probe_outcome {
                         ProbeOutcome::Ready => {
@@ -418,20 +415,20 @@ impl<'a> StartScheduler<'a> {
                 }
             }
 
-            if let Some(child) = self.children[index].as_mut() {
-                if let Some(status) = child.try_wait()? {
-                    input_reap_child(child);
-                    self.children[index] = None;
-                    let message = format!(
-                        "command '{}' exited before readiness{}",
-                        command.name,
-                        status
-                            .code()
-                            .map(|code| format!(" with status {code}"))
-                            .unwrap_or_default()
-                    );
-                    return Err(io::Error::other(message));
-                }
+            if let Some(child) = self.children[index].as_mut()
+                && let Some(status) = child.try_wait()?
+            {
+                input_reap_child(child);
+                self.children[index] = None;
+                let message = format!(
+                    "command '{}' exited before readiness{}",
+                    command.name,
+                    status
+                        .code()
+                        .map(|code| format!(" with status {code}"))
+                        .unwrap_or_default()
+                );
+                return Err(io::Error::other(message));
             }
         }
 
@@ -468,13 +465,8 @@ impl StartupLineBuffer {
     }
 
     fn drain(&mut self, rx: &mut mpsc::Receiver<String>) {
-        loop {
-            match rx.try_recv() {
-                Ok(line) => self.push(line),
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
+        while let Ok(line) = rx.try_recv() {
+            self.push(line);
         }
     }
 

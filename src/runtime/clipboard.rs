@@ -12,18 +12,18 @@ struct ClipboardCommand<'a> {
 pub(super) fn write(text: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return write_to_command(
+        write_to_command(
             ClipboardCommand {
                 program: "pbcopy",
                 args: &[],
             },
             text,
-        );
+        )
     }
 
     #[cfg(target_os = "linux")]
     {
-        return write_first_available(
+        write_first_available(
             &[
                 ClipboardCommand {
                     program: "wl-copy",
@@ -39,7 +39,7 @@ pub(super) fn write(text: &str) -> io::Result<()> {
                 },
             ],
             text,
-        );
+        )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -95,9 +95,9 @@ fn write_to_command(command: ClipboardCommand<'_>, text: &str) -> io::Result<()>
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("{} exited with {status}", command.program),
-        ))
+        Err(io::Error::other(format!(
+            "{} exited with {status}",
+            command.program
+        )))
     }
 }

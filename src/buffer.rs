@@ -126,10 +126,10 @@ impl LogBuffer {
             return None;
         }
 
-        if self.events.len() == self.capacity {
-            if let Some(event) = self.events.pop_front() {
-                change.removed.push(event.sequence);
-            }
+        if self.events.len() == self.capacity
+            && let Some(event) = self.events.pop_front()
+        {
+            change.removed.push(event.sequence);
         }
 
         let sequence = self.next_sequence;
@@ -347,12 +347,11 @@ impl LogBuffer {
     pub(crate) fn event_by_sequence(&self, sequence: u64) -> Option<&LogEvent> {
         let first_sequence = self.events.front()?.sequence;
         let offset = sequence.checked_sub(first_sequence)?;
-        if let Ok(index) = usize::try_from(offset) {
-            if let Some(event) = self.events.get(index) {
-                if event.sequence == sequence {
-                    return Some(event);
-                }
-            }
+        if let Ok(index) = usize::try_from(offset)
+            && let Some(event) = self.events.get(index)
+            && event.sequence == sequence
+        {
+            return Some(event);
         }
 
         self.events.iter().find(|event| event.sequence == sequence)

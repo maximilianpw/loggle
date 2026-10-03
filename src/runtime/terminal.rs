@@ -27,6 +27,8 @@ use super::{
     keys::{self, KeyOutcome},
 };
 
+// Plain runtime plumbing from `RuntimeConfig`; a parameter struct would only rename it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     mut rx: mpsc::Receiver<String>,
     startup_lines: Vec<String>,
@@ -162,6 +164,7 @@ impl Drop for TerminalModeGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     rx: &mut mpsc::Receiver<String>,
