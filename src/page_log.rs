@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize, Serializer};
 pub use crate::model::Level as LogLevel;
 use crate::{
     buffer::LogBuffer,
+    facet::{
+        DEFAULT_FACET_BUCKET_LIMIT, DEFAULT_FACET_RECORD_LIMIT, FacetGroup, FacetKind,
+        FacetOptions, FacetOptionsError, MAX_FACET_BUCKET_LIMIT, MAX_FACET_RECORD_LIMIT,
+        MIN_FACET_BUCKET_LIMIT, MIN_FACET_RECORD_LIMIT, aggregate_facets, escape_facet_text,
+    },
     filter::{LogFilter, PropertyFilterUpdate},
     model::{LogEvent, LogProperty, PropertyValue, SourceConfig, clean_display_text},
 };
@@ -103,6 +108,7 @@ pub enum LogPageError {
     },
     ActivePageIdInUse(LogPageId),
     InvalidPropertyFilter(String),
+    InvalidFacetOptions(FacetOptionsError),
     Io {
         action: &'static str,
         path: PathBuf,
@@ -123,6 +129,7 @@ impl fmt::Display for LogPageError {
             Self::InvalidPropertyFilter(value) => {
                 write!(f, "invalid property filter '{value}'")
             }
+            Self::InvalidFacetOptions(source) => write!(f, "invalid facet options: {source}"),
             Self::Io {
                 action,
                 path,
@@ -139,6 +146,7 @@ impl std::error::Error for LogPageError {
             Self::MissingPage { .. }
             | Self::ActivePageIdInUse(_)
             | Self::InvalidPropertyFilter(_) => None,
+            Self::InvalidFacetOptions(source) => Some(source),
             Self::Io { source, .. } | Self::Output(source) => Some(source),
         }
     }
@@ -195,6 +203,65 @@ impl LogPageTailOptions {
             || self.text.as_ref().is_some_and(|text| !text.is_empty())
             || self.level.is_some()
             || !self.property_filters.is_empty()
+    }
+}
+
+/// Options for `loggle facets`: the same narrowing filters as
+/// [`LogPageTailOptions`], plus which facets to aggregate and their bounds.
+///
+/// Each facet excludes its own filter (a `level` filter narrows the `source`
+/// facet but not the `level` facet), matching the TUI facet dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPageFacetOptions {
+    /// Newest parsed records to aggregate; clamped to
+    /// `MIN_FACET_RECORD_LIMIT..=MAX_FACET_RECORD_LIMIT`.
+    pub record_limit: usize,
+    /// Buckets kept per facet; clamped to
+    /// `MIN_FACET_BUCKET_LIMIT..=MAX_FACET_BUCKET_LIMIT`.
+    pub bucket_limit: usize,
+    /// Facets to print. Empty means `source`, `level` and `property_key`.
+    /// `property_value` is always included when `property_key` is set, and
+    /// is never produced without one.
+    pub facets: Vec<FacetKind>,
+    /// Property whose values the `property_value` facet counts.
+    pub property_key: Option<String>,
+    pub source: Option<String>,
+    pub text: Option<String>,
+    pub level: Option<LogLevel>,
+    pub property_filters: Vec<String>,
+    pub source_config: SourceConfig,
+    pub format: LogOutputFormat,
+}
+
+impl Default for LogPageFacetOptions {
+    fn default() -> Self {
+        Self {
+            record_limit: DEFAULT_FACET_RECORD_LIMIT,
+            bucket_limit: DEFAULT_FACET_BUCKET_LIMIT,
+            facets: Vec::new(),
+            property_key: None,
+            source: None,
+            text: None,
+            level: None,
+            property_filters: Vec::new(),
+            source_config: SourceConfig::default(),
+            format: LogOutputFormat::Text,
+        }
+    }
+}
+
+impl LogPageFacetOptions {
+    fn includes(&self, facet: FacetKind) -> bool {
+        match facet {
+            FacetKind::PropertyValue => self.property_key.is_some(),
+            facet if self.facets.is_empty() => {
+                matches!(
+                    facet,
+                    FacetKind::Source | FacetKind::Level | FacetKind::PropertyKey
+                )
+            }
+            facet => self.facets.contains(&facet),
+        }
     }
 }
 
@@ -318,15 +385,146 @@ pub fn print_log_page_sources<W: Write>(
     Ok(())
 }
 
-fn source_counts<R: BufRead>(
+/// Aggregates source/level/property facets over the newest records of a page,
+/// after applying the same narrowing filters as `loggle log`.
+///
+/// Text output prints one block per facet; JSON output prints one
+/// [`FacetGroup`] per line in `source`, `level`, `property_key`,
+/// `property_value` order.
+pub fn print_log_page_facets<W: Write>(
+    id: &LogPageId,
+    options: &LogPageFacetOptions,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    let path = log_page_path(id);
+    print_log_page_facets_from_path(id, &path, options, writer)
+}
+
+fn print_log_page_facets_from_path<W: Write>(
+    id: &LogPageId,
+    path: &Path,
+    options: &LogPageFacetOptions,
+    writer: &mut W,
+) -> Result<(), LogPageError> {
+    let file = open_log_page(id, path)?;
+    let groups = facet_groups(BufReader::new(file), options, path)?;
+    match options.format {
+        LogOutputFormat::Json => groups
+            .iter()
+            .try_for_each(|group| write_json_line(writer, group)),
+        LogOutputFormat::Text => write_facet_text(writer, &groups).map_err(LogPageError::Output),
+    }
+}
+
+fn facet_groups<R: BufRead>(
     reader: R,
-    source_config: SourceConfig,
-) -> io::Result<BTreeMap<String, usize>> {
+    options: &LogPageFacetOptions,
+    path: &Path,
+) -> Result<Vec<FacetGroup>, LogPageError> {
+    let property_key = options
+        .property_key
+        .as_ref()
+        .map(|key| key.trim().to_string());
+    let facet_options = FacetOptions::new(
+        options
+            .bucket_limit
+            .clamp(MIN_FACET_BUCKET_LIMIT, MAX_FACET_BUCKET_LIMIT),
+        property_key,
+    )
+    .map_err(LogPageError::InvalidFacetOptions)?;
+    let filter = build_log_filter(
+        options.source.as_deref(),
+        options.text.as_deref(),
+        options.level,
+        &options.property_filters,
+    )?;
+    let buffer = parse_log_page(reader, options.source_config.clone()).map_err(|source| {
+        LogPageError::Io {
+            action: "read log page",
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    let mut groups = aggregate_facets(
+        buffer.events().iter(),
+        options
+            .record_limit
+            .clamp(MIN_FACET_RECORD_LIMIT, MAX_FACET_RECORD_LIMIT),
+        &filter,
+        &facet_options,
+    );
+    groups.retain(|group| options.includes(group.facet));
+    Ok(groups)
+}
+
+/// Writes one block per facet: a heading such as
+/// `source (12 records, 3 buckets)` followed by aligned `  value  count` rows.
+/// Values are escaped so newlines and control characters stay on one row.
+fn write_facet_text<W: Write>(writer: &mut W, groups: &[FacetGroup]) -> io::Result<()> {
+    for (index, group) in groups.iter().enumerate() {
+        if index > 0 {
+            writeln!(writer)?;
+        }
+        write!(writer, "{}", group.facet.as_str())?;
+        if let Some(key) = &group.property_key {
+            write!(writer, " {}", escape_facet_text(key))?;
+        }
+        write!(
+            writer,
+            " ({} records, {} buckets",
+            group.eligible_records, group.total_buckets
+        )?;
+        if group.truncated {
+            write!(writer, ", top {} shown", group.buckets.len())?;
+        }
+        if group.window_truncated {
+            write!(
+                writer,
+                ", newest {} of {} records scanned",
+                group.window_records, group.available_records
+            )?;
+        }
+        writeln!(writer, ")")?;
+
+        if group.buckets.is_empty() {
+            writeln!(writer, "  (none)")?;
+            continue;
+        }
+        let rows = group
+            .buckets
+            .iter()
+            .map(|bucket| (escape_facet_text(&bucket.value), bucket.count.to_string()))
+            .collect::<Vec<_>>();
+        let value_width = rows
+            .iter()
+            .map(|(value, _)| value.chars().count())
+            .max()
+            .unwrap_or(0);
+        let count_width = rows.iter().map(|(_, count)| count.len()).max().unwrap_or(0);
+        for (value, count) in rows {
+            let padding = value_width - value.chars().count();
+            writeln!(writer, "  {value}{:padding$}  {count:>count_width$}", "")?;
+        }
+    }
+    Ok(())
+}
+
+/// Parses a page's lines through a [`LogBuffer`] exactly as the viewer does.
+fn parse_log_page<R: BufRead>(reader: R, source_config: SourceConfig) -> io::Result<LogBuffer> {
     let mut buffer = LogBuffer::unbounded_with_source_config(source_config);
     for line in reader.lines() {
         buffer.push_line(line?);
     }
     buffer.finish_input();
+    Ok(buffer)
+}
+
+fn source_counts<R: BufRead>(
+    reader: R,
+    source_config: SourceConfig,
+) -> io::Result<BTreeMap<String, usize>> {
+    let buffer = parse_log_page(reader, source_config)?;
     let mut counts = BTreeMap::new();
     for event in buffer.events() {
         *counts.entry(event.source.clone()).or_default() += 1;
@@ -758,20 +956,31 @@ fn take_removed_group_lines(
 }
 
 fn log_filter_for_options(options: &LogPageTailOptions) -> Result<LogFilter, LogPageError> {
+    build_log_filter(
+        options.source.as_deref(),
+        options.text.as_deref(),
+        options.level,
+        &options.property_filters,
+    )
+}
+
+/// The narrowing filter shared by `loggle log` and `loggle facets`.
+fn build_log_filter(
+    source: Option<&str>,
+    text: Option<&str>,
+    level: Option<LogLevel>,
+    property_filters: &[String],
+) -> Result<LogFilter, LogPageError> {
     let mut filter = LogFilter::default();
-    filter.source = options
-        .source
-        .as_ref()
+    filter.source = source
         .map(|source| source.trim().to_string())
         .filter(|source| !source.is_empty());
-    filter.text = options
-        .text
-        .as_ref()
+    filter.text = text
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
-    filter.level = options.level;
+    filter.level = level;
 
-    for property_filter in &options.property_filters {
+    for property_filter in property_filters {
         let update = PropertyFilterUpdate::parse(property_filter, false)
             .ok_or_else(|| LogPageError::InvalidPropertyFilter(property_filter.clone()))?;
         filter.add_property_filter(update);
@@ -1079,6 +1288,245 @@ mod tests {
                 .is_empty()
         );
         assert!(source_counts(BufReader::new(&b"\xff"[..]), SourceConfig::default()).is_err());
+    }
+
+    fn fixture_facets(options: &LogPageFacetOptions) -> Vec<FacetGroup> {
+        let fixture = include_str!("../fixtures/mixed-service-investigation.log");
+        facet_groups(BufReader::new(fixture.as_bytes()), options, Path::new("t")).unwrap()
+    }
+
+    fn bucket_counts(group: &FacetGroup) -> Vec<(&str, usize)> {
+        group
+            .buckets
+            .iter()
+            .map(|bucket| (bucket.value.as_str(), bucket.count))
+            .collect()
+    }
+
+    #[test]
+    fn facets_default_to_source_level_and_property_key_over_the_fixture() {
+        let groups = fixture_facets(&LogPageFacetOptions::default());
+
+        assert_eq!(
+            groups.iter().map(|group| group.facet).collect::<Vec<_>>(),
+            [FacetKind::Source, FacetKind::Level, FacetKind::PropertyKey]
+        );
+        assert_eq!(
+            bucket_counts(&groups[0]),
+            [
+                ("api", 5),
+                ("worker", 4),
+                ("database", 2),
+                ("minio-init", 1)
+            ]
+        );
+        assert_eq!(groups[0].available_records, 12);
+        assert_eq!(groups[0].eligible_records, 12);
+        assert_eq!(bucket_counts(&groups[1]), [("error", 3), ("info", 9)]);
+        assert!(
+            bucket_counts(&groups[2]).contains(&("requestId", 11)),
+            "{:?}",
+            groups[2]
+        );
+    }
+
+    #[test]
+    fn facets_count_property_values_and_honour_selection_and_filters() {
+        let mut options = LogPageFacetOptions {
+            property_key: Some(" requestId ".to_string()),
+            facets: vec![FacetKind::Source],
+            ..LogPageFacetOptions::default()
+        };
+        let groups = fixture_facets(&options);
+        assert_eq!(
+            groups.iter().map(|group| group.facet).collect::<Vec<_>>(),
+            [FacetKind::Source, FacetKind::PropertyValue]
+        );
+        let values = &groups[1];
+        assert_eq!(values.property_key.as_deref(), Some("requestId"));
+        assert_eq!(
+            bucket_counts(values),
+            [
+                ("fixture-failed", 5),
+                ("fixture-success", 5),
+                ("fixture-failed-extra", 1)
+            ]
+        );
+
+        // `--level error` narrows every other facet but not the level facet.
+        options.facets = vec![FacetKind::Level, FacetKind::Source];
+        options.level = Some(LogLevel::Error);
+        let groups = fixture_facets(&options);
+        assert_eq!(
+            bucket_counts(&groups[0]),
+            [("api", 1), ("database", 1), ("worker", 1)]
+        );
+        assert_eq!(groups[0].matched_records, 3);
+        assert_eq!(bucket_counts(&groups[1]), [("error", 3), ("info", 9)]);
+        assert_eq!(bucket_counts(&groups[2]), [("fixture-failed", 3)]);
+
+        options.level = None;
+        options.source = Some("worker".to_string());
+        options.text = Some("job".to_string());
+        options.property_filters = vec!["jobId=job-002".to_string()];
+        let groups = fixture_facets(&options);
+        assert_eq!(bucket_counts(&groups[2]), [("fixture-success", 2)]);
+
+        options.property_filters = vec!["=".to_string()];
+        assert!(matches!(
+            facet_groups(BufReader::new(&b""[..]), &options, Path::new("t")),
+            Err(LogPageError::InvalidPropertyFilter(_))
+        ));
+        options.property_filters.clear();
+        options.property_key = Some("  ".to_string());
+        assert!(matches!(
+            facet_groups(BufReader::new(&b""[..]), &options, Path::new("t")),
+            Err(LogPageError::InvalidFacetOptions(_))
+        ));
+    }
+
+    #[test]
+    fn facets_bound_the_record_window_and_bucket_count() {
+        let options = LogPageFacetOptions {
+            record_limit: 5,
+            bucket_limit: 1,
+            facets: vec![FacetKind::Source],
+            ..LogPageFacetOptions::default()
+        };
+        let groups = fixture_facets(&options);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].window_records, 5);
+        assert!(groups[0].window_truncated);
+        assert_eq!(groups[0].total_buckets, 3);
+        assert!(groups[0].truncated);
+        assert_eq!(bucket_counts(&groups[0]), [("api", 2)]);
+
+        let clamped = fixture_facets(&LogPageFacetOptions {
+            record_limit: 0,
+            bucket_limit: 0,
+            ..options
+        });
+        assert_eq!(clamped[0].window_records, MIN_FACET_RECORD_LIMIT);
+        assert_eq!(clamped[0].buckets.len(), MIN_FACET_BUCKET_LIMIT);
+    }
+
+    #[test]
+    fn facet_json_lines_match_the_schema_version_1_shape() {
+        let (root, _, page_dir) = test_state_dir("facet-json-test");
+        let id = LogPageId::parse("facets").unwrap();
+        let path = log_page_path_in_dir(&id, &page_dir);
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(
+            &path,
+            include_str!("../fixtures/mixed-service-investigation.log"),
+        )
+        .unwrap();
+        let options = LogPageFacetOptions {
+            property_key: Some("requestId".to_string()),
+            property_filters: vec!["requestId=fixture-failed".to_string()],
+            format: LogOutputFormat::Json,
+            ..LogPageFacetOptions::default()
+        };
+        let mut output = Vec::new();
+        print_log_page_facets_from_path(&id, &path, &options, &mut output).unwrap();
+        let lines = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line["facet"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["source", "level", "property_key", "property_value"]
+        );
+        assert!(lines.iter().all(|line| line["schema_version"] == 1));
+        assert_eq!(
+            lines[3],
+            serde_json::json!({
+                "schema_version": 1,
+                "facet": "property_value",
+                "property_key": "requestId",
+                "available_records": 12,
+                "window_records": 12,
+                "window_truncated": false,
+                "matched_records": 5,
+                "eligible_records": 12,
+                "total_buckets": 3,
+                "truncated": false,
+                "buckets": [
+                    {"value": "fixture-failed", "count": 5, "value_types": ["string", "text"]},
+                    {"value": "fixture-success", "count": 5, "value_types": ["string", "text"]},
+                    {"value": "fixture-failed-extra", "count": 1, "value_types": ["text"]},
+                ],
+            })
+        );
+        assert_eq!(lines[0]["property_key"], serde_json::Value::Null);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn facet_text_output_is_aligned_and_escaped() {
+        let input = "api | INFO a key=x\napi | INFO b\nweb | ERROR c\n";
+        let options = LogPageFacetOptions {
+            facets: vec![FacetKind::Source, FacetKind::Level],
+            bucket_limit: 1,
+            ..LogPageFacetOptions::default()
+        };
+        let groups =
+            facet_groups(BufReader::new(input.as_bytes()), &options, Path::new("t")).unwrap();
+        let mut output = Vec::new();
+        write_facet_text(&mut output, &groups).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "source (3 records, 2 buckets, top 1 shown)\n  api  2\n\nlevel (3 records, 2 buckets, top 1 shown)\n  error  1\n"
+        );
+
+        let mut group = groups[0].clone();
+        group.property_key = Some("multi\nline".to_string());
+        group.buckets[0].value = "two\nlines".to_string();
+        group.buckets.push(group.buckets[0].clone());
+        group.buckets[1].value = "x".to_string();
+        group.buckets[1].count = 12;
+        group.buckets.push(group.buckets[1].clone());
+        group.buckets[2].value = String::new();
+        group.total_buckets = 3;
+        group.truncated = false;
+        let mut output = Vec::new();
+        write_facet_text(&mut output, &[group]).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "source multi\\nline (3 records, 3 buckets)\n  two\\nlines   2\n  x           12\n              12\n"
+        );
+
+        let empty = facet_groups(BufReader::new(&b""[..]), &options, Path::new("t")).unwrap();
+        let mut output = Vec::new();
+        write_facet_text(&mut output, &empty).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "source (0 records, 0 buckets)\n  (none)\n\nlevel (0 records, 0 buckets)\n  (none)\n"
+        );
+    }
+
+    #[test]
+    fn facets_report_a_missing_page() {
+        let (root, _, page_dir) = test_state_dir("facet-missing-test");
+        let id = LogPageId::parse("missing").unwrap();
+        let path = log_page_path_in_dir(&id, &page_dir);
+
+        let error = print_log_page_facets_from_path(
+            &id,
+            &path,
+            &LogPageFacetOptions::default(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LogPageError::MissingPage { .. }));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

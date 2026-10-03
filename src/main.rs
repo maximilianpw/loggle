@@ -4,12 +4,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use loggle::{
-    ActiveLogPageRecord, ConfigEnv, LogLevel, LogOutputFormat, LogPageError, LogPageId,
-    LogPageTailOptions, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
-    active_log_pages, load_named_config, load_project_config, print_log_page_sources,
-    print_log_page_tail_with_options, run, write_json_line,
+    ActiveLogPageRecord, ConfigEnv, DEFAULT_FACET_BUCKET_LIMIT, DEFAULT_FACET_RECORD_LIMIT,
+    FacetKind, LogLevel, LogOutputFormat, LogPageError, LogPageFacetOptions, LogPageId,
+    LogPageTailOptions, MAX_FACET_BUCKET_LIMIT, MAX_FACET_RECORD_LIMIT, MIN_FACET_BUCKET_LIMIT,
+    MIN_FACET_RECORD_LIMIT, NamedCommand, RuntimeConfig, RuntimeError, RuntimeInput, SourceConfig,
+    active_log_pages, load_named_config, load_project_config, print_log_page_facets,
+    print_log_page_sources, print_log_page_tail_with_options, run, write_json_line,
 };
 
 /// Printed when loggle is started from a terminal with nothing to read.
@@ -26,7 +28,7 @@ const USAGE: &str = "loggle reads newline-delimited logs from stdin or runs comm
     subcommand_value_name = "SUBCOMMAND",
     subcommand_help_heading = "Subcommands",
     override_usage = "loggle [OPTIONS] [--] [COMMAND]...\n       loggle [OPTIONS] <SUBCOMMAND>",
-    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1\n  loggle log -i 1 -n 5 --level error --json"
+    after_help = "Agent log access:\n  loggle -- docker compose up\n  loggle pages\n  loggle sources -i 1\n  loggle log -i 1 -n 5 --clean\n  loggle log -i 1 -n 5 --service api --text error --property tenantId=tenant-1\n  loggle log -i 1 -n 5 --level error --json\n  loggle facets -i 1 --property-key requestId --json"
 )]
 struct Cli {
     #[arg(
@@ -100,6 +102,11 @@ enum CliCommand {
         about = "List observed source names and record counts in a retained page (not Compose service aliases)."
     )]
     Sources(SourcesArgs),
+
+    #[command(
+        about = "Count records per source, level, property key, or property value in a retained page."
+    )]
+    Facets(FacetsArgs),
 }
 
 /// Subcommands that open the viewer, as opposed to querying page logs.
@@ -215,6 +222,113 @@ struct SourcesArgs {
     source_fields: Vec<String>,
 }
 
+#[derive(Debug, Args)]
+struct FacetsArgs {
+    #[arg(short = 'i', long = "id", value_name = "ID")]
+    id: LogPageId,
+
+    #[arg(
+        long = "facet",
+        value_enum,
+        value_name = "FACET",
+        help = "Facet to print (repeatable); default: source, level, property_key"
+    )]
+    facets: Vec<FacetArg>,
+
+    #[arg(
+        long = "property-key",
+        value_name = "KEY",
+        value_parser = parse_property_key,
+        required_if_eq("facets", "property_value"),
+        help = "Count the values of this property (implies --facet property_value)"
+    )]
+    property_key: Option<String>,
+
+    #[arg(
+        long = "records",
+        value_name = "N",
+        default_value_t = DEFAULT_FACET_RECORD_LIMIT,
+        value_parser = parse_facet_record_limit,
+        help = "Aggregate only the newest N parsed records"
+    )]
+    records: usize,
+
+    #[arg(
+        long = "buckets",
+        value_name = "N",
+        default_value_t = DEFAULT_FACET_BUCKET_LIMIT,
+        value_parser = parse_facet_bucket_limit,
+        help = "Print at most N buckets per facet"
+    )]
+    buckets: usize,
+
+    #[arg(
+        short = 's',
+        long = "source",
+        visible_alias = "service",
+        value_name = "SOURCE",
+        value_parser = parse_source_filter
+    )]
+    source: Option<String>,
+
+    #[arg(
+        short = 'p',
+        long = "property",
+        value_name = "FILTER",
+        value_parser = parse_property_filter
+    )]
+    property_filters: Vec<String>,
+
+    #[arg(
+        short = 't',
+        long = "text",
+        visible_alias = "search",
+        value_name = "QUERY",
+        value_parser = parse_text_filter
+    )]
+    text: Option<String>,
+
+    #[arg(
+        long = "level",
+        value_name = "LEVEL",
+        value_parser = parse_level,
+        help = "Only records at this level: fatal, error, warn, info, debug, trace, unknown"
+    )]
+    level: Option<LogLevel>,
+
+    #[arg(
+        long,
+        help = "Print one schema_version 1 JSON object per facet per line (JSONL)"
+    )]
+    json: bool,
+
+    #[arg(long = "source-field", value_delimiter = ',', value_parser = parse_source_field)]
+    source_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FacetArg {
+    #[value(name = "source")]
+    Source,
+    #[value(name = "level")]
+    Level,
+    #[value(name = "property_key")]
+    PropertyKey,
+    #[value(name = "property_value")]
+    PropertyValue,
+}
+
+impl From<FacetArg> for FacetKind {
+    fn from(facet: FacetArg) -> Self {
+        match facet {
+            FacetArg::Source => Self::Source,
+            FacetArg::Level => Self::Level,
+            FacetArg::PropertyKey => Self::PropertyKey,
+            FacetArg::PropertyValue => Self::PropertyValue,
+        }
+    }
+}
+
 fn parse_buffer_lines(input: &str) -> Result<usize, String> {
     let value = input
         .parse::<usize>()
@@ -233,6 +347,35 @@ fn parse_tail_lines(input: &str) -> Result<usize, String> {
         .map_err(|error| format!("invalid line count: {error}"))?;
 
     Ok(value)
+}
+
+fn parse_bounded(input: &str, label: &str, min: usize, max: usize) -> Result<usize, String> {
+    let value = input
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {label}: {error}"))?;
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{label} must be between {min} and {max}"))
+    }
+}
+
+fn parse_facet_record_limit(input: &str) -> Result<usize, String> {
+    parse_bounded(
+        input,
+        "record limit",
+        MIN_FACET_RECORD_LIMIT,
+        MAX_FACET_RECORD_LIMIT,
+    )
+}
+
+fn parse_facet_bucket_limit(input: &str) -> Result<usize, String> {
+    parse_bounded(
+        input,
+        "bucket limit",
+        MIN_FACET_BUCKET_LIMIT,
+        MAX_FACET_BUCKET_LIMIT,
+    )
 }
 
 fn parse_non_empty(input: &str, label: &str) -> Result<String, String> {
@@ -260,6 +403,10 @@ fn parse_text_filter(input: &str) -> Result<String, String> {
     parse_non_empty(input, "text filter")
 }
 
+fn parse_property_key(input: &str) -> Result<String, String> {
+    parse_non_empty(input, "property key")
+}
+
 fn parse_level(input: &str) -> Result<LogLevel, String> {
     LogLevel::parse(input).ok_or_else(|| {
         format!(
@@ -280,6 +427,7 @@ fn main() {
                 &mut io::stdout().lock(),
             ));
         }
+        Some(CliCommand::Facets(args)) => return report_command(run_facets_command(args)),
         Some(CliCommand::Runtime(command)) => Some(command),
         None => None,
     };
@@ -342,6 +490,32 @@ fn run_log_command(args: LogArgs) -> Result<(), LogPageError> {
 
     let mut stdout = io::stdout().lock();
     print_log_page_tail_with_options(&args.id, &options, &mut stdout)
+}
+
+fn facet_options(args: FacetsArgs) -> LogPageFacetOptions {
+    LogPageFacetOptions {
+        record_limit: args.records,
+        bucket_limit: args.buckets,
+        facets: args.facets.into_iter().map(FacetKind::from).collect(),
+        property_key: args.property_key,
+        source: args.source,
+        text: args.text,
+        level: args.level,
+        property_filters: args.property_filters,
+        source_config: SourceConfig::with_fields(args.source_fields),
+        format: if args.json {
+            LogOutputFormat::Json
+        } else {
+            LogOutputFormat::Text
+        },
+    }
+}
+
+fn run_facets_command(args: FacetsArgs) -> Result<(), LogPageError> {
+    let id = args.id.clone();
+    let options = facet_options(args);
+    let mut stdout = io::stdout().lock();
+    print_log_page_facets(&id, &options, &mut stdout)
 }
 
 fn run_pages_command(args: PagesArgs) -> Result<(), LogPageError> {
@@ -614,6 +788,13 @@ mod tests {
         }
     }
 
+    fn facets_args(raw_args: &[&str]) -> FacetsArgs {
+        match parse_cli(raw_args).subcommand {
+            Some(CliCommand::Facets(args)) => args,
+            other => panic!("expected facets subcommand, got {other:?}"),
+        }
+    }
+
     fn assert_help(raw_args: &[&str]) {
         let error = try_parse_cli(raw_args).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::DisplayHelp, "{raw_args:?}");
@@ -817,6 +998,7 @@ api = ["pnpm", "start"]
         assert_help(&["log", "--help"]);
         assert_help(&["pages", "--help"]);
         assert_help(&["sources", "--help"]);
+        assert_help(&["facets", "--help"]);
     }
 
     #[test]
@@ -910,6 +1092,128 @@ api = ["pnpm", "start"]
         let cli = parse_cli(&["--", "sources", "--help"]);
         assert!(cli.subcommand.is_none());
         assert_eq!(cli.command, command(&["sources", "--help"]));
+    }
+
+    #[test]
+    fn facets_command_cli_defaults_and_filters() {
+        let options = facet_options(facets_args(&["facets", "-i", "1"]));
+        assert_eq!(options.record_limit, DEFAULT_FACET_RECORD_LIMIT);
+        assert_eq!(options.bucket_limit, DEFAULT_FACET_BUCKET_LIMIT);
+        assert!(options.facets.is_empty());
+        assert_eq!(options.property_key, None);
+        assert_eq!(options.format, LogOutputFormat::Text);
+
+        let args = facets_args(&[
+            "facets",
+            "-i",
+            "1",
+            "--facet",
+            "source",
+            "--facet",
+            "property_value",
+            "--property-key",
+            " requestId ",
+            "--records",
+            "25",
+            "--buckets",
+            "7",
+            "--service",
+            "api",
+            "--search",
+            "database",
+            "--level",
+            "warning",
+            "--property",
+            "tenantId=tenant-1",
+            "--source-field",
+            "logger",
+            "--json",
+        ]);
+        assert_eq!(args.id.as_str(), "1");
+        let options = facet_options(args);
+        assert_eq!(
+            options.facets,
+            [FacetKind::Source, FacetKind::PropertyValue]
+        );
+        assert_eq!(options.property_key.as_deref(), Some("requestId"));
+        assert_eq!(options.record_limit, 25);
+        assert_eq!(options.bucket_limit, 7);
+        assert_eq!(options.source.as_deref(), Some("api"));
+        assert_eq!(options.text.as_deref(), Some("database"));
+        assert_eq!(options.level, Some(LogLevel::Warn));
+        assert_eq!(options.property_filters, command(&["tenantId=tenant-1"]));
+        assert_eq!(options.format, LogOutputFormat::Json);
+    }
+
+    #[test]
+    fn facets_command_cli_rejects_invalid_values() {
+        for (args, kind) in [
+            (&["facets"][..], ErrorKind::MissingRequiredArgument),
+            (
+                &["facets", "-i", "1", "--facet", "property_value"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &[
+                    "facets",
+                    "-i",
+                    "1",
+                    "--facet",
+                    "source",
+                    "--facet",
+                    "property_value",
+                ],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["facets", "-i", "1", "--facet", "tenant"],
+                ErrorKind::InvalidValue,
+            ),
+            (
+                &["facets", "-i", "1", "--records", "0"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["facets", "-i", "1", "--records", "100001"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["facets", "-i", "1", "--buckets", "0"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["facets", "-i", "1", "--buckets", "101"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["facets", "-i", "1", "--property-key", "  "],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["facets", "-i", "1", "--level", "notice"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["facets", "-i", "1", "--clean"],
+                ErrorKind::UnknownArgument,
+            ),
+        ] {
+            let error = try_parse_cli(args).unwrap_err();
+            assert_eq!(error.kind(), kind, "{args:?}");
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+        assert!(
+            try_parse_cli(&[
+                "facets",
+                "-i",
+                "1",
+                "--records",
+                "100000",
+                "--buckets",
+                "100"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
