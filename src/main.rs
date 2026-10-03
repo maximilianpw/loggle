@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     io::{self, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -220,7 +219,7 @@ fn parse_text_filter(input: &str) -> Result<String, String> {
     parse_non_empty(input, "text filter")
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
     let cli = Cli::parse();
     let runtime_command = match cli.subcommand {
         Some(CliCommand::Log(args)) => return report_command(run_log_command(args)),
@@ -255,22 +254,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         page_id: cli.page_id,
         page_logging: !cli.no_page_log,
     }) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(RuntimeError::MissingInput) => {
             eprintln!("{USAGE}");
             std::process::exit(1);
         }
-        Err(error) => Err(Box::new(error)),
+        // Runtime errors (startup readiness timeouts, terminal failures) are
+        // user-facing; print them as a message, not the Debug form of the enum.
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn report_command(result: Result<(), LogPageError>) -> Result<(), Box<dyn Error>> {
+fn report_command(result: Result<(), LogPageError>) {
     if let Err(error) = result {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
-
-    Ok(())
 }
 
 fn run_log_command(args: LogArgs) -> Result<(), LogPageError> {

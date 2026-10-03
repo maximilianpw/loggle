@@ -273,6 +273,12 @@ one strategy per command:
 `ready.command` and defaults to `500`. Successful probe output is not shown in
 Loggle; timeout errors include recent probe output when there is any.
 
+The viewer opens immediately and streams output while dependencies start. The
+status line shows startup progress (for example `starting: 1/3 ready; waiting
+for db`), and `q` works during startup: already-launched commands are shut down
+the same way as a normal quit. A readiness timeout or a dependency exiting
+before it is ready closes the viewer and prints the error.
+
 Top-level `env` applies to every `loggle start` command. Per-command `env`
 applies only to that command and overrides top-level keys. Loggle still inherits
 the environment from the parent shell; config env adds or overrides variables for
